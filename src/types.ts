@@ -6,7 +6,7 @@ export type DiscordUser = {
   avatar?: string | null;
 };
 
-export type TeamMemberRole = 'sub' | 'main' | 'coach';
+export type TeamMemberRole = 'sub' | 'main' | 'coach' | 'captain';
 
 export type Team = {
   id: string;
@@ -38,8 +38,13 @@ export type TeamInvite = {
   respondedAt?: string;
 };
 
+export type AdministratorSettings = {
+  adminRoleId?: string;
+};
+
 export type StoreShape = {
   teams: Team[];
   members: TeamMember[];
   invites: TeamInvite[];
+  settings: AdministratorSettings;
 };

@@ -118,6 +118,21 @@ Generate a session secret with:
 openssl rand -hex 32
 ```
 
+## Change the managed Discord server
+
+Changing which Discord server/guild the bot manages is intentionally command-line only; there is no website setting for it. Run this from the server shell you control, replacing the ID with the new Discord server/guild ID:
+
+```bash
+npm run set:guild -- 123456789012345678
+```
+
+The command updates `DISCORD_GUILD_ID` in `.env`, creates a timestamped backup by default, and leaves the file private (`chmod 600`). Restart the app afterward so the bot reconnects using the new server ID:
+
+```bash
+docker compose up -d --force-recreate
+# or restart your local Node process if you are not using Docker
+```
+
 ## Run locally
 
 ```bash

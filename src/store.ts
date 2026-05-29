@@ -1,11 +1,12 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 
 const initialStore: StoreShape = {
   teams: [],
   members: [],
-  invites: []
+  invites: [],
+  settings: {}
 };
 
 export class JsonStore {
@@ -26,6 +27,23 @@ export class JsonStore {
   async getTeamsByOwner(ownerId: string) {
     const data = await this.read();
     return data.teams.filter((team) => team.ownerId === ownerId);
+  }
+
+  async getTeams() {
+    const data = await this.read();
+    return [...data.teams].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async getAdministratorSettings() {
+    const data = await this.read();
+    return data.settings;
+  }
+
+  async updateAdministratorSettings(settings: AdministratorSettings) {
+    await this.update((data) => {
+      data.settings = { ...data.settings, ...settings };
+      return data;
+    });
   }
 
   async getTeam(teamId: string) {
@@ -60,7 +78,7 @@ export class JsonStore {
     return data.invites.find((invite) => invite.id === inviteId);
   }
 
-  async addTeam(team: Team, ownerRole: TeamMemberRole = 'coach') {
+  async addTeam(team: Team, ownerRole: TeamMemberRole = 'captain') {
     await this.update((data) => {
       if (data.members.some((member) => member.userId === team.ownerId)) {
         throw new Error('You are already in a team. Leave or delete your current team before creating another one.');
@@ -143,9 +161,29 @@ export class JsonStore {
 
   async setTeamMemberRole(teamId: string, userId: string, role: TeamMemberRole) {
     await this.update((data) => {
+      const team = data.teams.find((item) => item.id === teamId);
+      if (team?.ownerId === userId) throw new Error('Transfer team ownership to change the captain.');
+
       const member = data.members.find((item) => item.teamId === teamId && item.userId === userId);
       if (!member) throw new Error('Team member not found.');
       member.role = role;
+      return data;
+    });
+  }
+
+  async transferTeamOwnership(teamId: string, newOwnerId: string) {
+    await this.update((data) => {
+      const team = data.teams.find((item) => item.id === teamId);
+      if (!team) throw new Error('Team not found.');
+      if (team.ownerId === newOwnerId) throw new Error('That member is already the team captain.');
+
+      const previousOwner = data.members.find((member) => member.teamId === teamId && member.userId === team.ownerId);
+      const nextOwner = data.members.find((member) => member.teamId === teamId && member.userId === newOwnerId);
+      if (!nextOwner) throw new Error('New captain must already be a team member.');
+
+      if (previousOwner) previousOwner.role = 'coach';
+      nextOwner.role = 'captain';
+      team.ownerId = newOwnerId;
       return data;
     });
   }
@@ -187,7 +225,8 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
   const normalized: StoreShape = {
     teams: data.teams ?? [],
     members: data.members ?? [],
-    invites: data.invites ?? []
+    invites: data.invites ?? [],
+    settings: data.settings ?? {}
   };
 
   for (const team of normalized.teams) {
@@ -195,7 +234,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
       normalized.members.push({
         teamId: team.id,
         userId: team.ownerId,
-        role: 'coach',
+        role: 'captain',
         joinedAt: team.createdAt
       });
     }
@@ -211,6 +250,11 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
       role: 'main',
       joinedAt: invite.respondedAt ?? invite.createdAt
     });
+  }
+
+  for (const team of normalized.teams) {
+    const owner = normalized.members.find((member) => member.teamId === team.id && member.userId === team.ownerId);
+    if (owner) owner.role = 'captain';
   }
 
   return normalized;

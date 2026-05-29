@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "update": "./update.sh"
+    "update": "./update.sh",
+    "set:guild": "node scripts/set-discord-server-id.mjs"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
