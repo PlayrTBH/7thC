@@ -2,7 +2,7 @@
 
 Self-hosted Discord bot + website integration for creating lightweight teams inside a Discord server.
 
-Users authenticate on the website with Discord OAuth2, choose server members to invite, and submit a team name. The bot then:
+Users authenticate on the website with Discord OAuth2, submit a team name, and optionally choose server members to invite. The bot then:
 
 - creates a no-permissions team role;
 - creates a private category for that role;
@@ -140,7 +140,7 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>, log in with Discord, create a team, and choose members to invite.
+Open <http://localhost:3000>, log in with Discord, create a team, and optionally choose members to invite during creation or later from the manage team page.
 
 ## Docker
 

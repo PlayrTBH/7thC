@@ -184,7 +184,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
         layout(
           'Team created',
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
-           <p>${invites.length} invite DM${invites.length === 1 ? '' : 's'} queued.</p>
+           <p>${teamCreatedInviteMessage(invites.length)}</p>
            <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`,
           { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }
         )
@@ -490,14 +490,19 @@ function dashboardTeamSection(team: Team | undefined, userId: string) {
 function teamForm() {
   return `<form method="post" action="/teams" onsubmit="const button = this.querySelector('button[type=submit]'); if (button) { button.disabled = true; button.textContent = 'Creating team…'; }">
     <label>Team name <input name="teamName" maxlength="80" required /></label>
-    ${invitePicker('Create team and send invites')}
+    ${invitePicker('Create team', 'You can invite server members now, or create the team first and invite members later from the manage team page.')}
   </form>
   ${inviteSearchScript()}`;
 }
 
-function invitePicker(submitLabel: string) {
+function teamCreatedInviteMessage(inviteCount: number) {
+  if (inviteCount === 0) return 'No invite DMs were queued. You can invite members from the manage team page when you are ready.';
+  return `${inviteCount} invite DM${inviteCount === 1 ? '' : 's'} queued.`;
+}
+
+function invitePicker(submitLabel: string, description = 'Search by Discord username or server nickname. Only server members who are not already in a team can be invited.') {
   return `<h2>Invite server members</h2>
-    <p><small>Search by Discord username or server nickname. Only server members who are not already in a team can be invited.</small></p>
+    <p><small>${escapeHtml(description)}</small></p>
     <div class="invite-search">
       <label for="member-search">Discord username</label>
       <input id="member-search" type="search" autocomplete="off" placeholder="Start typing a username…" />
