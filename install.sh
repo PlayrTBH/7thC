@@ -6,7 +6,7 @@ fi
 
 set -euo pipefail
 
-APP_NAME="Discord Team Hub"
+APP_NAME="7th Circle Team Hub"
 ENV_FILE=".env"
 DEFAULT_GITHUB_REPO_NAME="7thC"
 DEFAULT_GITHUB_REPO="${DISCORD_TEAM_HUB_GITHUB_REPO:-}"

@@ -6,7 +6,7 @@ fi
 
 set -euo pipefail
 
-APP_NAME="Discord Team Hub"
+APP_NAME="7th Circle Team Hub"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UPDATE_MODE="${UPDATE_MODE:-auto}"
 

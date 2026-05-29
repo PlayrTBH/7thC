@@ -40,7 +40,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const user = req.session.discordUser;
       if (!user) {
-        res.send(layout('Discord Team Hub', `<section class="hero-card"><p class="eyebrow">Discord Team Hub</p><h2>Build and manage competitive teams in one clean command center.</h2><p>Create private Discord team roles and channels from a web form.</p><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
+        res.send(layout('7th Circle Team Hub', `<section class="hero-card login-card"><p class="eyebrow">7th Circle Team Hub</p><h2>Log in</h2><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
         return;
       }
 
@@ -157,13 +157,16 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
   app.get('/teams/new', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
-      const currentTeam = await store.getTeamForUser(user.id);
+      const [currentTeam, administratorAccess] = await Promise.all([
+        store.getTeamForUser(user.id),
+        bot.getAdministratorAccess(user.id)
+      ]);
       if (currentTeam) {
-        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, active: 'teams' }));
+        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }));
         return;
       }
 
-      res.send(layout('Create a team', teamForm(), { user, active: 'teams' }));
+      res.send(layout('Create a team', teamForm(), { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -175,6 +178,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       const teamName = String(req.body.teamName ?? '');
       const selected = selectedMemberIds(req.body.memberIds);
 
+      const administratorAccess = await bot.getAdministratorAccess(user.id);
       const { team, invites } = await bot.createTeam(user.id, teamName, selected);
       res.send(
         layout(
@@ -182,7 +186,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
            <p>${invites.length} invite DM${invites.length === 1 ? '' : 's'} queued.</p>
            <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`,
-          { user, active: 'teams' }
+          { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }
         )
       );
     } catch (error) {
@@ -396,7 +400,7 @@ function settingsPage(user: DiscordUser) {
       <p class="eyebrow">Account</p>
       <h2>${escapeHtml(displayUser(user))}</h2>
       <p><small>@${escapeHtml(user.username)} · Discord ID <code>${escapeHtml(user.id)}</code></small></p>
-      <p>Use this page to confirm which Discord account is connected to Team Hub.</p>
+      <p>Use this page to confirm which Discord account is connected to 7th Circle Team Hub.</p>
       <p><a class="button danger" href="/logout">Log out</a></p>
     </div>
   </section>`;
@@ -474,7 +478,7 @@ function dashboardTeamSection(team: Team | undefined, userId: string) {
 }
 
 function teamForm() {
-  return `<form method="post" action="/teams">
+  return `<form method="post" action="/teams" onsubmit="const button = this.querySelector('button[type=submit]'); if (button) { button.disabled = true; button.textContent = 'Creating team…'; }">
     <label>Team name <input name="teamName" maxlength="80" required /></label>
     ${invitePicker('Create team and send invites')}
   </form>
@@ -665,7 +669,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(title)} · Discord Team Hub</title>
+  <title>${escapeHtml(title)} · 7th Circle Team Hub</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <style>
     :root { color-scheme: dark; --bg: #0b0c0f; --panel: #17191f; --panel-strong: #20232b; --muted: #a8b0bd; --text: #f4f6fb; --line: #30343d; --red: #c90820; --red-strong: #ef233c; --red-soft: rgba(201, 8, 32, .16); --shadow: 0 24px 70px rgba(0, 0, 0, .45); }
@@ -732,7 +736,7 @@ function navigation(options: LayoutOptions) {
     : '<a class="button" href="/auth/discord">Log in</a>';
 
   return `<header class="topbar">
-    <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7thC Team Hub</span></a>
+    <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle Team Hub</span></a>
     <div class="nav-shell">
       <nav class="nav-links" aria-label="Primary navigation">
         <a href="/"${activeClass('dashboard')}>Dashboard</a>
