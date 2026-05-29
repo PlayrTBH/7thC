@@ -48,6 +48,14 @@ sudo apt-get update && sudo apt-get install -y git curl gh
 gh auth login --scopes repo
 gh auth setup-git
 
+# Pull install.sh from the private 7thC repo and run it.
+GH_REPO=$(gh repo list --limit 200 --json name,nameWithOwner \
+  --jq '.[] | select(.name == "7thC") | .nameWithOwner' | head -n 1)
+gh api -H "Accept: application/vnd.github.raw" \
+  "/repos/$GH_REPO/contents/install.sh?ref=work" | bash
+```
+
+When the script is launched this way, it first finds this private `7thC` repository through your authenticated GitHub account, clones or updates it on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
 # Replace OWNER, REPO, and BRANCH. For this branch, BRANCH is usually work.
 curl -H "Authorization: Bearer $(gh auth token)" \
   -fsSL https://raw.githubusercontent.com/OWNER/REPO/BRANCH/install.sh \
