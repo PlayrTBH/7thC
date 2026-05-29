@@ -4,7 +4,7 @@ import session from 'express-session';
 import { config, discordRedirectUri } from './config.js';
 import type { TeamBot } from './bot.js';
 import type { JsonStore } from './store.js';
-import type { DiscordUser, Team, TeamMemberRole } from './types.js';
+import type { DiscordUser, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -197,8 +197,8 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
   app.get('/teams/:teamId', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
-      const members = await bot.getTeamMemberDetails(team.id);
-      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members, Boolean(res.locals.canManageAllTeams)), { user: req.session.discordUser, isAdmin: Boolean(res.locals.canManageAllTeams), active: 'teams' }));
+      const [members, invites] = await Promise.all([bot.getTeamMemberDetails(team.id), bot.getTeamInviteDetails(team.id)]);
+      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members, invites, Boolean(res.locals.canManageAllTeams)), { user: req.session.discordUser, isAdmin: Boolean(res.locals.canManageAllTeams), active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -219,6 +219,16 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const team = res.locals.team as Team;
       await bot.setTeamRoleColor(team.id, String(req.body.roleColor ?? ''));
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/name', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      await bot.renameTeam(team.id, String(req.body.teamName ?? ''));
       res.redirect(`/teams/${encodeURIComponent(team.id)}`);
     } catch (error) {
       next(error);
@@ -584,9 +594,19 @@ function inviteSearchScript() {
 function manageTeamPage(
   team: Team,
   members: Array<{ userId: string; role: TeamMemberRole; displayName: string; username: string; avatarUrl: string; isOwner: boolean }>,
+  invites: Array<TeamInvite & { displayName: string; username: string; avatarUrl: string }>,
   canManageAllTeams = false
 ) {
   return `<p><a href="${canManageAllTeams ? '/administrator' : '/'}">← Back to ${canManageAllTeams ? 'administrator' : 'dashboard'}</a></p>
+    <section class="card">
+      <h2>Team name</h2>
+      <p><small>Rename the Discord role and private team channels for this team.</small></p>
+      <form method="post" action="/teams/${encodeURIComponent(team.id)}/name" class="inline-form">
+        <label>Team name <input name="teamName" maxlength="80" value="${escapeHtml(team.name)}" required /></label>
+        <button type="submit">Change name</button>
+      </form>
+    </section>
+
     <section class="card">
       <h2>Team role color</h2>
       <form method="post" action="/teams/${encodeURIComponent(team.id)}/color" class="inline-form">
@@ -603,6 +623,11 @@ function manageTeamPage(
     ${inviteSearchScript()}
 
     <section class="card">
+      <h2>Pending invites</h2>
+      ${pendingInvitesSection(invites)}
+    </section>
+
+    <section class="card">
       <h2>Members</h2>
       <div class="management-list">
         ${members.map((member) => managedMember(team, member)).join('')}
@@ -616,6 +641,27 @@ function manageTeamPage(
         <button class="danger" type="submit">Delete team</button>
       </form>
     </section>`;
+}
+
+
+function pendingInvitesSection(invites: Array<TeamInvite & { displayName: string; username: string; avatarUrl: string }>) {
+  const pendingInvites = invites.filter((invite) => invite.status === 'pending');
+  if (!pendingInvites.length) return '<p>No pending invites right now.</p>';
+
+  return `<p><small>These Discord members have been sent an invite and have not responded yet.</small></p>
+    <div class="management-list">
+      ${pendingInvites.map((invite) => pendingInvite(invite)).join('')}
+    </div>`;
+}
+
+function pendingInvite(invite: TeamInvite & { displayName: string; username: string; avatarUrl: string }) {
+  return `<div class="managed-member">
+    ${invite.avatarUrl ? `<img src="${escapeHtml(invite.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
+    <div class="member-info">
+      <strong>${escapeHtml(invite.displayName)}</strong> <span class="pill">pending</span><br />
+      <small>@${escapeHtml(invite.username)} · invited ${escapeHtml(formatDateTime(invite.createdAt))}</small>
+    </div>
+  </div>`;
 }
 
 function managedMember(
@@ -660,6 +706,12 @@ function teamRoleLabel(role: TeamMemberRole) {
 function parseTeamMemberRole(role: unknown): TeamMemberRole {
   if (role === 'sub' || role === 'main' || role === 'coach') return role;
   throw new Error('Invalid team member role.');
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 function layout(title: string, body: string, options: LayoutOptions = {}) {

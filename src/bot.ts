@@ -151,6 +151,22 @@ export class TeamBot {
     );
   }
 
+  async getTeamInviteDetails(teamId: string) {
+    const guild = await this.getGuild();
+    const invites = await this.store.getTeamInvites(teamId);
+    return Promise.all(
+      invites.map(async (invite) => {
+        const member = await guild.members.fetch(invite.inviteeId).catch(() => null);
+        return {
+          ...invite,
+          displayName: member?.displayName ?? invite.inviteeId,
+          username: member?.user.username ?? invite.inviteeId,
+          avatarUrl: member?.displayAvatarURL({ size: 64 }) ?? ''
+        };
+      })
+    );
+  }
+
   async createTeam(ownerId: string, rawTeamName: string, inviteeIds: string[]) {
     const activeCreation = this.teamCreationLocks.get(ownerId);
     if (activeCreation) {
@@ -337,6 +353,25 @@ export class TeamBot {
 
     await role.setColor(color, 'Team role color changed from 7th Circle Team Hub');
     await this.store.updateTeamRoleColor(teamId, color);
+  }
+
+  async renameTeam(teamId: string, rawTeamName: string) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+
+    const teamName = normalizeTeamName(rawTeamName);
+    const safeChannelName = toChannelName(teamName);
+    const guild = await this.getGuild();
+    await assertBotPermissions(guild);
+
+    const role = await guild.roles.fetch(team.roleId);
+    if (!role) throw new Error('Team role no longer exists in Discord.');
+
+    await role.setName(teamName, 'Team renamed from 7th Circle Team Hub');
+    await renameGuildChannel(guild, team.categoryId, teamName, 'Team category renamed from 7th Circle Team Hub');
+    await renameGuildChannel(guild, team.textChannelId, safeChannelName, 'Team text channel renamed from 7th Circle Team Hub');
+    await renameGuildChannel(guild, team.voiceChannelId, `${teamName} Voice`, 'Team voice channel renamed from 7th Circle Team Hub');
+    await this.store.updateTeamName(teamId, teamName);
   }
 
   async deleteTeam(teamId: string) {
@@ -552,6 +587,12 @@ function toChannelName(teamName: string) {
 
 function unique(values: string[]) {
   return [...new Set(values)];
+}
+
+async function renameGuildChannel(guild: Guild, channelId: string, name: string, reason: string) {
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel || !('setName' in channel)) return;
+  await channel.setName(name, reason);
 }
 
 async function assertBotPermissions(guild: Guild) {

@@ -78,6 +78,13 @@ export class JsonStore {
     return data.invites.find((invite) => invite.id === inviteId);
   }
 
+  async getTeamInvites(teamId: string) {
+    const data = await this.read();
+    return data.invites
+      .filter((invite) => invite.teamId === teamId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
   async addTeam(team: Team, ownerRole: TeamMemberRole = 'captain') {
     await this.update((data) => {
       if (data.members.some((member) => member.userId === team.ownerId)) {
@@ -99,6 +106,15 @@ export class JsonStore {
     await this.update((data) => {
       const team = data.teams.find((item) => item.id === teamId);
       if (team) team.roleColor = roleColor;
+      return data;
+    });
+  }
+
+  async updateTeamName(teamId: string, name: string) {
+    await this.update((data) => {
+      const team = data.teams.find((item) => item.id === teamId);
+      if (!team) throw new Error('Team not found.');
+      team.name = name;
       return data;
     });
   }
