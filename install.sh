@@ -3,9 +3,13 @@ set -euo pipefail
 
 APP_NAME="Discord Team Hub"
 ENV_FILE=".env"
+DEFAULT_GITHUB_OWNER="PlayrTBH"
 DEFAULT_GITHUB_REPO_NAME="7thC"
-DEFAULT_GITHUB_REPO="${DISCORD_TEAM_HUB_GITHUB_REPO:-}"
+DEFAULT_GITHUB_REPO="$DEFAULT_GITHUB_OWNER/$DEFAULT_GITHUB_REPO_NAME"
 DEFAULT_GITHUB_BRANCH=""
+DEFAULT_GITHUB_REPO_NAME="7thC"
+DEFAULT_GITHUB_BRANCH=""
+DEFAULT_GITHUB_BRANCH="work"
 
 if [[ -t 0 ]]; then
   PROMPT_INPUT="/dev/stdin"
@@ -170,20 +174,17 @@ resolve_repo_url() {
   fi
 
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    if [[ -n "$DEFAULT_GITHUB_REPO" ]] && gh repo view "$DEFAULT_GITHUB_REPO" >/dev/null 2>&1; then
+    if gh repo view "$DEFAULT_GITHUB_REPO" >/dev/null 2>&1; then
       printf 'https://github.com/%s.git' "$DEFAULT_GITHUB_REPO"
-      return 0
-    fi
-
     local name_with_owner=""
-    name_with_owner="$(gh repo list --limit 1000 --json name,nameWithOwner --jq ".[] | select((.name | ascii_downcase) == (\"$DEFAULT_GITHUB_REPO_NAME\" | ascii_downcase)) | .nameWithOwner" | head -n 1 || true)"
+    name_with_owner="$(gh repo list --limit 200 --json name,nameWithOwner --jq ".[] | select(.name == \"$DEFAULT_GITHUB_REPO_NAME\") | .nameWithOwner" | head -n 1 || true)"
     if [[ -n "$name_with_owner" ]]; then
       printf 'https://github.com/%s.git' "$name_with_owner"
       return 0
     fi
   fi
 
-  note "Could not automatically find the GitHub repository for this installer."
+  note "Could not automatically access GitHub repo $DEFAULT_GITHUB_REPO."
   prompt_required DISCORD_TEAM_HUB_REPO_URL "GitHub repository clone URL"
 }
 
@@ -205,6 +206,13 @@ ensure_repo_checkout() {
   local install_dir="${DISCORD_TEAM_HUB_DIR:-$HOME/discord-team-hub}"
 
   repo_url="$(resolve_repo_url)"
+  local repo_url="${DISCORD_TEAM_HUB_REPO_URL:-}"
+  local branch="${DISCORD_TEAM_HUB_BRANCH:-}"
+  local install_dir="${DISCORD_TEAM_HUB_DIR:-$HOME/discord-team-hub}"
+
+  if [[ -z "$repo_url" ]]; then
+    repo_url="$(prompt_required DISCORD_TEAM_HUB_REPO_URL "GitHub repository clone URL")"
+  fi
 
   install_dir="$(prompt_default "Install directory" "$install_dir")"
 
