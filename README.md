@@ -34,6 +34,41 @@ Users authenticate on the website with Discord OAuth2, choose server members to 
 4. Enable the **Server Members Intent** for the bot so it can list inviteable members.
 5. Use the OAuth2 URL generator to invite the bot to your server with the permissions listed above.
 
+## One-line interactive setup
+
+### From a private GitHub repo on a fresh VM
+
+Install GitHub CLI, authenticate with access to this private repo, then pull and run the installer directly from GitHub:
+
+```bash
+# Ubuntu/Debian example
+sudo apt-get update && sudo apt-get install -y git curl gh
+
+# Log in to GitHub; choose GitHub.com, HTTPS, and browser/device-code auth when prompted.
+gh auth login --scopes repo
+gh auth setup-git
+
+# Replace OWNER, REPO, and BRANCH. For this branch, BRANCH is usually work.
+curl -H "Authorization: Bearer $(gh auth token)" \
+  -fsSL https://raw.githubusercontent.com/OWNER/REPO/BRANCH/install.sh \
+  | DISCORD_TEAM_HUB_REPO_URL=https://github.com/OWNER/REPO.git \
+    DISCORD_TEAM_HUB_BRANCH=BRANCH \
+    bash
+```
+
+When the script is launched this way, it first clones or updates the private repository on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
+
+### From an already checked-out repo
+
+```bash
+npm run setup
+# or
+./install.sh
+```
+
+The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
+
+## Manual configuration
 ## Configure
 
 Copy the example environment file and fill in values:

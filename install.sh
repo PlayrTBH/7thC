@@ -157,6 +157,64 @@ run_local_setup() {
   npm run build
 }
 
+
+ensure_repo_checkout() {
+  if [[ -f package.json && -f src/index.ts && -f install.sh ]]; then
+    return 0
+  fi
+
+  say "Repository checkout needed"
+  note "The installer was run outside the app repository, so it needs to clone the private repo first."
+
+  if ! command -v git >/dev/null 2>&1; then
+    note "git was not found. Install git, then rerun the GitHub one-line installer."
+    exit 1
+  fi
+
+  local repo_url="${DISCORD_TEAM_HUB_REPO_URL:-}"
+  local branch="${DISCORD_TEAM_HUB_BRANCH:-}"
+  local install_dir="${DISCORD_TEAM_HUB_DIR:-$HOME/discord-team-hub}"
+
+  if [[ -z "$repo_url" ]]; then
+    repo_url="$(prompt_required DISCORD_TEAM_HUB_REPO_URL "GitHub repository clone URL")"
+  fi
+
+  install_dir="$(prompt_default "Install directory" "$install_dir")"
+
+  if [[ -d "$install_dir/.git" ]]; then
+    say "Updating existing checkout"
+    git -C "$install_dir" fetch --all --prune
+    if [[ -n "$branch" ]]; then
+      git -C "$install_dir" checkout "$branch"
+      git -C "$install_dir" pull --ff-only origin "$branch"
+    else
+      git -C "$install_dir" pull --ff-only
+    fi
+  else
+    if [[ -e "$install_dir" ]]; then
+      note "$install_dir already exists but is not a git checkout. Choose a different DISCORD_TEAM_HUB_DIR or remove it."
+      exit 1
+    fi
+
+    say "Cloning app repository"
+    if [[ -n "$branch" ]]; then
+      git clone --branch "$branch" "$repo_url" "$install_dir"
+    else
+      git clone "$repo_url" "$install_dir"
+    fi
+  fi
+
+  if [[ ! -f "$install_dir/install.sh" ]]; then
+    note "The cloned repository does not contain install.sh. Check DISCORD_TEAM_HUB_REPO_URL and DISCORD_TEAM_HUB_BRANCH."
+    exit 1
+  fi
+
+  chmod +x "$install_dir/install.sh"
+  say "Continuing setup from $install_dir"
+  cd "$install_dir"
+  exec ./install.sh
+}
+
 run_docker_setup() {
   if [[ ! -f docker-compose.yml ]]; then
     note "docker-compose.yml was not found. Run this installer from the repository directory before Docker setup."
@@ -173,6 +231,7 @@ run_docker_setup() {
 }
 
 say "$APP_NAME installer"
+ensure_repo_checkout
 note "This will ask for Discord OAuth/bot settings and generate $ENV_FILE."
 note "Create the Discord application first, then set its redirect URL to: PUBLIC_URL/auth/discord/callback"
 
