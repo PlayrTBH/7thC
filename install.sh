@@ -198,6 +198,13 @@ ensure_repo_checkout() {
   local install_dir="${DISCORD_TEAM_HUB_DIR:-$HOME/discord-team-hub}"
 
   repo_url="$(resolve_repo_url)"
+  local repo_url="${DISCORD_TEAM_HUB_REPO_URL:-}"
+  local branch="${DISCORD_TEAM_HUB_BRANCH:-}"
+  local install_dir="${DISCORD_TEAM_HUB_DIR:-$HOME/discord-team-hub}"
+
+  if [[ -z "$repo_url" ]]; then
+    repo_url="$(prompt_required DISCORD_TEAM_HUB_REPO_URL "GitHub repository clone URL")"
+  fi
 
   install_dir="$(prompt_default "Install directory" "$install_dir")"
 
