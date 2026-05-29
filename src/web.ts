@@ -4,7 +4,7 @@ import session from 'express-session';
 import { config, discordRedirectUri } from './config.js';
 import type { TeamBot } from './bot.js';
 import type { JsonStore } from './store.js';
-import type { DiscordUser } from './types.js';
+import type { DiscordUser, Team, TeamMemberRole } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -32,27 +32,25 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     })
   );
 
-  app.get('/', async (req, res) => {
-    const user = req.session.discordUser;
-    if (!user) {
-      res.send(layout('Discord Team Hub', `<p>Create private Discord team roles and channels from a web form.</p><p><a class="button" href="/auth/discord">Log in with Discord</a></p>`));
-      return;
-    }
+  app.get('/', async (req, res, next) => {
+    try {
+      const user = req.session.discordUser;
+      if (!user) {
+        res.send(layout('Discord Team Hub', `<p>Create private Discord team roles and channels from a web form.</p><p><a class="button" href="/auth/discord">Log in with Discord</a></p>`));
+        return;
+      }
 
-    const teams = await store.getTeamsByOwner(user.id);
-    res.send(
-      layout(
-        'Dashboard',
-        `<p>Logged in as <strong>${escapeHtml(displayUser(user))}</strong>. <a href="/logout">Log out</a></p>
-         <p><a class="button" href="/teams/new">Create a team</a></p>
-         <h2>Your teams</h2>
-         ${
-           teams.length
-             ? `<ul>${teams.map((team) => `<li><strong>${escapeHtml(team.name)}</strong> — role <code>${team.roleId}</code></li>`).join('')}</ul>`
-             : '<p>No teams created yet.</p>'
-         }`
-      )
-    );
+      const currentTeam = await store.getTeamForUser(user.id);
+      res.send(
+        layout(
+          'Dashboard',
+          `<p>Logged in as <strong>${escapeHtml(displayUser(user))}</strong>. <a href="/logout">Log out</a></p>
+           ${dashboardTeamSection(currentTeam, user.id)}`
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get('/auth/discord', (req, res) => {
@@ -98,6 +96,12 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
   app.get('/teams/new', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
+      const currentTeam = await store.getTeamForUser(user.id);
+      if (currentTeam) {
+        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`));
+        return;
+      }
+
       const members = await bot.listInvitableMembers(user.id);
       res.send(layout('Create a team', teamForm(members)));
     } catch (error) {
@@ -121,9 +125,70 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           'Team created',
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
            <p>${invites.length} invite DM${invites.length === 1 ? '' : 's'} queued.</p>
-           <p><a class="button" href="/">Back to dashboard</a></p>`
+           <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`
         )
       );
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/teams/:teamId', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      const members = await bot.getTeamMemberDetails(team.id);
+      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/color', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      await bot.setTeamRoleColor(team.id, String(req.body.roleColor ?? ''));
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/members/:userId/role', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      const role = parseTeamMemberRole(req.body.role);
+      await bot.setTeamMemberRole(team.id, req.params.userId, role);
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/members/:userId/kick', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      await bot.kickTeamMember(team.id, req.params.userId);
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/delete', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      await bot.deleteTeam(team.id);
+      res.redirect('/');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/leave', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      await bot.leaveTeam(user.id);
+      res.redirect('/');
     } catch (error) {
       next(error);
     }
@@ -175,23 +240,133 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+function requireTeamOwner(store: JsonStore) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = req.session.discordUser!;
+      const team = await store.getTeam(req.params.teamId);
+      if (!team) {
+        res.status(404).send(layout('Team not found', '<p>That team does not exist.</p><p><a href="/">Back home</a></p>'));
+        return;
+      }
+      if (team.ownerId !== user.id) {
+        res.status(403).send(layout('Not allowed', '<p>Only the team owner can manage this team.</p><p><a href="/">Back home</a></p>'));
+        return;
+      }
+      res.locals.team = team;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function dashboardTeamSection(team: Team | undefined, userId: string) {
+  if (!team) {
+    return `<p>You are not currently in a team.</p><p><a class="button" href="/teams/new">Create a team</a></p>`;
+  }
+
+  if (team.ownerId === userId) {
+    return `<h2>Your team</h2>
+      <div class="card">
+        <p><strong>${escapeHtml(team.name)}</strong> — role <code>${escapeHtml(team.roleId)}</code></p>
+        <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a></p>
+      </div>`;
+  }
+
+  return `<h2>Your team</h2>
+    <div class="card">
+      <p>You are currently a member of <strong>${escapeHtml(team.name)}</strong>.</p>
+      <form method="post" action="/teams/leave" onsubmit="return confirm('Leave ${escapeJsString(team.name)}? You will lose access to its private channels.');">
+        <button class="danger" type="submit">Leave team</button>
+      </form>
+    </div>`;
+}
+
 function teamForm(members: Array<{ id: string; displayName: string; username: string; avatarUrl: string }>) {
   return `<form method="post" action="/teams">
     <label>Team name <input name="teamName" maxlength="80" required /></label>
     <h2>Invite server members</h2>
+    <p><small>Only server members who are not already in a team are shown.</small></p>
     <div class="member-list">
-      ${members
-        .map(
-          (member) => `<label class="member">
-            <input type="checkbox" name="memberIds" value="${escapeHtml(member.id)}" />
-            <img src="${escapeHtml(member.avatarUrl)}" alt="" />
-            <span>${escapeHtml(member.displayName)} <small>@${escapeHtml(member.username)}</small></span>
-          </label>`
-        )
-        .join('')}
+      ${members.length ? members.map(memberCheckbox).join('') : '<p>No eligible members are available to invite right now.</p>'}
     </div>
     <button type="submit">Create team and send invites</button>
   </form>`;
+}
+
+function memberCheckbox(member: { id: string; displayName: string; username: string; avatarUrl: string }) {
+  return `<label class="member">
+    <input type="checkbox" name="memberIds" value="${escapeHtml(member.id)}" />
+    <img src="${escapeHtml(member.avatarUrl)}" alt="" />
+    <span>${escapeHtml(member.displayName)} <small>@${escapeHtml(member.username)}</small></span>
+  </label>`;
+}
+
+function manageTeamPage(
+  team: Team,
+  members: Array<{ userId: string; role: TeamMemberRole; displayName: string; username: string; avatarUrl: string; isOwner: boolean }>
+) {
+  return `<p><a href="/">← Back to dashboard</a></p>
+    <section class="card">
+      <h2>Team role color</h2>
+      <form method="post" action="/teams/${encodeURIComponent(team.id)}/color" class="inline-form">
+        <label>Color <input type="color" name="roleColor" value="${escapeHtml(team.roleColor ?? '#5865F2')}" /></label>
+        <button type="submit">Change color</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Members</h2>
+      <div class="management-list">
+        ${members.map((member) => managedMember(team, member)).join('')}
+      </div>
+    </section>
+
+    <section class="card danger-zone">
+      <h2>Delete team</h2>
+      <p>Deletes the Discord team role, private channels, pending invites, and all stored memberships.</p>
+      <form method="post" action="/teams/${encodeURIComponent(team.id)}/delete" onsubmit="return confirm('Delete ${escapeJsString(team.name)}? This cannot be undone.');">
+        <button class="danger" type="submit">Delete team</button>
+      </form>
+    </section>`;
+}
+
+function managedMember(
+  team: Team,
+  member: { userId: string; role: TeamMemberRole; displayName: string; username: string; avatarUrl: string; isOwner: boolean }
+) {
+  return `<div class="managed-member">
+    ${member.avatarUrl ? `<img src="${escapeHtml(member.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
+    <div class="member-info">
+      <strong>${escapeHtml(member.displayName)}</strong> ${member.isOwner ? '<span class="pill">owner</span>' : ''}<br />
+      <small>@${escapeHtml(member.username)}</small>
+    </div>
+    <form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/role" class="inline-form">
+      <select name="role" aria-label="Team role for ${escapeHtml(member.displayName)}">
+        ${teamRoleOptions(member.role)}
+      </select>
+      <button type="submit">Save role</button>
+    </form>
+    ${
+      member.isOwner
+        ? ''
+        : `<form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/kick" onsubmit="return confirm('Kick ${escapeJsString(member.displayName)} from ${escapeJsString(team.name)}?');">
+             <button class="danger" type="submit">Kick</button>
+           </form>`
+    }
+  </div>`;
+}
+
+function teamRoleOptions(selected: TeamMemberRole) {
+  return (['sub', 'main', 'coach'] as TeamMemberRole[])
+    .map((role) => `<option value="${role}"${role === selected ? ' selected' : ''}>${role}</option>`)
+    .join('');
+}
+
+function parseTeamMemberRole(role: unknown): TeamMemberRole {
+  if (role === 'sub' || role === 'main' || role === 'coach') return role;
+  throw new Error('Invalid team member role.');
 }
 
 function layout(title: string, body: string) {
@@ -204,11 +379,20 @@ function layout(title: string, body: string) {
   <style>
     body { font-family: Inter, system-ui, sans-serif; margin: 0; background: #111827; color: #f9fafb; }
     main { max-width: 900px; margin: 0 auto; padding: 3rem 1.25rem; }
-    a { color: #93c5fd; } .button, button { background: #5865f2; color: white; border: 0; border-radius: .5rem; padding: .75rem 1rem; text-decoration: none; cursor: pointer; }
-    input { border-radius: .4rem; border: 1px solid #4b5563; padding: .6rem; margin-left: .5rem; }
+    a { color: #93c5fd; } .button, button { background: #5865f2; color: white; border: 0; border-radius: .5rem; padding: .75rem 1rem; text-decoration: none; cursor: pointer; display: inline-block; }
+    .secondary { background: #374151; } .danger { background: #dc2626; } .danger-zone { border-color: #7f1d1d; }
+    input, select { border-radius: .4rem; border: 1px solid #4b5563; padding: .6rem; margin-left: .5rem; background: #111827; color: #f9fafb; }
+    input[type="color"] { width: 4rem; height: 2.6rem; padding: .2rem; vertical-align: middle; }
+    .card { background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: 1rem; margin: 1rem 0; }
     .member-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; margin: 1rem 0; }
-    .member { display: flex; align-items: center; gap: .75rem; background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; }
-    .member img { width: 36px; height: 36px; border-radius: 999px; } small { color: #9ca3af; }
+    .member, .managed-member { display: flex; align-items: center; gap: .75rem; background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; }
+    .managed-member { flex-wrap: wrap; justify-content: space-between; }
+    .management-list { display: grid; gap: .75rem; }
+    .member-info { flex: 1 1 12rem; }
+    .member img, .managed-member img, .avatar-placeholder { width: 36px; height: 36px; border-radius: 999px; background: #374151; }
+    .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    .pill { display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border-radius: 999px; background: #374151; color: #d1d5db; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+    small { color: #9ca3af; }
     code { background: #1f2937; border-radius: .25rem; padding: .15rem .35rem; }
   </style>
 </head>
@@ -222,4 +406,8 @@ function displayUser(user: DiscordUser) {
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]!);
+}
+
+function escapeJsString(value: string) {
+  return escapeHtml(value.replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 }
