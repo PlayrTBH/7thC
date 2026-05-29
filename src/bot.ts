@@ -244,7 +244,9 @@ export class TeamBot {
       createdAt: new Date().toISOString()
     };
     try {
-      await this.ensureTeamRolePlacement(guild, role, organizationRoleIds);
+      await this.ensureTeamRolePlacement(guild, role, organizationRoleIds).catch((error) => {
+        console.warn(`Unable to place newly created team role ${role.id} above organization roles:`, error);
+      });
       await owner.roles.add(role, 'Team owner role assignment');
       await this.applyOrganizationalRole(owner, 'captain');
       await this.store.addTeam(team, 'captain');
@@ -396,13 +398,33 @@ export class TeamBot {
       .filter((role): role is Role => Boolean(role));
     if (!organizationRoles.length) return;
 
+    if (!teamRole.editable) {
+      console.warn(`Team role ${teamRole.id} is not editable by the bot; skipping role placement.`);
+      return;
+    }
+
+    const me = await guild.members.fetchMe();
+    const highestManageablePosition = me.roles.highest.position - 1;
+    if (highestManageablePosition < 1) {
+      console.warn('Bot role is not high enough to place team roles; skipping role placement.');
+      return;
+    }
+
     const highestOrganizationRolePosition = Math.max(...organizationRoles.map((role) => role.position));
     if (!teamRole.hoist) {
       teamRole = await teamRole.setHoist(true, 'Team roles are displayed separately by 7th Circle Team Hub');
     }
-    if (teamRole.position <= highestOrganizationRolePosition) {
-      await teamRole.setPosition(highestOrganizationRolePosition + 1, {
-        reason: 'Team roles are placed above 7th Circle Team Hub organization roles'
+
+    const desiredPosition = Math.min(highestOrganizationRolePosition + 1, highestManageablePosition);
+    if (highestOrganizationRolePosition >= highestManageablePosition) {
+      console.warn(
+        `Bot role is not high enough to place team role ${teamRole.id} above organization roles; placing it as high as the bot can manage.`
+      );
+    }
+
+    if (teamRole.position < desiredPosition) {
+      await teamRole.setPosition(desiredPosition, {
+        reason: 'Team roles are placed above 7th Circle Team Hub organization roles when Discord role hierarchy allows it'
       });
     }
   }
