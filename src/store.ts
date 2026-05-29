@@ -95,11 +95,14 @@ export class JsonStore {
   }
 
   async addInvites(invites: TeamInvite[]) {
+    let addedInvites: TeamInvite[] = [];
     await this.update((data) => {
       const unavailableUserIds = new Set(data.members.map((member) => member.userId));
-      data.invites.push(...invites.filter((invite) => !unavailableUserIds.has(invite.inviteeId)));
+      addedInvites = invites.filter((invite) => !unavailableUserIds.has(invite.inviteeId));
+      data.invites.push(...addedInvites);
       return data;
     });
+    return addedInvites;
   }
 
   async updateInviteStatus(inviteId: string, status: TeamInvite['status']) {
@@ -123,7 +126,7 @@ export class JsonStore {
         throw new Error('Team no longer exists.');
       }
       if (data.members.some((member) => member.userId === userId)) {
-        throw new Error('You are already in a team. Leave your current team before joining another one.');
+        throw new Error('You already own or belong to a team. Leave or delete your current team before accepting another invite.');
       }
 
       invite.status = 'accepted';

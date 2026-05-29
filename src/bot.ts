@@ -74,9 +74,12 @@ export class TeamBot {
     return guild.members.fetch(userId).catch(() => null);
   }
 
-  async listInvitableMembers(currentUserId: string) {
+  async searchInvitableMembers(currentUserId: string, rawQuery: string) {
+    const query = rawQuery.trim();
+    if (query.length < 2) return [];
+
     const guild = await this.getGuild();
-    const members = await guild.members.fetch();
+    const members = await guild.members.search({ query, limit: 25 });
     const unavailableUserIds = await this.store.getTeamMemberUserIds();
     return members
       .filter((member) => !member.user.bot && member.id !== currentUserId && !unavailableUserIds.has(member.id))
@@ -84,6 +87,7 @@ export class TeamBot {
         id: member.id,
         displayName: member.displayName,
         username: member.user.username,
+        tag: member.user.tag,
         avatarUrl: member.displayAvatarURL({ size: 64 })
       }))
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -185,22 +189,19 @@ export class TeamBot {
     };
     await this.store.addTeam(team, 'coach');
 
-    const unavailableUserIds = await this.store.getTeamMemberUserIds();
-    const invites: TeamInvite[] = unique(inviteeIds)
-      .filter((inviteeId) => inviteeId !== ownerId && !unavailableUserIds.has(inviteeId))
-      .map((inviteeId) => ({
-        id: randomUUID(),
-        teamId: team.id,
-        inviterId: ownerId,
-        inviteeId,
-        status: 'pending',
-        createdAt: new Date().toISOString()
-      }));
-
-    await this.store.addInvites(invites);
-    await Promise.all(invites.map((invite) => this.sendInviteDm(guild, owner, team, invite)));
+    const invites = await this.createAndSendInvites(guild, owner, team, inviteeIds);
 
     return { team, invites };
+  }
+
+  async inviteTeamMembers(teamId: string, inviterId: string, inviteeIds: string[]) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+    if (team.ownerId !== inviterId) throw new Error('Only the team owner can invite new members.');
+
+    const guild = await this.getGuild();
+    const inviter = await guild.members.fetch(inviterId);
+    return this.createAndSendInvites(guild, inviter, team, inviteeIds);
   }
 
   async setTeamMemberRole(teamId: string, userId: string, role: TeamMemberRole) {
@@ -272,6 +273,31 @@ export class TeamBot {
     await this.store.removeTeam(teamId);
   }
 
+  private async createAndSendInvites(guild: Guild, inviter: GuildMember, team: Team, inviteeIds: string[]) {
+    const unavailableUserIds = await this.store.getTeamMemberUserIds();
+    const now = new Date().toISOString();
+    const inviteCandidates = await Promise.all(
+      unique(inviteeIds)
+        .filter((inviteeId) => inviteeId !== inviter.id && !unavailableUserIds.has(inviteeId))
+        .map(async (inviteeId) => guild.members.fetch(inviteeId).catch(() => null))
+    );
+
+    const invites: TeamInvite[] = inviteCandidates
+      .filter((member): member is GuildMember => Boolean(member && !member.user.bot))
+      .map((member) => ({
+        id: randomUUID(),
+        teamId: team.id,
+        inviterId: inviter.id,
+        inviteeId: member.id,
+        status: 'pending',
+        createdAt: now
+      }));
+
+    const addedInvites = await this.store.addInvites(invites);
+    await Promise.all(addedInvites.map((invite) => this.sendInviteDm(guild, inviter, team, invite)));
+    return addedInvites;
+  }
+
   private async sendInviteDm(guild: Guild, owner: GuildMember, team: Team, invite: TeamInvite) {
     const member = await guild.members.fetch(invite.inviteeId).catch(() => null);
     if (!member) {
@@ -318,7 +344,7 @@ export class TeamBot {
     if (!team) throw new Error('Team no longer exists.');
 
     if (await this.store.getTeamForUser(userId)) {
-      throw new Error('You are already in a team. Leave your current team before joining another one.');
+      throw new Error('You already own or belong to a team. Leave or delete your current team before accepting another invite.');
     }
 
     const guild = await this.getGuild();
