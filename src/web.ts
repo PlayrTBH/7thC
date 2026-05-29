@@ -41,10 +41,12 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       }
 
       const currentTeam = await store.getTeamForUser(user.id);
+      const administratorAccess = await bot.getAdministratorAccess(user.id);
       res.send(
         layout(
           'Dashboard',
           `<p>Logged in as <strong>${escapeHtml(displayUser(user))}</strong>. <a href="/logout">Log out</a></p>
+           ${administratorAccess.isAdmin ? '<p><a class="button secondary" href="/administrator">Administrator page</a></p>' : ''}
            ${dashboardTeamSection(currentTeam, user.id)}`
         )
       );
@@ -93,6 +95,39 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     req.session.destroy(() => res.redirect('/'));
   });
 
+  app.get('/administrator', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
+    try {
+      const access = res.locals.administratorAccess as AdministratorAccess;
+      const [teams, settings, roles] = await Promise.all([
+        store.getTeams(),
+        store.getAdministratorSettings(),
+        access.isOwner ? bot.getGuildRoles() : Promise.resolve([])
+      ]);
+      const teamSummaries = await Promise.all(
+        teams.map(async (team) => ({
+          team,
+          memberCount: (await store.getTeamMembers(team.id)).length
+        }))
+      );
+      res.send(layout('Administrator', administratorPage(teamSummaries, access, roles, settings.adminRoleId)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/settings', requireAuth, requireGuildOwner(bot), async (req, res, next) => {
+    try {
+      const adminRoleId = String(req.body.adminRoleId ?? '').trim() || undefined;
+      if (adminRoleId && !(await bot.getGuildRoles()).some((role) => role.id === adminRoleId)) {
+        throw new Error('Selected administrator role was not found in this Discord server.');
+      }
+      await store.updateAdministratorSettings({ adminRoleId });
+      res.redirect('/administrator');
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/members/search', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
@@ -139,28 +174,28 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
-  app.get('/teams/:teamId', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.get('/teams/:teamId', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       const members = await bot.getTeamMemberDetails(team.id);
-      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members)));
+      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members, Boolean(res.locals.canManageAllTeams))));
     } catch (error) {
       next(error);
     }
   });
 
-  app.post('/teams/:teamId/invites', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.post('/teams/:teamId/invites', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       const user = req.session.discordUser!;
-      await bot.inviteTeamMembers(team.id, user.id, selectedMemberIds(req.body.memberIds));
+      await bot.inviteTeamMembers(team.id, user.id, selectedMemberIds(req.body.memberIds), Boolean(res.locals.canManageAllTeams));
       res.redirect(`/teams/${encodeURIComponent(team.id)}`);
     } catch (error) {
       next(error);
     }
   });
 
-  app.post('/teams/:teamId/color', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.post('/teams/:teamId/color', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       await bot.setTeamRoleColor(team.id, String(req.body.roleColor ?? ''));
@@ -170,7 +205,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
-  app.post('/teams/:teamId/members/:userId/role', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.post('/teams/:teamId/members/:userId/role', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       const role = parseTeamMemberRole(req.body.role);
@@ -181,7 +216,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
-  app.post('/teams/:teamId/members/:userId/kick', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.post('/teams/:teamId/members/:userId/kick', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       await bot.kickTeamMember(team.id, req.params.userId);
@@ -191,11 +226,21 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
-  app.post('/teams/:teamId/delete', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+  app.post('/teams/:teamId/members/:userId/transfer-ownership', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      await bot.transferTeamOwnership(team.id, req.params.userId);
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/delete', requireAuth, requireTeamManager(bot, store), async (req, res, next) => {
     try {
       const team = res.locals.team as Team;
       await bot.deleteTeam(team.id);
-      res.redirect('/');
+      res.redirect(res.locals.canManageAllTeams ? '/administrator' : '/');
     } catch (error) {
       next(error);
     }
@@ -219,6 +264,8 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 
   return app;
 }
+
+type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
 
 function selectedMemberIds(memberIds: unknown) {
   return Array.isArray(memberIds) ? memberIds.map(String) : memberIds ? [String(memberIds)] : [];
@@ -261,7 +308,39 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-function requireTeamOwner(store: JsonStore) {
+function requireGuildAdministrator(bot: TeamBot) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
+      if (!access.isAdmin) {
+        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner or configured administrator role can access this page.</p><p><a href="/">Back home</a></p>'));
+        return;
+      }
+      res.locals.administratorAccess = access;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function requireGuildOwner(bot: TeamBot) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
+      if (!access.isOwner) {
+        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner can change administrator settings.</p><p><a href="/administrator">Back to administrator</a></p>'));
+        return;
+      }
+      res.locals.administratorAccess = access;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function requireTeamManager(bot: TeamBot, store: JsonStore) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = req.session.discordUser!;
@@ -270,16 +349,68 @@ function requireTeamOwner(store: JsonStore) {
         res.status(404).send(layout('Team not found', '<p>That team does not exist.</p><p><a href="/">Back home</a></p>'));
         return;
       }
-      if (team.ownerId !== user.id) {
-        res.status(403).send(layout('Not allowed', '<p>Only the team owner can manage this team.</p><p><a href="/">Back home</a></p>'));
+      const access = await bot.getAdministratorAccess(user.id);
+      if (team.ownerId !== user.id && !access.isAdmin) {
+        res.status(403).send(layout('Not allowed', '<p>Only the team owner or a server administrator can manage this team.</p><p><a href="/">Back home</a></p>'));
         return;
       }
       res.locals.team = team;
+      res.locals.administratorAccess = access;
+      res.locals.canManageAllTeams = access.isAdmin;
       next();
     } catch (error) {
       next(error);
     }
   };
+}
+
+function administratorPage(
+  teamSummaries: Array<{ team: Team; memberCount: number }>,
+  access: AdministratorAccess,
+  roles: Array<{ id: string; name: string; managed: boolean; position: number }>,
+  adminRoleId?: string
+) {
+  return `<p><a href="/">← Back to dashboard</a></p>
+    <section class="card">
+      <h2>All teams</h2>
+      ${
+        teamSummaries.length
+          ? `<div class="management-list">${teamSummaries.map(({ team, memberCount }) => administratorTeamCard(team, memberCount)).join('')}</div>`
+          : '<p>No teams have been created yet.</p>'
+      }
+    </section>
+    ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}`;
+}
+
+function administratorTeamCard(team: Team, memberCount: number) {
+  return `<div class="admin-team-row">
+    <div>
+      <strong>${escapeHtml(team.name)}</strong><br />
+      <small>${memberCount} member${memberCount === 1 ? '' : 's'} · owner <code>${escapeHtml(team.ownerId)}</code></small>
+    </div>
+    <div class="admin-team-actions">
+      <a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage</a>
+      <form method="post" action="/teams/${encodeURIComponent(team.id)}/delete" onsubmit="return confirm('Delete ${escapeJsString(team.name)}? This cannot be undone.');">
+        <button class="danger" type="submit">Delete</button>
+      </form>
+    </div>
+  </div>`;
+}
+
+function administratorSettingsForm(roles: Array<{ id: string; name: string; managed: boolean }>, adminRoleId?: string) {
+  return `<section class="card">
+    <h2>Administrator role</h2>
+    <p><small>Select a Discord role that can access this administrator page and manage teams. Only the Discord owner can change this setting.</small></p>
+    <form method="post" action="/administrator/settings" class="inline-form">
+      <label>Admin role
+        <select name="adminRoleId">
+          <option value="">No administrator role</option>
+          ${roles.map((role) => `<option value="${escapeHtml(role.id)}"${role.id === adminRoleId ? ' selected' : ''}>${escapeHtml(role.name)}${role.managed ? ' (managed)' : ''}</option>`).join('')}
+        </select>
+      </label>
+      <button type="submit">Save settings</button>
+    </form>
+  </section>`;
 }
 
 function dashboardTeamSection(team: Team | undefined, userId: string) {
@@ -410,9 +541,10 @@ function inviteSearchScript() {
 
 function manageTeamPage(
   team: Team,
-  members: Array<{ userId: string; role: TeamMemberRole; displayName: string; username: string; avatarUrl: string; isOwner: boolean }>
+  members: Array<{ userId: string; role: TeamMemberRole; displayName: string; username: string; avatarUrl: string; isOwner: boolean }>,
+  canManageAllTeams = false
 ) {
-  return `<p><a href="/">← Back to dashboard</a></p>
+  return `<p><a href="${canManageAllTeams ? '/administrator' : '/'}">← Back to ${canManageAllTeams ? 'administrator' : 'dashboard'}</a></p>
     <section class="card">
       <h2>Team role color</h2>
       <form method="post" action="/teams/${encodeURIComponent(team.id)}/color" class="inline-form">
@@ -451,19 +583,22 @@ function managedMember(
   return `<div class="managed-member">
     ${member.avatarUrl ? `<img src="${escapeHtml(member.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
     <div class="member-info">
-      <strong>${escapeHtml(member.displayName)}</strong> ${member.isOwner ? '<span class="pill">owner</span>' : ''}<br />
+      <strong>${escapeHtml(member.displayName)}</strong> ${member.isOwner ? '<span class="pill">captain</span>' : ''}<br />
       <small>@${escapeHtml(member.username)}</small>
     </div>
-    <form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/role" class="inline-form">
-      <select name="role" aria-label="Team role for ${escapeHtml(member.displayName)}">
-        ${teamRoleOptions(member.role)}
-      </select>
-      <button type="submit">Save role</button>
-    </form>
     ${
       member.isOwner
-        ? ''
-        : `<form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/kick" onsubmit="return confirm('Kick ${escapeJsString(member.displayName)} from ${escapeJsString(team.name)}?');">
+        ? `<span class="role-label">${teamRoleLabel(member.role)}</span>`
+        : `<form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/role" class="inline-form">
+             <select name="role" aria-label="Team role for ${escapeHtml(member.displayName)}">
+               ${teamRoleOptions(member.role)}
+             </select>
+             <button type="submit">Save role</button>
+           </form>
+           <form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/transfer-ownership" onsubmit="return confirm('Transfer captain ownership of ${escapeJsString(team.name)} to ${escapeJsString(member.displayName)}? This will make them the team owner.');">
+             <button class="secondary" type="submit">Make captain</button>
+           </form>
+           <form method="post" action="/teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.userId)}/kick" onsubmit="return confirm('Kick ${escapeJsString(member.displayName)} from ${escapeJsString(team.name)}?');">
              <button class="danger" type="submit">Kick</button>
            </form>`
     }
@@ -472,8 +607,12 @@ function managedMember(
 
 function teamRoleOptions(selected: TeamMemberRole) {
   return (['sub', 'main', 'coach'] as TeamMemberRole[])
-    .map((role) => `<option value="${role}"${role === selected ? ' selected' : ''}>${role}</option>`)
+    .map((role) => `<option value="${role}"${role === selected ? ' selected' : ''}>${teamRoleLabel(role)}</option>`)
     .join('');
+}
+
+function teamRoleLabel(role: TeamMemberRole) {
+  return role.charAt(0).toUpperCase() + role.slice(1);
 }
 
 function parseTeamMemberRole(role: unknown): TeamMemberRole {
@@ -508,10 +647,12 @@ function layout(title: string, body: string) {
     .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #4b5563; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
     .management-list { display: grid; gap: .75rem; }
+    .admin-team-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; background: #111827; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; flex-wrap: wrap; }
+    .admin-team-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
     .member-info { flex: 1 1 12rem; }
     .member img, .managed-member img, .avatar-placeholder { width: 36px; height: 36px; border-radius: 999px; background: #374151; }
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
-    .pill { display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border-radius: 999px; background: #374151; color: #d1d5db; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+    .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border-radius: 999px; background: #374151; color: #d1d5db; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
     small { color: #9ca3af; }
     code { background: #1f2937; border-radius: .25rem; padding: .15rem .35rem; }
   </style>

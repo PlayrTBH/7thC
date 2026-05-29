@@ -18,10 +18,13 @@ import { config } from './config.js';
 import type { JsonStore } from './store.js';
 import type { Team, TeamInvite, TeamMemberRole } from './types.js';
 
+const organizationRoleColor = '#6b7280';
+
 const organizationalRoleConfig: Record<TeamMemberRole, { name: string; color: ColorResolvable }> = {
-  sub: { name: 'Team Sub', color: '#6b7280' },
-  main: { name: 'Team Main', color: '#3b82f6' },
-  coach: { name: 'Team Coach', color: '#f59e0b' }
+  sub: { name: 'Team Sub', color: organizationRoleColor },
+  main: { name: 'Team Main', color: organizationRoleColor },
+  coach: { name: 'Team Coach', color: organizationRoleColor },
+  captain: { name: 'Team Captain', color: organizationRoleColor }
 };
 
 export class TeamBot {
@@ -61,6 +64,7 @@ export class TeamBot {
       }
       this.client.once(Events.ClientReady, () => resolve());
     });
+    await this.ensureTeamRolesHoisted();
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
   }
 
@@ -72,6 +76,40 @@ export class TeamBot {
   async getGuildMember(userId: string) {
     const guild = await this.getGuild();
     return guild.members.fetch(userId).catch(() => null);
+  }
+
+  async getAdministratorAccess(userId: string) {
+    const guild = await this.getGuild();
+    if (guild.ownerId === userId) return { isOwner: true, isAdmin: true };
+
+    const settings = await this.store.getAdministratorSettings();
+    if (!settings.adminRoleId) return { isOwner: false, isAdmin: false };
+
+    const member = await guild.members.fetch(userId).catch(() => null);
+    return { isOwner: false, isAdmin: Boolean(member?.roles.cache.has(settings.adminRoleId)) };
+  }
+
+  async getGuildRoles() {
+    const guild = await this.getGuild();
+    const roles = await guild.roles.fetch();
+    return roles
+      .filter((role) => role.id !== guild.roles.everyone.id)
+      .map((role) => ({ id: role.id, name: role.name, managed: role.managed, position: role.position }))
+      .sort((a, b) => b.position - a.position || a.name.localeCompare(b.name));
+  }
+
+  async ensureTeamRolesHoisted() {
+    const guild = await this.getGuild();
+    const teams = await this.store.getTeams();
+    await Promise.all(
+      teams.map(async (team) => {
+        const role = await guild.roles.fetch(team.roleId).catch(() => null);
+        if (!role || role.hoist) return;
+        await role.edit({ hoist: true, reason: 'Team roles are displayed separately by Team Hub' }).catch((error) => {
+          console.warn(`Unable to hoist team role ${team.roleId}:`, error);
+        });
+      })
+    );
   }
 
   async searchInvitableMembers(currentUserId: string, rawQuery: string) {
@@ -129,6 +167,7 @@ export class TeamBot {
     const role = await guild.roles.create({
       name: teamName,
       color: 'Random',
+      hoist: true,
       permissions: [],
       reason: `Team role created by ${owner.user.tag}`
     });
@@ -173,7 +212,7 @@ export class TeamBot {
     });
 
     await owner.roles.add(role, 'Team owner role assignment');
-    await this.applyOrganizationalRole(owner, 'coach');
+    await this.applyOrganizationalRole(owner, 'captain');
 
     const team: Team = {
       id: randomUUID(),
@@ -187,17 +226,17 @@ export class TeamBot {
       voiceChannelId: voiceChannel.id,
       createdAt: new Date().toISOString()
     };
-    await this.store.addTeam(team, 'coach');
+    await this.store.addTeam(team, 'captain');
 
     const invites = await this.createAndSendInvites(guild, owner, team, inviteeIds);
 
     return { team, invites };
   }
 
-  async inviteTeamMembers(teamId: string, inviterId: string, inviteeIds: string[]) {
+  async inviteTeamMembers(teamId: string, inviterId: string, inviteeIds: string[], allowNonOwner = false) {
     const team = await this.store.getTeam(teamId);
     if (!team) throw new Error('Team not found.');
-    if (team.ownerId !== inviterId) throw new Error('Only the team owner can invite new members.');
+    if (!allowNonOwner && team.ownerId !== inviterId) throw new Error('Only the team owner can invite new members.');
 
     const guild = await this.getGuild();
     const inviter = await guild.members.fetch(inviterId);
@@ -215,6 +254,24 @@ export class TeamBot {
     const member = await guild.members.fetch(userId);
     await this.applyOrganizationalRole(member, role);
     await this.store.setTeamMemberRole(teamId, userId, role);
+  }
+
+  async transferTeamOwnership(teamId: string, newOwnerId: string) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+    if (team.ownerId === newOwnerId) throw new Error('That member is already the team captain.');
+
+    const newOwnerRecord = await this.store.getTeamMember(teamId, newOwnerId);
+    if (!newOwnerRecord) throw new Error('New captain must already be a team member.');
+
+    const guild = await this.getGuild();
+    const newOwner = await guild.members.fetch(newOwnerId);
+    const previousOwner = await guild.members.fetch(team.ownerId).catch(() => null);
+
+    await newOwner.roles.add(team.roleId, 'Team captain transfer');
+    await this.applyOrganizationalRole(newOwner, 'captain');
+    if (previousOwner) await this.applyOrganizationalRole(previousOwner, 'coach');
+    await this.store.transferTeamOwnership(teamId, newOwnerId);
   }
 
   async kickTeamMember(teamId: string, userId: string) {
@@ -368,6 +425,9 @@ export class TeamBot {
     for (const [role, settings] of Object.entries(organizationalRoleConfig) as Array<[TeamMemberRole, (typeof organizationalRoleConfig)[TeamMemberRole]]>) {
       const existingRole = existingRoles.find((item) => item.name === settings.name);
       if (existingRole) {
+        if (!existingRole.managed && (existingRole.hexColor.toLowerCase() !== String(settings.color).toLowerCase() || existingRole.hoist)) {
+          await existingRole.edit({ color: settings.color, hoist: false, reason: 'Team organization role style normalized by Team Hub' });
+        }
         roleIds.set(role, existingRole.id);
         continue;
       }
@@ -375,6 +435,7 @@ export class TeamBot {
       const createdRole = await guild.roles.create({
         name: settings.name,
         color: settings.color,
+        hoist: false,
         permissions: [],
         reason: 'Generic team organization role created by Team Hub'
       });
