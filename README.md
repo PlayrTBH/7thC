@@ -1,4 +1,4 @@
-# Discord Team Hub
+# 7th Circle Team Hub
 
 Self-hosted Discord bot + website integration for creating lightweight teams inside a Discord server.
 

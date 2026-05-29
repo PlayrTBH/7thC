@@ -11,6 +11,7 @@ import {
   PermissionsBitField,
   type ColorResolvable,
   type Guild,
+  type Role,
   type GuildMember
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
@@ -32,6 +33,8 @@ export class TeamBot {
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.DirectMessages],
     partials: [Partials.Channel]
   });
+
+  private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
 
   constructor(private readonly store: JsonStore) {
     this.client.on(Events.InteractionCreate, async (interaction) => {
@@ -64,7 +67,7 @@ export class TeamBot {
       }
       this.client.once(Events.ClientReady, () => resolve());
     });
-    await this.ensureTeamRolesHoisted();
+    await this.ensureTeamRolesDisplayed();
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
   }
 
@@ -98,18 +101,15 @@ export class TeamBot {
       .sort((a, b) => b.position - a.position || a.name.localeCompare(b.name));
   }
 
-  async ensureTeamRolesHoisted() {
+  async ensureTeamRolesDisplayed() {
     const guild = await this.getGuild();
     const teams = await this.store.getTeams();
-    await Promise.all(
-      teams.map(async (team) => {
-        const role = await guild.roles.fetch(team.roleId).catch(() => null);
-        if (!role || role.hoist) return;
-        await role.edit({ hoist: true, reason: 'Team roles are displayed separately by Team Hub' }).catch((error) => {
-          console.warn(`Unable to hoist team role ${team.roleId}:`, error);
-        });
-      })
-    );
+    const organizationRoleIds = await this.ensureOrganizationalRoles(guild);
+    for (const team of teams) {
+      await this.ensureTeamRolePlacement(guild, team.roleId, organizationRoleIds).catch((error) => {
+        console.warn(`Unable to place team role ${team.roleId} above organization roles:`, error);
+      });
+    }
   }
 
   async searchInvitableMembers(currentUserId: string, rawQuery: string) {
@@ -152,6 +152,26 @@ export class TeamBot {
   }
 
   async createTeam(ownerId: string, rawTeamName: string, inviteeIds: string[]) {
+    const activeCreation = this.teamCreationLocks.get(ownerId);
+    if (activeCreation) {
+      await activeCreation.catch(() => undefined);
+      if (await this.store.getTeamForUser(ownerId)) {
+        throw new Error('You are already in a team. Leave or delete your current team before creating another one.');
+      }
+    }
+
+    const creation = this.createTeamUnlocked(ownerId, rawTeamName, inviteeIds);
+    this.teamCreationLocks.set(ownerId, creation);
+    try {
+      return await creation;
+    } finally {
+      if (this.teamCreationLocks.get(ownerId) === creation) {
+        this.teamCreationLocks.delete(ownerId);
+      }
+    }
+  }
+
+  private async createTeamUnlocked(ownerId: string, rawTeamName: string, inviteeIds: string[]) {
     if (await this.store.getTeamForUser(ownerId)) {
       throw new Error('You are already in a team. Leave or delete your current team before creating another one.');
     }
@@ -162,7 +182,7 @@ export class TeamBot {
     const safeChannelName = toChannelName(teamName);
 
     await assertBotPermissions(guild);
-    await this.ensureOrganizationalRoles(guild);
+    const organizationRoleIds = await this.ensureOrganizationalRoles(guild);
 
     const role = await guild.roles.create({
       name: teamName,
@@ -211,9 +231,6 @@ export class TeamBot {
       reason: `Team voice channel created by ${owner.user.tag}`
     });
 
-    await owner.roles.add(role, 'Team owner role assignment');
-    await this.applyOrganizationalRole(owner, 'captain');
-
     const team: Team = {
       id: randomUUID(),
       name: teamName,
@@ -226,7 +243,20 @@ export class TeamBot {
       voiceChannelId: voiceChannel.id,
       createdAt: new Date().toISOString()
     };
-    await this.store.addTeam(team, 'captain');
+    try {
+      await this.ensureTeamRolePlacement(guild, role, organizationRoleIds);
+      await owner.roles.add(role, 'Team owner role assignment');
+      await this.applyOrganizationalRole(owner, 'captain');
+      await this.store.addTeam(team, 'captain');
+    } catch (error) {
+      await guild.channels.delete(textChannel.id, 'Team creation rolled back').catch(() => undefined);
+      await guild.channels.delete(voiceChannel.id, 'Team creation rolled back').catch(() => undefined);
+      await guild.channels.delete(category.id, 'Team creation rolled back').catch(() => undefined);
+      await guild.roles.delete(role.id, 'Team creation rolled back').catch(() => undefined);
+      await owner.roles.remove(role.id, 'Team creation rolled back').catch(() => undefined);
+      await this.removeOrganizationalRoles(owner).catch(() => undefined);
+      throw error;
+    }
 
     const invites = await this.createAndSendInvites(guild, owner, team, inviteeIds);
 
@@ -303,7 +333,7 @@ export class TeamBot {
     const role = await guild.roles.fetch(team.roleId);
     if (!role) throw new Error('Team role no longer exists in Discord.');
 
-    await role.setColor(color, 'Team role color changed from website');
+    await role.setColor(color, 'Team role color changed from 7th Circle Team Hub');
     await this.store.updateTeamRoleColor(teamId, color);
   }
 
@@ -353,6 +383,28 @@ export class TeamBot {
     const addedInvites = await this.store.addInvites(invites);
     await Promise.all(addedInvites.map((invite) => this.sendInviteDm(guild, inviter, team, invite)));
     return addedInvites;
+  }
+
+  private async ensureTeamRolePlacement(guild: Guild, roleOrId: Role | string, organizationRoleIds?: Map<TeamMemberRole, string>) {
+    const roleIds = organizationRoleIds ?? (await this.ensureOrganizationalRoles(guild));
+    const roles = await guild.roles.fetch();
+    let teamRole = typeof roleOrId === 'string' ? roles.get(roleOrId) ?? (await guild.roles.fetch(roleOrId)) : roleOrId;
+    if (!teamRole) return;
+
+    const organizationRoles = [...roleIds.values()]
+      .map((roleId) => roles.get(roleId))
+      .filter((role): role is Role => Boolean(role));
+    if (!organizationRoles.length) return;
+
+    const highestOrganizationRolePosition = Math.max(...organizationRoles.map((role) => role.position));
+    if (!teamRole.hoist) {
+      teamRole = await teamRole.setHoist(true, 'Team roles are displayed separately by 7th Circle Team Hub');
+    }
+    if (teamRole.position <= highestOrganizationRolePosition) {
+      await teamRole.setPosition(highestOrganizationRolePosition + 1, {
+        reason: 'Team roles are placed above 7th Circle Team Hub organization roles'
+      });
+    }
   }
 
   private async sendInviteDm(guild: Guild, owner: GuildMember, team: Team, invite: TeamInvite) {
@@ -426,7 +478,7 @@ export class TeamBot {
       const existingRole = existingRoles.find((item) => item.name === settings.name);
       if (existingRole) {
         if (!existingRole.managed && (existingRole.hexColor.toLowerCase() !== String(settings.color).toLowerCase() || existingRole.hoist)) {
-          await existingRole.edit({ color: settings.color, hoist: false, reason: 'Team organization role style normalized by Team Hub' });
+          await existingRole.edit({ color: settings.color, hoist: false, reason: 'Team organization role style normalized by 7th Circle Team Hub' });
         }
         roleIds.set(role, existingRole.id);
         continue;
@@ -437,7 +489,7 @@ export class TeamBot {
         color: settings.color,
         hoist: false,
         permissions: [],
-        reason: 'Generic team organization role created by Team Hub'
+        reason: 'Generic team organization role created by 7th Circle Team Hub'
       });
       roleIds.set(role, createdRole.id);
     }
