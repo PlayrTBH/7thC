@@ -18,6 +18,10 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 
   app.set('trust proxy', 1);
   app.use(express.urlencoded({ extended: false }));
+  app.get('/favicon.svg', (_req, res) => {
+    res.type('image/svg+xml').send(FAVICON_SVG);
+  });
+
   app.use(
     session({
       name: 'teamhub.sid',
@@ -36,7 +40,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const user = req.session.discordUser;
       if (!user) {
-        res.send(layout('Discord Team Hub', `<p>Create private Discord team roles and channels from a web form.</p><p><a class="button" href="/auth/discord">Log in with Discord</a></p>`));
+        res.send(layout('Discord Team Hub', `<section class="hero-card"><p class="eyebrow">Discord Team Hub</p><h2>Build and manage competitive teams in one clean command center.</h2><p>Create private Discord team roles and channels from a web form.</p><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
         return;
       }
 
@@ -45,9 +49,10 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       res.send(
         layout(
           'Dashboard',
-          `<p>Logged in as <strong>${escapeHtml(displayUser(user))}</strong>. <a href="/logout">Log out</a></p>
+          `<p class="page-intro">Logged in as <strong>${escapeHtml(displayUser(user))}</strong>.</p>
            ${administratorAccess.isAdmin ? '<p><a class="button secondary" href="/administrator">Administrator page</a></p>' : ''}
-           ${dashboardTeamSection(currentTeam, user.id)}`
+           ${dashboardTeamSection(currentTeam, user.id)}`,
+          { user, isAdmin: administratorAccess.isAdmin, active: 'dashboard' }
         )
       );
     } catch (error) {
@@ -95,7 +100,17 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     req.session.destroy(() => res.redirect('/'));
   });
 
-  app.get('/administrator', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
+  app.get('/settings', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const administratorAccess = await bot.getAdministratorAccess(user.id);
+      res.send(layout('Account settings', settingsPage(user), { user, isAdmin: administratorAccess.isAdmin, active: 'settings' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/administrator', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const access = res.locals.administratorAccess as AdministratorAccess;
       const [teams, settings, roles] = await Promise.all([
@@ -109,7 +124,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           memberCount: (await store.getTeamMembers(team.id)).length
         }))
       );
-      res.send(layout('Administrator', administratorPage(teamSummaries, access, roles, settings.adminRoleId)));
+      res.send(layout('Administrator', administratorPage(teamSummaries, access, roles, settings.adminRoleId), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -144,11 +159,11 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       const user = req.session.discordUser!;
       const currentTeam = await store.getTeamForUser(user.id);
       if (currentTeam) {
-        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`));
+        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, active: 'teams' }));
         return;
       }
 
-      res.send(layout('Create a team', teamForm()));
+      res.send(layout('Create a team', teamForm(), { user, active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -166,7 +181,8 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           'Team created',
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
            <p>${invites.length} invite DM${invites.length === 1 ? '' : 's'} queued.</p>
-           <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`
+           <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`,
+          { user, active: 'teams' }
         )
       );
     } catch (error) {
@@ -178,7 +194,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const team = res.locals.team as Team;
       const members = await bot.getTeamMemberDetails(team.id);
-      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members, Boolean(res.locals.canManageAllTeams))));
+      res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members, Boolean(res.locals.canManageAllTeams)), { user: req.session.discordUser, isAdmin: Boolean(res.locals.canManageAllTeams), active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -256,16 +272,25 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
-  app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
     console.error(error);
     const message = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).send(layout('Something went wrong', `<p>${escapeHtml(message)}</p><p><a href="/">Back home</a></p>`));
+    res.status(500).send(layout('Something went wrong', `<p>${escapeHtml(message)}</p><p><a href="/">Back home</a></p>`, { user: req.session.discordUser }));
   });
 
   return app;
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; active?: 'dashboard' | 'teams' | 'administrator' | 'settings' };
+
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#020202"/>
+  <path d="M545 102c200 21 356 190 356 396 0 220-179 399-399 399-171 0-317-108-373-260h113c50 95 149 158 260 158 164 0 297-133 297-297 0-149-110-273-254-294z" fill="#0b0b0c"/>
+  <path d="M118 100h377v101L279 592H129l216-378H118z" fill="#c90820"/>
+  <path d="M176 264h83L100 541v-58c0-79 27-155 76-219z" fill="#ffffff"/>
+</svg>`;
+
 
 function selectedMemberIds(memberIds: unknown) {
   return Array.isArray(memberIds) ? memberIds.map(String) : memberIds ? [String(memberIds)] : [];
@@ -313,7 +338,7 @@ function requireGuildAdministrator(bot: TeamBot) {
     try {
       const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
       if (!access.isAdmin) {
-        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner or configured administrator role can access this page.</p><p><a href="/">Back home</a></p>'));
+        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner or configured administrator role can access this page.</p><p><a href="/">Back home</a></p>', { user: req.session.discordUser }));
         return;
       }
       res.locals.administratorAccess = access;
@@ -329,7 +354,7 @@ function requireGuildOwner(bot: TeamBot) {
     try {
       const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
       if (!access.isOwner) {
-        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner can change administrator settings.</p><p><a href="/administrator">Back to administrator</a></p>'));
+        res.status(403).send(layout('Not allowed', '<p>Only the Discord owner can change administrator settings.</p><p><a href="/administrator">Back to administrator</a></p>', { user: req.session.discordUser }));
         return;
       }
       res.locals.administratorAccess = access;
@@ -346,12 +371,12 @@ function requireTeamManager(bot: TeamBot, store: JsonStore) {
       const user = req.session.discordUser!;
       const team = await store.getTeam(req.params.teamId);
       if (!team) {
-        res.status(404).send(layout('Team not found', '<p>That team does not exist.</p><p><a href="/">Back home</a></p>'));
+        res.status(404).send(layout('Team not found', '<p>That team does not exist.</p><p><a href="/">Back home</a></p>', { user }));
         return;
       }
       const access = await bot.getAdministratorAccess(user.id);
       if (team.ownerId !== user.id && !access.isAdmin) {
-        res.status(403).send(layout('Not allowed', '<p>Only the team owner or a server administrator can manage this team.</p><p><a href="/">Back home</a></p>'));
+        res.status(403).send(layout('Not allowed', '<p>Only the team owner or a server administrator can manage this team.</p><p><a href="/">Back home</a></p>', { user, isAdmin: access.isAdmin }));
         return;
       }
       res.locals.team = team;
@@ -362,6 +387,19 @@ function requireTeamManager(bot: TeamBot, store: JsonStore) {
       next(error);
     }
   };
+}
+
+function settingsPage(user: DiscordUser) {
+  return `<section class="card profile-card">
+    <img class="profile-avatar" src="${escapeHtml(discordAvatarUrl(user, 160))}" alt="" />
+    <div>
+      <p class="eyebrow">Account</p>
+      <h2>${escapeHtml(displayUser(user))}</h2>
+      <p><small>@${escapeHtml(user.username)} · Discord ID <code>${escapeHtml(user.id)}</code></small></p>
+      <p>Use this page to confirm which Discord account is connected to Team Hub.</p>
+      <p><a class="button danger" href="/logout">Log out</a></p>
+    </div>
+  </section>`;
 }
 
 function administratorPage(
@@ -620,45 +658,96 @@ function parseTeamMemberRole(role: unknown): TeamMemberRole {
   throw new Error('Invalid team member role.');
 }
 
-function layout(title: string, body: string) {
+function layout(title: string, body: string, options: LayoutOptions = {}) {
+  const nav = navigation(options);
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)} · Discord Team Hub</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <style>
-    body { font-family: Inter, system-ui, sans-serif; margin: 0; background: #111827; color: #f9fafb; }
-    main { max-width: 900px; margin: 0 auto; padding: 3rem 1.25rem; }
-    a { color: #93c5fd; } .button, button { background: #5865f2; color: white; border: 0; border-radius: .5rem; padding: .75rem 1rem; text-decoration: none; cursor: pointer; display: inline-block; }
-    .secondary { background: #374151; } .danger { background: #dc2626; } .danger-zone { border-color: #7f1d1d; }
-    input, select { border-radius: .4rem; border: 1px solid #4b5563; padding: .6rem; margin-left: .5rem; background: #111827; color: #f9fafb; }
+    :root { color-scheme: dark; --bg: #0b0c0f; --panel: #17191f; --panel-strong: #20232b; --muted: #a8b0bd; --text: #f4f6fb; --line: #30343d; --red: #c90820; --red-strong: #ef233c; --red-soft: rgba(201, 8, 32, .16); --shadow: 0 24px 70px rgba(0, 0, 0, .45); }
+    * { box-sizing: border-box; }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; background: radial-gradient(circle at top left, rgba(201, 8, 32, .18), transparent 32rem), linear-gradient(135deg, #101116 0%, var(--bg) 52%, #050506 100%); color: var(--text); }
+    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px); background-size: 44px 44px; mask-image: linear-gradient(to bottom, rgba(0,0,0,.8), transparent 75%); }
+    a { color: #ff6b7a; text-decoration: none; } a:hover { color: #ff8f9a; }
+    .topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .85rem clamp(1rem, 4vw, 3rem); border-bottom: 1px solid rgba(255,255,255,.08); background: rgba(11, 12, 15, .82); backdrop-filter: blur(18px); }
+    .brand { display: inline-flex; align-items: center; gap: .75rem; color: var(--text); font-weight: 800; letter-spacing: .02em; }
+    .brand-mark { width: 2.35rem; height: 2.35rem; border-radius: .8rem; box-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 10px 30px rgba(201,8,32,.24); }
+    .nav-shell { display: flex; align-items: center; gap: 1rem; }
+    .nav-links { display: flex; align-items: center; gap: .35rem; padding: .25rem; border: 1px solid rgba(255,255,255,.08); border-radius: 999px; background: rgba(255,255,255,.035); }
+    .nav-links a { color: var(--muted); padding: .55rem .9rem; border-radius: 999px; font-size: .94rem; font-weight: 700; }
+    .nav-links a.active, .nav-links a:hover { color: var(--text); background: var(--red-soft); box-shadow: inset 0 0 0 1px rgba(239,35,60,.28); }
+    .account-link { display: inline-flex; align-items: center; gap: .6rem; color: var(--text); padding: .35rem .75rem .35rem .35rem; border: 1px solid rgba(255,255,255,.08); border-radius: 999px; background: rgba(255,255,255,.045); font-weight: 700; }
+    .account-link.active, .account-link:hover { background: var(--red-soft); box-shadow: inset 0 0 0 1px rgba(239,35,60,.26); color: var(--text); }
+    .account-link img { width: 2rem; height: 2rem; border-radius: 999px; border: 2px solid rgba(239,35,60,.65); object-fit: cover; }
+    main { width: min(1060px, calc(100% - 2rem)); margin: 0 auto; padding: 3rem 0 4rem; }
+    .page-header { margin-bottom: 1.5rem; } h1 { margin: 0; font-size: clamp(2rem, 5vw, 4.25rem); letter-spacing: -.06em; line-height: .95; } h2 { margin-top: 0; letter-spacing: -.03em; } .page-intro { color: var(--muted); }
+    .hero-card { position: relative; overflow: hidden; padding: clamp(1.5rem, 5vw, 4rem); border: 1px solid rgba(239,35,60,.28); border-radius: 1.5rem; background: linear-gradient(145deg, rgba(32,35,43,.94), rgba(12,13,17,.96)); box-shadow: var(--shadow); }
+    .hero-card::after { content: "7"; position: absolute; right: clamp(1rem, 7vw, 5rem); bottom: -2.5rem; color: rgba(201,8,32,.18); font-size: clamp(10rem, 28vw, 20rem); font-weight: 950; line-height: .8; }
+    .hero-card h2 { max-width: 720px; margin: .25rem 0 1rem; font-size: clamp(2.25rem, 7vw, 5.5rem); line-height: .9; }
+    .eyebrow { margin: 0 0 .75rem; color: var(--red-strong); text-transform: uppercase; letter-spacing: .16em; font-size: .78rem; font-weight: 900; }
+    .button, button { background: linear-gradient(135deg, var(--red), #8f0617); color: white; border: 0; border-radius: .8rem; padding: .78rem 1rem; text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font-weight: 800; box-shadow: 0 12px 30px rgba(201,8,32,.22); }
+    button:hover, .button:hover { transform: translateY(-1px); color: white; }
+    .secondary { background: #2b2f38; box-shadow: none; } .danger { background: linear-gradient(135deg, #ef233c, #9f0719); } .danger-zone { border-color: rgba(239,35,60,.45); }
+    input, select { border-radius: .7rem; border: 1px solid var(--line); padding: .68rem .78rem; margin-left: .5rem; background: #0f1116; color: var(--text); outline: none; }
+    input:focus, select:focus { border-color: var(--red-strong); box-shadow: 0 0 0 3px rgba(239,35,60,.18); }
     input[type="color"] { width: 4rem; height: 2.6rem; padding: .2rem; vertical-align: middle; }
-    .card { background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: 1rem; margin: 1rem 0; }
+    .card { background: linear-gradient(180deg, rgba(32,35,43,.96), rgba(23,25,31,.96)); border: 1px solid rgba(255,255,255,.08); border-radius: 1.1rem; padding: 1.15rem; margin: 1rem 0; box-shadow: 0 18px 45px rgba(0,0,0,.24); }
     .member-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; margin: 1rem 0; }
-    .member, .managed-member { display: flex; align-items: center; gap: .75rem; background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; }
-    .member-result { width: 100%; text-align: left; color: #f9fafb; }
-    .member-result:hover { border-color: #93c5fd; }
+    .member, .managed-member { display: flex; align-items: center; gap: .75rem; background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .8rem; }
+    .member-result { width: 100%; text-align: left; color: var(--text); box-shadow: none; }
+    .member-result:hover { border-color: var(--red-strong); }
     .invite-search { display: grid; gap: .4rem; margin: 1rem 0; }
     .invite-search input { margin-left: 0; max-width: 28rem; }
     .selected-members { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: 1rem 0; }
     .selected-members h3 { flex-basis: 100%; margin: 0; }
-    .selected-member { display: inline-flex; align-items: center; gap: .4rem; background: #374151; border-radius: 999px; padding: .35rem .45rem .35rem .75rem; }
-    .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #4b5563; }
+    .selected-member { display: inline-flex; align-items: center; gap: .4rem; background: var(--red-soft); border: 1px solid rgba(239,35,60,.24); border-radius: 999px; padding: .35rem .45rem .35rem .75rem; }
+    .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #3a1017; box-shadow: none; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
     .management-list { display: grid; gap: .75rem; }
-    .admin-team-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; background: #111827; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; flex-wrap: wrap; }
+    .admin-team-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; flex-wrap: wrap; }
     .admin-team-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
     .member-info { flex: 1 1 12rem; }
-    .member img, .managed-member img, .avatar-placeholder { width: 36px; height: 36px; border-radius: 999px; background: #374151; }
+    .member img, .managed-member img, .avatar-placeholder { width: 38px; height: 38px; border-radius: 999px; background: #2b2f38; object-fit: cover; }
+    .profile-card { display: flex; align-items: center; gap: 1.25rem; }
+    .profile-avatar { width: 96px; height: 96px; border-radius: 1.25rem; border: 2px solid rgba(239,35,60,.7); object-fit: cover; }
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
-    .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border-radius: 999px; background: #374151; color: #d1d5db; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
-    small { color: #9ca3af; }
-    code { background: #1f2937; border-radius: .25rem; padding: .15rem .35rem; }
+    .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .16rem .5rem; border-radius: 999px; background: var(--red-soft); color: #ffb3bc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+    small { color: var(--muted); } code { background: #0f1116; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .35rem; color: #ffd4d9; }
+    @media (max-width: 720px) { .topbar { align-items: stretch; flex-direction: column; } .nav-shell { justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
-<body><main><h1>${escapeHtml(title)}</h1>${body}</main></body>
+<body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main></body>
 </html>`;
+}
+
+function navigation(options: LayoutOptions) {
+  const activeClass = (key: LayoutOptions['active']) => options.active === key ? ' class="active"' : '';
+  const adminLink = options.user && options.isAdmin ? `<a href="/administrator"${activeClass('administrator')}>Administrator</a>` : '';
+  const userControls = options.user
+    ? `<a class="account-link${options.active === 'settings' ? ' active' : ''}" href="/settings" title="Open account settings"><img src="${escapeHtml(discordAvatarUrl(options.user))}" alt="" /><span>${escapeHtml(displayUser(options.user))}</span></a>`
+    : '<a class="button" href="/auth/discord">Log in</a>';
+
+  return `<header class="topbar">
+    <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7thC Team Hub</span></a>
+    <div class="nav-shell">
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a href="/"${activeClass('dashboard')}>Dashboard</a>
+        ${options.user ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
+        ${adminLink}
+      </nav>
+      ${userControls}
+    </div>
+  </header>`;
+}
+
+function discordAvatarUrl(user: DiscordUser, size = 64) {
+  if (user.avatar) return `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=${size}`;
+  const fallbackIndex = Number(user.discriminator ?? '0') % 5;
+  return `https://cdn.discordapp.com/embed/avatars/${fallbackIndex}.png`;
 }
 
 function displayUser(user: DiscordUser) {
