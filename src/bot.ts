@@ -9,13 +9,20 @@ import {
   OverwriteType,
   Partials,
   PermissionsBitField,
+  type ColorResolvable,
   type Guild,
   type GuildMember
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { Team, TeamInvite } from './types.js';
+import type { Team, TeamInvite, TeamMemberRole } from './types.js';
+
+const organizationalRoleConfig: Record<TeamMemberRole, { name: string; color: ColorResolvable }> = {
+  sub: { name: 'Team Sub', color: '#6b7280' },
+  main: { name: 'Team Main', color: '#3b82f6' },
+  coach: { name: 'Team Coach', color: '#f59e0b' }
+};
 
 export class TeamBot {
   readonly client = new Client({
@@ -32,7 +39,7 @@ export class TeamBot {
       try {
         if (action === 'accept') {
           await this.acceptInvite(inviteId, interaction.user.id);
-          await interaction.reply({ content: 'Invite accepted. Your team role has been added.', ephemeral: true });
+          await interaction.reply({ content: 'Invite accepted. Your team roles have been added.', ephemeral: true });
         }
         if (action === 'decline') {
           await this.declineInvite(inviteId, interaction.user.id);
@@ -70,8 +77,9 @@ export class TeamBot {
   async listInvitableMembers(currentUserId: string) {
     const guild = await this.getGuild();
     const members = await guild.members.fetch();
+    const unavailableUserIds = await this.store.getTeamMemberUserIds();
     return members
-      .filter((member) => !member.user.bot && member.id !== currentUserId)
+      .filter((member) => !member.user.bot && member.id !== currentUserId && !unavailableUserIds.has(member.id))
       .map((member) => ({
         id: member.id,
         displayName: member.displayName,
@@ -81,13 +89,38 @@ export class TeamBot {
       .sort((a, b) => a.displayName.localeCompare(b.displayName));
   }
 
+  async getTeamMemberDetails(teamId: string) {
+    const guild = await this.getGuild();
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+
+    const members = await this.store.getTeamMembers(teamId);
+    return Promise.all(
+      members.map(async (membership) => {
+        const member = await guild.members.fetch(membership.userId).catch(() => null);
+        return {
+          ...membership,
+          displayName: member?.displayName ?? membership.userId,
+          username: member?.user.username ?? membership.userId,
+          avatarUrl: member?.displayAvatarURL({ size: 64 }) ?? '',
+          isOwner: membership.userId === team.ownerId
+        };
+      })
+    );
+  }
+
   async createTeam(ownerId: string, rawTeamName: string, inviteeIds: string[]) {
+    if (await this.store.getTeamForUser(ownerId)) {
+      throw new Error('You are already in a team. Leave or delete your current team before creating another one.');
+    }
+
     const guild = await this.getGuild();
     const owner = await guild.members.fetch(ownerId);
     const teamName = normalizeTeamName(rawTeamName);
     const safeChannelName = toChannelName(teamName);
 
     await assertBotPermissions(guild);
+    await this.ensureOrganizationalRoles(guild);
 
     const role = await guild.roles.create({
       name: teamName,
@@ -136,6 +169,7 @@ export class TeamBot {
     });
 
     await owner.roles.add(role, 'Team owner role assignment');
+    await this.applyOrganizationalRole(owner, 'coach');
 
     const team: Team = {
       id: randomUUID(),
@@ -143,15 +177,17 @@ export class TeamBot {
       ownerId,
       guildId: guild.id,
       roleId: role.id,
+      roleColor: role.hexColor,
       categoryId: category.id,
       textChannelId: textChannel.id,
       voiceChannelId: voiceChannel.id,
       createdAt: new Date().toISOString()
     };
-    await this.store.addTeam(team);
+    await this.store.addTeam(team, 'coach');
 
+    const unavailableUserIds = await this.store.getTeamMemberUserIds();
     const invites: TeamInvite[] = unique(inviteeIds)
-      .filter((inviteeId) => inviteeId !== ownerId)
+      .filter((inviteeId) => inviteeId !== ownerId && !unavailableUserIds.has(inviteeId))
       .map((inviteeId) => ({
         id: randomUUID(),
         teamId: team.id,
@@ -165,6 +201,75 @@ export class TeamBot {
     await Promise.all(invites.map((invite) => this.sendInviteDm(guild, owner, team, invite)));
 
     return { team, invites };
+  }
+
+  async setTeamMemberRole(teamId: string, userId: string, role: TeamMemberRole) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+
+    const memberRecord = await this.store.getTeamMember(teamId, userId);
+    if (!memberRecord) throw new Error('Team member not found.');
+
+    const guild = await this.getGuild();
+    const member = await guild.members.fetch(userId);
+    await this.applyOrganizationalRole(member, role);
+    await this.store.setTeamMemberRole(teamId, userId, role);
+  }
+
+  async kickTeamMember(teamId: string, userId: string) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+    if (team.ownerId === userId) throw new Error('Team owners cannot be kicked. Delete the team instead.');
+
+    const guild = await this.getGuild();
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member) {
+      await member.roles.remove(team.roleId, 'Removed from team');
+      await this.removeOrganizationalRoles(member);
+    }
+    await this.store.removeTeamMember(teamId, userId);
+  }
+
+  async leaveTeam(userId: string) {
+    const team = await this.store.getTeamForUser(userId);
+    if (!team) throw new Error('You are not currently in a team.');
+    await this.kickTeamMember(team.id, userId);
+  }
+
+  async setTeamRoleColor(teamId: string, rawColor: string) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+
+    const color = normalizeHexColor(rawColor);
+    const guild = await this.getGuild();
+    const role = await guild.roles.fetch(team.roleId);
+    if (!role) throw new Error('Team role no longer exists in Discord.');
+
+    await role.setColor(color, 'Team role color changed from website');
+    await this.store.updateTeamRoleColor(teamId, color);
+  }
+
+  async deleteTeam(teamId: string) {
+    const team = await this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found.');
+
+    const guild = await this.getGuild();
+    const members = await this.store.getTeamMembers(teamId);
+
+    await Promise.all(
+      members.map(async (membership) => {
+        const member = await guild.members.fetch(membership.userId).catch(() => null);
+        if (!member) return;
+        await member.roles.remove(team.roleId, 'Team deleted').catch(() => undefined);
+        await this.removeOrganizationalRoles(member);
+      })
+    );
+
+    await guild.channels.delete(team.textChannelId, 'Team deleted').catch(() => undefined);
+    await guild.channels.delete(team.voiceChannelId, 'Team deleted').catch(() => undefined);
+    await guild.channels.delete(team.categoryId, 'Team deleted').catch(() => undefined);
+    await guild.roles.delete(team.roleId, 'Team deleted').catch(() => undefined);
+    await this.store.removeTeam(teamId);
   }
 
   private async sendInviteDm(guild: Guild, owner: GuildMember, team: Team, invite: TeamInvite) {
@@ -212,10 +317,59 @@ export class TeamBot {
     const team = await this.store.getTeam(invite.teamId);
     if (!team) throw new Error('Team no longer exists.');
 
+    if (await this.store.getTeamForUser(userId)) {
+      throw new Error('You are already in a team. Leave your current team before joining another one.');
+    }
+
     const guild = await this.getGuild();
     const member = await guild.members.fetch(userId);
     await member.roles.add(team.roleId, `Accepted team invite ${invite.id}`);
-    await this.store.updateInviteStatus(invite.id, 'accepted');
+    await this.applyOrganizationalRole(member, 'main');
+
+    try {
+      await this.store.acceptInvite(invite.id, userId, 'main');
+    } catch (error) {
+      await member.roles.remove(team.roleId, 'Team invite accept rolled back').catch(() => undefined);
+      await this.removeOrganizationalRoles(member).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async ensureOrganizationalRoles(guild: Guild) {
+    const existingRoles = await guild.roles.fetch();
+    const roleIds = new Map<TeamMemberRole, string>();
+
+    for (const [role, settings] of Object.entries(organizationalRoleConfig) as Array<[TeamMemberRole, (typeof organizationalRoleConfig)[TeamMemberRole]]>) {
+      const existingRole = existingRoles.find((item) => item.name === settings.name);
+      if (existingRole) {
+        roleIds.set(role, existingRole.id);
+        continue;
+      }
+
+      const createdRole = await guild.roles.create({
+        name: settings.name,
+        color: settings.color,
+        permissions: [],
+        reason: 'Generic team organization role created by Team Hub'
+      });
+      roleIds.set(role, createdRole.id);
+    }
+
+    return roleIds;
+  }
+
+  private async applyOrganizationalRole(member: GuildMember, selectedRole: TeamMemberRole) {
+    const roleIds = await this.ensureOrganizationalRoles(member.guild);
+    const selectedRoleId = roleIds.get(selectedRole);
+    if (!selectedRoleId) throw new Error(`Unable to find ${selectedRole} role.`);
+
+    await member.roles.remove([...roleIds.values()].filter((roleId) => roleId !== selectedRoleId), 'Team organization role changed');
+    await member.roles.add(selectedRoleId, 'Team organization role changed');
+  }
+
+  private async removeOrganizationalRoles(member: GuildMember) {
+    const roleIds = await this.ensureOrganizationalRoles(member.guild);
+    await member.roles.remove([...roleIds.values()], 'Removed from team');
   }
 }
 
@@ -223,6 +377,12 @@ function normalizeTeamName(teamName: string) {
   const normalized = teamName.trim().replace(/\s+/g, ' ').slice(0, 80);
   if (normalized.length < 2) throw new Error('Team name must be at least 2 characters.');
   return normalized;
+}
+
+function normalizeHexColor(color: string) {
+  const normalized = color.trim();
+  if (!/^#[0-9a-fA-F]{6}$/.test(normalized)) throw new Error('Role color must be a hex color like #5865f2.');
+  return normalized.toUpperCase() as `#${string}`;
 }
 
 function toChannelName(teamName: string) {

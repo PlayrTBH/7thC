@@ -6,16 +6,26 @@ export type DiscordUser = {
   avatar?: string | null;
 };
 
+export type TeamMemberRole = 'sub' | 'main' | 'coach';
+
 export type Team = {
   id: string;
   name: string;
   ownerId: string;
   guildId: string;
   roleId: string;
+  roleColor?: string;
   categoryId: string;
   textChannelId: string;
   voiceChannelId: string;
   createdAt: string;
+};
+
+export type TeamMember = {
+  teamId: string;
+  userId: string;
+  role: TeamMemberRole;
+  joinedAt: string;
 };
 
 export type TeamInvite = {
@@ -30,5 +40,6 @@ export type TeamInvite = {
 
 export type StoreShape = {
   teams: Team[];
+  members: TeamMember[];
   invites: TeamInvite[];
 };
