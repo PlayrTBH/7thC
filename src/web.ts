@@ -93,6 +93,17 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     req.session.destroy(() => res.redirect('/'));
   });
 
+  app.get('/members/search', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const query = typeof req.query.query === 'string' ? req.query.query : '';
+      const members = await bot.searchInvitableMembers(user.id, query);
+      res.json({ members });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/teams/new', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
@@ -102,8 +113,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
         return;
       }
 
-      const members = await bot.listInvitableMembers(user.id);
-      res.send(layout('Create a team', teamForm(members)));
+      res.send(layout('Create a team', teamForm()));
     } catch (error) {
       next(error);
     }
@@ -113,11 +123,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const user = req.session.discordUser!;
       const teamName = String(req.body.teamName ?? '');
-      const selected = Array.isArray(req.body.memberIds)
-        ? req.body.memberIds.map(String)
-        : req.body.memberIds
-          ? [String(req.body.memberIds)]
-          : [];
+      const selected = selectedMemberIds(req.body.memberIds);
 
       const { team, invites } = await bot.createTeam(user.id, teamName, selected);
       res.send(
@@ -138,6 +144,17 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       const team = res.locals.team as Team;
       const members = await bot.getTeamMemberDetails(team.id);
       res.send(layout(`Manage ${team.name}`, manageTeamPage(team, members)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/teams/:teamId/invites', requireAuth, requireTeamOwner(store), async (req, res, next) => {
+    try {
+      const team = res.locals.team as Team;
+      const user = req.session.discordUser!;
+      await bot.inviteTeamMembers(team.id, user.id, selectedMemberIds(req.body.memberIds));
+      res.redirect(`/teams/${encodeURIComponent(team.id)}`);
     } catch (error) {
       next(error);
     }
@@ -201,6 +218,10 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
   });
 
   return app;
+}
+
+function selectedMemberIds(memberIds: unknown) {
+  return Array.isArray(memberIds) ? memberIds.map(String) : memberIds ? [String(memberIds)] : [];
 }
 
 async function exchangeCodeForUser(code: string) {
@@ -283,24 +304,108 @@ function dashboardTeamSection(team: Team | undefined, userId: string) {
     </div>`;
 }
 
-function teamForm(members: Array<{ id: string; displayName: string; username: string; avatarUrl: string }>) {
+function teamForm() {
   return `<form method="post" action="/teams">
     <label>Team name <input name="teamName" maxlength="80" required /></label>
-    <h2>Invite server members</h2>
-    <p><small>Only server members who are not already in a team are shown.</small></p>
-    <div class="member-list">
-      ${members.length ? members.map(memberCheckbox).join('') : '<p>No eligible members are available to invite right now.</p>'}
-    </div>
-    <button type="submit">Create team and send invites</button>
-  </form>`;
+    ${invitePicker('Create team and send invites')}
+  </form>
+  ${inviteSearchScript()}`;
 }
 
-function memberCheckbox(member: { id: string; displayName: string; username: string; avatarUrl: string }) {
-  return `<label class="member">
-    <input type="checkbox" name="memberIds" value="${escapeHtml(member.id)}" />
-    <img src="${escapeHtml(member.avatarUrl)}" alt="" />
-    <span>${escapeHtml(member.displayName)} <small>@${escapeHtml(member.username)}</small></span>
-  </label>`;
+function invitePicker(submitLabel: string) {
+  return `<h2>Invite server members</h2>
+    <p><small>Search by Discord username or server nickname. Only server members who are not already in a team can be invited.</small></p>
+    <div class="invite-search">
+      <label for="member-search">Discord username</label>
+      <input id="member-search" type="search" autocomplete="off" placeholder="Start typing a username…" />
+      <small id="member-search-status">Enter at least 2 characters to search.</small>
+    </div>
+    <div id="selected-members" class="selected-members" aria-live="polite"></div>
+    <div id="member-search-results" class="member-list"></div>
+    <button type="submit">${escapeHtml(submitLabel)}</button>`;
+}
+
+function inviteSearchScript() {
+  return `<script>
+    (() => {
+      const input = document.getElementById('member-search');
+      const results = document.getElementById('member-search-results');
+      const selected = document.getElementById('selected-members');
+      const status = document.getElementById('member-search-status');
+      const selectedMembers = new Map();
+      let searchTimeout;
+      let activeSearch = 0;
+
+      const escapeHtml = (value) => value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+
+      const renderSelected = () => {
+        selected.innerHTML = selectedMembers.size
+          ? '<h3>Selected invites</h3>' + Array.from(selectedMembers.values()).map((member) =>
+              '<span class="selected-member">' +
+                '<input type="hidden" name="memberIds" value="' + escapeHtml(member.id) + '" />' +
+                escapeHtml(member.displayName) + ' <small>@' + escapeHtml(member.tag || member.username) + '</small>' +
+                '<button type="button" data-remove-member="' + escapeHtml(member.id) + '" aria-label="Remove ' + escapeHtml(member.displayName) + '">×</button>' +
+              '</span>').join('')
+          : '';
+      };
+
+      const renderResults = (members) => {
+        results.innerHTML = members.length
+          ? members.map((member) =>
+              '<button class="member member-result" type="button" data-add-member="' + escapeHtml(member.id) + '">' +
+                '<img src="' + escapeHtml(member.avatarUrl) + '" alt="" />' +
+                '<span>' + escapeHtml(member.displayName) + ' <small>@' + escapeHtml(member.tag || member.username) + '</small></span>' +
+              '</button>').join('')
+          : '<p>No eligible members matched that search.</p>';
+
+        for (const button of results.querySelectorAll('[data-add-member]')) {
+          button.addEventListener('click', () => {
+            const member = members.find((item) => item.id === button.dataset.addMember);
+            if (!member) return;
+            selectedMembers.set(member.id, member);
+            renderSelected();
+          });
+        }
+      };
+
+      selected.addEventListener('click', (event) => {
+        if (!(event.target instanceof Element)) return;
+        const button = event.target.closest('[data-remove-member]');
+        if (!button) return;
+        selectedMembers.delete(button.dataset.removeMember);
+        renderSelected();
+      });
+
+      input.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        const query = input.value.trim();
+        if (query.length < 2) {
+          activeSearch += 1;
+          results.innerHTML = '';
+          status.textContent = 'Enter at least 2 characters to search.';
+          return;
+        }
+
+        status.textContent = 'Searching…';
+        searchTimeout = setTimeout(async () => {
+          const searchId = ++activeSearch;
+          try {
+            const response = await fetch('/members/search?query=' + encodeURIComponent(query));
+            if (!response.ok) throw new Error('Search failed.');
+            const data = await response.json();
+            if (searchId !== activeSearch) return;
+            renderResults(data.members || []);
+            const resultCount = (data.members || []).length;
+            status.textContent = resultCount + ' result' + (resultCount === 1 ? '' : 's') + ' found.';
+          } catch {
+            if (searchId !== activeSearch) return;
+            results.innerHTML = '';
+            status.textContent = 'Unable to search members right now.';
+          }
+        }, 300);
+      });
+    })();
+  </script>`;
 }
 
 function manageTeamPage(
@@ -315,6 +420,13 @@ function manageTeamPage(
         <button type="submit">Change color</button>
       </form>
     </section>
+
+    <section class="card">
+      <form method="post" action="/teams/${encodeURIComponent(team.id)}/invites">
+        ${invitePicker('Send invites')}
+      </form>
+    </section>
+    ${inviteSearchScript()}
 
     <section class="card">
       <h2>Members</h2>
@@ -386,6 +498,14 @@ function layout(title: string, body: string) {
     .card { background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: 1rem; margin: 1rem 0; }
     .member-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; margin: 1rem 0; }
     .member, .managed-member { display: flex; align-items: center; gap: .75rem; background: #1f2937; border: 1px solid #374151; border-radius: .75rem; padding: .75rem; }
+    .member-result { width: 100%; text-align: left; color: #f9fafb; }
+    .member-result:hover { border-color: #93c5fd; }
+    .invite-search { display: grid; gap: .4rem; margin: 1rem 0; }
+    .invite-search input { margin-left: 0; max-width: 28rem; }
+    .selected-members { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: 1rem 0; }
+    .selected-members h3 { flex-basis: 100%; margin: 0; }
+    .selected-member { display: inline-flex; align-items: center; gap: .4rem; background: #374151; border-radius: 999px; padding: .35rem .45rem .35rem .75rem; }
+    .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #4b5563; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
     .management-list { display: grid; gap: .75rem; }
     .member-info { flex: 1 1 12rem; }
