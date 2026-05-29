@@ -34,31 +34,7 @@ Users authenticate on the website with Discord OAuth2, choose server members to 
 4. Enable the **Server Members Intent** for the bot so it can list inviteable members.
 5. Use the OAuth2 URL generator to invite the bot to your server with the permissions listed above.
 
-## One-line interactive setup
-
-Run the installer from a checked-out copy of this repository:
-
-```bash
-bash -c "$(cat install.sh)"
-```
-
-Or run it directly:
-
-```bash
-npm run setup
-# or
-./install.sh
-```
-
-The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
-
-If you host this repository somewhere public, setup can be kicked off with a clone-and-run one-liner:
-
-```bash
-git clone https://github.com/<owner>/<repo>.git discord-team-hub && cd discord-team-hub && ./install.sh
-```
-
-## Manual configuration
+## Configure
 
 Copy the example environment file and fill in values:
 
