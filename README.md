@@ -49,6 +49,21 @@ gh auth login --scopes repo
 gh auth setup-git
 
 # Pull install.sh from the private 7thC repo and run it.
+set -euo pipefail
+GH_REPO=$(gh repo list --limit 200 --json name,nameWithOwner \
+  --jq '.[] | select(.name == "7thC") | .nameWithOwner' | head -n 1)
+test -n "$GH_REPO" || { echo "Could not find a GitHub repo named 7thC for this account." >&2; exit 1; }
+GH_BRANCH=$(gh repo view "$GH_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+INSTALLER=$(mktemp)
+gh api -H "Accept: application/vnd.github.raw" \
+  "/repos/$GH_REPO/contents/install.sh?ref=$GH_BRANCH" > "$INSTALLER"
+DISCORD_TEAM_HUB_REPO_URL="https://github.com/$GH_REPO.git" \
+  DISCORD_TEAM_HUB_BRANCH="$GH_BRANCH" \
+  bash "$INSTALLER"
+rm -f "$INSTALLER"
+```
+
+When the script is launched this way, it first finds this private `7thC` repository through your authenticated GitHub account, downloads `install.sh` from the repo default branch, clones or updates the repository on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
 GH_REPO=$(gh repo list --limit 200 --json name,nameWithOwner \
   --jq '.[] | select(.name == "7thC") | .nameWithOwner' | head -n 1)
 gh api -H "Accept: application/vnd.github.raw" \

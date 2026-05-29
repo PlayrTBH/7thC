@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="Discord Team Hub"
 ENV_FILE=".env"
 DEFAULT_GITHUB_REPO_NAME="7thC"
+DEFAULT_GITHUB_BRANCH=""
 DEFAULT_GITHUB_BRANCH="work"
 
 if [[ -t 0 ]]; then
