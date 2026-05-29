@@ -90,7 +90,7 @@ npm run setup
 ./install.sh
 ```
 
-The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
+The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, bind host, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
 
 ## Manual configuration
 
@@ -106,6 +106,7 @@ DISCORD_CLIENT_SECRET=your_discord_application_client_secret
 DISCORD_BOT_TOKEN=your_discord_bot_token
 DISCORD_GUILD_ID=your_server_guild_id
 PUBLIC_URL=http://localhost:3000
+HOST=0.0.0.0
 PORT=3000
 SESSION_SECRET=replace_with_a_long_random_secret
 DATA_FILE=./data/store.json
@@ -133,6 +134,80 @@ docker compose up -d --build
 ```
 
 The compose file reads `.env`, exposes port 3000, and persists the JSON store in `./data`.
+
+
+
+## Updating an existing install
+
+From the installed repository directory, run one command:
+
+```bash
+./update.sh
+```
+
+The updater preserves `.env` and `data/`, fetches the latest git changes, and then either rebuilds/restarts Docker Compose if that service exists or runs a local `npm install` and `npm run build`.
+
+You can force a mode if needed:
+
+```bash
+UPDATE_MODE=docker ./update.sh
+UPDATE_MODE=local ./update.sh
+```
+
+If you installed with the default path from `install.sh`, this is usually:
+
+```bash
+cd ~/discord-team-hub && ./update.sh
+```
+
+## Network troubleshooting
+
+If the VM cannot reach `http://192.168.1.117:3000` or your Cloudflare Tunnel does not resolve:
+
+1. Confirm the app is actually running and listening:
+
+   ```bash
+   docker compose ps
+   docker compose logs -f discord-team-hub
+   ss -ltnp | grep ':3000'
+   curl -v http://127.0.0.1:3000
+   ```
+
+2. Make sure `.env` exposes the app on all interfaces:
+
+   ```env
+   HOST=0.0.0.0
+   PORT=3000
+   ```
+
+3. If using Docker Compose, confirm the port mapping is still present:
+
+   ```yaml
+   ports:
+     - "3000:3000"
+   ```
+
+4. Configure Cloudflare Tunnel based on where `cloudflared` runs:
+
+   - If `cloudflared` runs on the same VM as this app, point it at:
+
+     ```text
+     http://localhost:3000
+     ```
+
+   - If `cloudflared` runs on a different VM on the same LAN, point it at the app VM LAN IP:
+
+     ```text
+     http://192.168.1.117:3000
+     ```
+
+     In this setup, `HOST=0.0.0.0` is required, Docker must publish `3000:3000`, and the app VM firewall must allow TCP 3000 from the Cloudflare Tunnel VM. Test that from the Cloudflare Tunnel VM with:
+
+     ```bash
+     curl -v http://192.168.1.117:3000
+     ```
+
+5. If `curl http://127.0.0.1:3000` on the app VM fails, check the app logs first. The website starts after the Discord bot login succeeds, so a bad bot token, missing privileged intent, or Discord connection failure can prevent port 3000 from opening.
 
 ## Production notes
 

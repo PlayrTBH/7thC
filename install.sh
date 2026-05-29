@@ -107,9 +107,10 @@ write_env() {
   local bot_token="$3"
   local guild_id="$4"
   local public_url="$5"
-  local port="$6"
-  local session_secret="$7"
-  local data_file="$8"
+  local host="$6"
+  local port="$7"
+  local session_secret="$8"
+  local data_file="$9"
 
   if [[ -f "$ENV_FILE" ]]; then
     if prompt_yes_no "$ENV_FILE already exists. Back it up and replace it?" "n"; then
@@ -127,6 +128,7 @@ DISCORD_CLIENT_SECRET=$client_secret
 DISCORD_BOT_TOKEN=$bot_token
 DISCORD_GUILD_ID=$guild_id
 PUBLIC_URL=$public_url
+HOST=$host
 PORT=$port
 SESSION_SECRET=$session_secret
 DATA_FILE=$data_file
@@ -272,11 +274,12 @@ client_secret="$(prompt_required DISCORD_CLIENT_SECRET "Discord client secret")"
 bot_token="$(prompt_required DISCORD_BOT_TOKEN "Discord bot token")"
 guild_id="$(prompt_required DISCORD_GUILD_ID "Discord server/guild ID")"
 public_url="$(prompt_default "Public website URL" "http://localhost:3000")"
+host="$(prompt_default "Bind host" "0.0.0.0")"
 port="$(prompt_default "HTTP port" "3000")"
 data_file="$(prompt_default "Data file path" "./data/store.json")"
 session_secret="$(prompt_secret "Session secret")"
 
-write_env "$client_id" "$client_secret" "$bot_token" "$guild_id" "$public_url" "$port" "$session_secret" "$data_file"
+write_env "$client_id" "$client_secret" "$bot_token" "$guild_id" "$public_url" "$host" "$port" "$session_secret" "$data_file"
 
 say "Choose how to finish setup"
 if prompt_yes_no "Run dependency install/build or Docker setup now?" "y"; then

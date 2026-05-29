@@ -10,6 +10,6 @@ const bot = new TeamBot(store);
 await bot.start();
 
 const app = createWebApp(bot, store);
-app.listen(config.PORT, () => {
-  console.log(`Website listening on ${config.PUBLIC_URL}`);
+app.listen(config.PORT, config.HOST, () => {
+  console.log(`Website listening on ${config.PUBLIC_URL} via ${config.HOST}:${config.PORT}`);
 });

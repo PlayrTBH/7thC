@@ -32,6 +32,7 @@ export const config = {
   DISCORD_BOT_TOKEN: required('DISCORD_BOT_TOKEN'),
   DISCORD_GUILD_ID: required('DISCORD_GUILD_ID'),
   PUBLIC_URL: optionalUrl('PUBLIC_URL', 'http://localhost:3000'),
+  HOST: process.env.HOST ?? '0.0.0.0',
   PORT: optionalPort('PORT', 3000),
   SESSION_SECRET: sessionSecret,
   DATA_FILE: process.env.DATA_FILE ?? './data/store.json'
