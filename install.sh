@@ -3,6 +3,10 @@ set -euo pipefail
 
 APP_NAME="Discord Team Hub"
 ENV_FILE=".env"
+DEFAULT_GITHUB_OWNER="PlayrTBH"
+DEFAULT_GITHUB_REPO_NAME="7thC"
+DEFAULT_GITHUB_REPO="$DEFAULT_GITHUB_OWNER/$DEFAULT_GITHUB_REPO_NAME"
+DEFAULT_GITHUB_BRANCH=""
 DEFAULT_GITHUB_REPO_NAME="7thC"
 DEFAULT_GITHUB_BRANCH=""
 DEFAULT_GITHUB_BRANCH="work"
@@ -170,6 +174,8 @@ resolve_repo_url() {
   fi
 
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if gh repo view "$DEFAULT_GITHUB_REPO" >/dev/null 2>&1; then
+      printf 'https://github.com/%s.git' "$DEFAULT_GITHUB_REPO"
     local name_with_owner=""
     name_with_owner="$(gh repo list --limit 200 --json name,nameWithOwner --jq ".[] | select(.name == \"$DEFAULT_GITHUB_REPO_NAME\") | .nameWithOwner" | head -n 1 || true)"
     if [[ -n "$name_with_owner" ]]; then
@@ -178,6 +184,7 @@ resolve_repo_url() {
     fi
   fi
 
+  note "Could not automatically access GitHub repo $DEFAULT_GITHUB_REPO."
   prompt_required DISCORD_TEAM_HUB_REPO_URL "GitHub repository clone URL"
 }
 
