@@ -48,39 +48,46 @@ sudo apt-get update && sudo apt-get install -y git curl gh
 gh auth login --scopes repo
 gh auth setup-git
 
-# Pull install.sh from the private repo and run it.
-# This runs inside a child bash process, so failures will not close your SSH shell.
-bash <<'INSTALLER_BOOTSTRAP'
-GH_REPO="${DISCORD_TEAM_HUB_GITHUB_REPO:-}"
-if [ -z "$GH_REPO" ]; then
-  GH_REPO=$(gh repo list --limit 1000 --json name,nameWithOwner \
-    --jq '.[] | select((.name | ascii_downcase) == "7thc") | .nameWithOwner' | head -n 1)
-fi
-if [ -z "$GH_REPO" ]; then
-  echo "I could not auto-detect the repo. Pick it from the repos this account can access:" >&2
-  mapfile -t GH_REPOS < <(gh repo list --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
-  select selected_repo in "${GH_REPOS[@]}"; do
-    GH_REPO="$selected_repo"
-    test -n "$GH_REPO" && break
-  done
-fi
-if [ -z "$GH_REPO" ]; then
-  echo "No GitHub repo selected; leaving this shell open." >&2
-else
-  GH_BRANCH=$(gh repo view "$GH_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name') && \
-  INSTALLER=$(mktemp) && \
-  gh api -H "Accept: application/vnd.github.raw" \
-    "/repos/$GH_REPO/contents/install.sh?ref=$GH_BRANCH" > "$INSTALLER" && \
-  DISCORD_TEAM_HUB_REPO_URL="https://github.com/$GH_REPO.git" \
-    DISCORD_TEAM_HUB_BRANCH="$GH_BRANCH" \
-    bash "$INSTALLER"
-  rm -f "${INSTALLER:-}"
-fi
-INSTALLER_BOOTSTRAP
+# Pull install.sh from the private PlayrTBH/7thC repo and run it.
+set -euo pipefail
+GH_REPO="PlayrTBH/7thC"
+gh repo view "$GH_REPO" >/dev/null || {
+  echo "GitHub CLI cannot access $GH_REPO. Make sure you logged in as an account with repo access." >&2
+  exit 1
+}
+# Pull install.sh from the private 7thC repo and run it.
+set -euo pipefail
+GH_REPO=$(gh repo list --limit 200 --json name,nameWithOwner \
+  --jq '.[] | select(.name == "7thC") | .nameWithOwner' | head -n 1)
+test -n "$GH_REPO" || { echo "Could not find a GitHub repo named 7thC for this account." >&2; exit 1; }
+GH_BRANCH=$(gh repo view "$GH_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+INSTALLER=$(mktemp)
+gh api -H "Accept: application/vnd.github.raw" \
+  "/repos/$GH_REPO/contents/install.sh?ref=$GH_BRANCH" > "$INSTALLER"
+DISCORD_TEAM_HUB_REPO_URL="https://github.com/$GH_REPO.git" \
+  DISCORD_TEAM_HUB_BRANCH="$GH_BRANCH" \
+  bash "$INSTALLER"
+rm -f "$INSTALLER"
 ```
 
+When the script is launched this way, it checks access to the private `PlayrTBH/7thC` repository through your authenticated GitHub account, downloads `install.sh` from the repo default branch, clones or updates the repository on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
+When the script is launched this way, it first finds this private `7thC` repository through your authenticated GitHub account, downloads `install.sh` from the repo default branch, clones or updates the repository on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
+GH_REPO=$(gh repo list --limit 200 --json name,nameWithOwner \
+  --jq '.[] | select(.name == "7thC") | .nameWithOwner' | head -n 1)
+gh api -H "Accept: application/vnd.github.raw" \
+  "/repos/$GH_REPO/contents/install.sh?ref=work" | bash
+```
 
-When the script is launched this way, it first tries to find an accessible repo named `7thC`; if it cannot, it lets you pick from the repositories your authenticated GitHub account can access. If you already know the exact `owner/repo`, prefix the command with `DISCORD_TEAM_HUB_GITHUB_REPO=owner/repo`. It then downloads `install.sh` from the selected repo default branch, clones or updates the repository on the VM, and continues the normal setup from that checkout. The bootstrap runs in a child `bash`, so a failure will return you to your SSH shell instead of logging you out. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
+When the script is launched this way, it first finds this private `7thC` repository through your authenticated GitHub account, clones or updates it on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
+# Replace OWNER, REPO, and BRANCH. For this branch, BRANCH is usually work.
+curl -H "Authorization: Bearer $(gh auth token)" \
+  -fsSL https://raw.githubusercontent.com/OWNER/REPO/BRANCH/install.sh \
+  | DISCORD_TEAM_HUB_REPO_URL=https://github.com/OWNER/REPO.git \
+    DISCORD_TEAM_HUB_BRANCH=BRANCH \
+    bash
+```
+
+When the script is launched this way, it first clones or updates the private repository on the VM, then continues the normal setup from that checkout. You can set `DISCORD_TEAM_HUB_DIR=/opt/discord-team-hub` before `bash` if you want a different install directory; otherwise it uses `~/discord-team-hub`.
 
 ### From an already checked-out repo
 
@@ -93,6 +100,7 @@ npm run setup
 The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
 
 ## Manual configuration
+## Configure
 
 Copy the example environment file and fill in values:
 
