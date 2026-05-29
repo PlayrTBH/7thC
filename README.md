@@ -69,6 +69,7 @@ npm run setup
 The installer prompts for your Discord client ID, client secret, bot token, guild/server ID, public URL, port, data file path, and session secret. It writes a private `.env` file, then offers to finish setup with Docker Compose, local `npm install && npm run build`, or skip dependency installation for later.
 
 ## Manual configuration
+## Configure
 
 Copy the example environment file and fill in values:
 
