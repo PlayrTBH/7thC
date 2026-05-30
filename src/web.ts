@@ -6,7 +6,7 @@ import type { TeamBot } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -112,6 +112,148 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       const user = req.session.discordUser!;
       const administratorAccess = await bot.getAdministratorAccess(user.id);
       res.send(layout('Account settings', settingsPage(user), { user, isAdmin: administratorAccess.isAdmin, active: 'settings' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+
+  app.get('/events', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [events, counts, currentTeam, administratorAccess] = await Promise.all([
+        store.getEvents(),
+        store.getEventRegistrationCounts(),
+        store.getTeamForUser(user.id),
+        bot.getAdministratorAccess(user.id)
+      ]);
+      res.send(layout('Events', eventsPage(events, counts, currentTeam, user.id), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/events/:eventId/register', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [event, currentTeam, administratorAccess] = await Promise.all([
+        store.getEvent(req.params.eventId),
+        store.getTeamForUser(user.id),
+        bot.getAdministratorAccess(user.id)
+      ]);
+      if (!event) {
+        res.status(404).send(layout('Event not found', '<p>That event does not exist.</p><p><a href="/events">Back to events</a></p>', { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+        return;
+      }
+      if (!currentTeam || currentTeam.ownerId !== user.id) {
+        res.status(403).send(layout('Captain required', '<p>Only a team captain can register a team for an event.</p><p><a href="/events">Back to events</a></p>', { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+        return;
+      }
+      const [members, registrations, existingRegistration] = await Promise.all([
+        bot.getTeamMemberDetails(currentTeam.id),
+        store.getEventRegistrations(event.id),
+        store.getEventRegistration(event.id, currentTeam.id)
+      ]);
+      res.send(layout(`Register for ${event.title}`, eventRegistrationPage(event, currentTeam, members, registrations.length, existingRegistration), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/events/:eventId/register', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const event = await store.getEvent(req.params.eventId);
+      if (!event) throw new Error('Event not found.');
+      const team = await store.getTeamForUser(user.id);
+      if (!team || team.ownerId !== user.id) throw new Error('Only a team captain can register a team for an event.');
+
+      const members = await store.getTeamMembers(team.id);
+      const mainPlayerIds = selectedMemberIds(req.body.mainPlayerIds);
+      const substitutePlayerIds = selectedMemberIds(req.body.substitutePlayerIds);
+      const registrationCount = (await store.getEventRegistrations(event.id)).length;
+      validateEventRegistration(event, members, mainPlayerIds, substitutePlayerIds, registrationCount);
+
+      const now = new Date().toISOString();
+      await store.addEventRegistration({
+        id: crypto.randomUUID(),
+        eventId: event.id,
+        teamId: team.id,
+        captainId: user.id,
+        mainPlayerIds,
+        substitutePlayerIds,
+        createdAt: now,
+        updatedAt: now
+      });
+      res.redirect(`/events/${encodeURIComponent(event.id)}/registrations`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/events/:eventId/registrations', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [event, administratorAccess] = await Promise.all([store.getEvent(req.params.eventId), bot.getAdministratorAccess(user.id)]);
+      if (!event) {
+        res.status(404).send(layout('Event not found', '<p>That event does not exist.</p><p><a href="/events">Back to events</a></p>', { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+        return;
+      }
+      const registrations = await store.getEventRegistrations(event.id);
+      const details = await Promise.all(
+        registrations.map(async (registration) => ({
+          registration,
+          team: await store.getTeam(registration.teamId),
+          members: await bot.getTeamMemberDetails(registration.teamId)
+        }))
+      );
+      res.send(layout(`${event.title} registrations`, eventRegistrationsPage(event, details), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/event-management', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const events = await store.getEvents();
+      const counts = await store.getEventRegistrationCounts();
+      res.send(layout('Event management', eventManagementPage(events, counts), { user: req.session.discordUser, isAdmin: true, active: 'event-management' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/event-management/events', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const now = new Date().toISOString();
+      const event = parseEventForm(req.body);
+      await store.addEvent({ id: crypto.randomUUID(), ...event, createdBy: req.session.discordUser!.id, createdAt: now, updatedAt: now });
+      res.redirect('/event-management');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/event-management/events/:eventId/edit', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const [event, counts] = await Promise.all([store.getEvent(req.params.eventId), store.getEventRegistrationCounts()]);
+      if (!event) {
+        res.status(404).send(layout('Event not found', '<p>That event does not exist.</p><p><a href="/event-management">Back to event management</a></p>', { user: req.session.discordUser, isAdmin: true, active: 'event-management' }));
+        return;
+      }
+      res.send(layout(`Edit ${event.title}`, eventEditPage(event, counts[event.id] ?? 0), { user: req.session.discordUser, isAdmin: true, active: 'event-management' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/event-management/events/:eventId', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const existing = await store.getEvent(req.params.eventId);
+      if (!existing) throw new Error('Event not found.');
+      const parsed = parseEventForm(req.body);
+      await store.updateEvent(existing.id, parsed);
+      res.redirect('/event-management');
     } catch (error) {
       next(error);
     }
@@ -340,7 +482,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
-type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; active?: 'dashboard' | 'teams' | 'administrator' | 'settings' | 'developer' };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; active?: 'dashboard' | 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#020202"/>
@@ -351,7 +493,8 @@ const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1
 
 
 function selectedMemberIds(memberIds: unknown) {
-  return Array.isArray(memberIds) ? memberIds.map(String) : memberIds ? [String(memberIds)] : [];
+  const values = Array.isArray(memberIds) ? memberIds.map(String) : memberIds ? [String(memberIds)] : [];
+  return [...new Set(values)];
 }
 
 async function exchangeCodeForUser(code: string) {
@@ -470,6 +613,270 @@ function settingsPage(user: DiscordUser) {
       <p><a class="button danger" href="/logout">Log out</a></p>
     </div>
   </section>`;
+}
+
+
+type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt'>;
+
+type EventRegistrationDetail = {
+  registration: EventRegistration;
+  team?: Team;
+  members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>;
+};
+
+function eventsPage(events: Event[], counts: Record<string, number>, currentTeam: Team | undefined, currentUserId: string) {
+  const visibleEvents = events.filter((event) => eventState(event) !== 'ended');
+  return `<p class="page-intro">Upcoming and live events are listed in chronological order. Team captains can register once their roster meets the event requirements.</p>
+    ${
+      visibleEvents.length
+        ? `<div class="event-list">${visibleEvents.map((event) => eventCard(event, counts[event.id] ?? 0, currentTeam, currentUserId)).join('')}</div>`
+        : '<section class="card"><h2>No upcoming or live events</h2><p>Check back after administrators create the next event.</p></section>'
+    }`;
+}
+
+function eventCard(event: Event, registrationCount: number, currentTeam: Team | undefined, currentUserId: string) {
+  const state = eventState(event);
+  const registrationState = eventRegistrationState(event, registrationCount);
+  const canRegister = currentTeam?.ownerId === currentUserId && registrationState === 'open';
+  return `<section class="card event-card">
+    <div class="section-heading-row">
+      <div>
+        <p class="eyebrow">${eventStateLabel(state)}</p>
+        <h2>${escapeHtml(event.title)}</h2>
+      </div>
+      <span class="event-capacity">${registrationCount}/${event.teamLimit} teams</span>
+    </div>
+    <p>${escapeHtml(event.description)}</p>
+    <div class="event-meta-grid">
+      ${eventMeta('Event starts', formatDateTime(event.startsAt))}
+      ${eventMeta('Event ends', formatDateTime(event.endsAt))}
+      ${eventMeta('Registration', `${formatDateTime(event.registrationOpensAt)} → ${formatDateTime(event.registrationClosesAt)}`)}
+      ${eventMeta('Roster required', `${event.requiredMainPlayers} main, ${event.requiredSubstitutes} sub${event.requiredSubstitutes === 1 ? '' : 's'}`)}
+    </div>
+    <div class="event-actions">
+      <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">Registered teams</a>
+      ${registrationState === 'full' ? '<span class="pill">Full</span>' : ''}
+      ${registrationState === 'not-open' ? '<span class="pill">Registration not open</span>' : ''}
+      ${registrationState === 'closed' ? '<span class="pill">Registration closed</span>' : ''}
+      ${canRegister ? `<a class="button" href="/events/${encodeURIComponent(event.id)}/register">Register</a>` : ''}
+      ${!currentTeam ? '<small>Create a team as captain to register.</small>' : ''}
+      ${currentTeam && currentTeam.ownerId !== currentUserId ? '<small>Only your team captain can register.</small>' : ''}
+    </div>
+  </section>`;
+}
+
+function eventRegistrationPage(
+  event: Event,
+  team: Team,
+  members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>,
+  registrationCount: number,
+  existingRegistration?: EventRegistration
+) {
+  const mainMembers = members.filter((member) => member.role === 'main');
+  const subMembers = members.filter((member) => member.role === 'sub');
+  const registrationState = eventRegistrationState(event, registrationCount);
+  if (existingRegistration) {
+    return `<p><a href="/events">← Back to events</a></p><section class="card"><h2>${escapeHtml(team.name)} is already registered</h2><p>Your team has already been added to this event.</p><p><a class="button" href="/events/${encodeURIComponent(event.id)}/registrations">View registered teams</a></p></section>`;
+  }
+  if (registrationState !== 'open') {
+    return `<p><a href="/events">← Back to events</a></p><section class="card"><h2>Registration is ${eventRegistrationStateLabel(registrationState)}</h2><p>This event cannot accept new registrations right now.</p></section>`;
+  }
+
+  return `<p><a href="/events">← Back to events</a></p>
+    <section class="card">
+      <p class="eyebrow">${escapeHtml(team.name)}</p>
+      <h2>Select roster for ${escapeHtml(event.title)}</h2>
+      <p>Choose the players who will compete from your <strong>Main</strong> role and the substitute players from your <strong>Sub</strong> role.</p>
+      <div class="event-meta-grid">
+        ${eventMeta('Required main players', String(event.requiredMainPlayers))}
+        ${eventMeta('Required substitutes', String(event.requiredSubstitutes))}
+        ${eventMeta('Teams registered', `${registrationCount}/${event.teamLimit}`)}
+        ${eventMeta('Registration closes', formatDateTime(event.registrationClosesAt))}
+      </div>
+      <form method="post" action="/events/${encodeURIComponent(event.id)}/register" class="stacked-form">
+        <fieldset>
+          <legend>Main players</legend>
+          ${memberCheckboxList('mainPlayerIds', mainMembers, event.requiredMainPlayers, 'No team members currently have the Main role.')}
+        </fieldset>
+        <fieldset>
+          <legend>Substitute players</legend>
+          ${memberCheckboxList('substitutePlayerIds', subMembers, event.requiredSubstitutes, 'No team members currently have the Sub role.')}
+        </fieldset>
+        <button type="submit">Register team</button>
+      </form>
+    </section>`;
+}
+
+function eventRegistrationsPage(event: Event, details: EventRegistrationDetail[]) {
+  return `<p><a href="/events">← Back to events</a></p>
+    <section class="card">
+      <div class="section-heading-row">
+        <div><p class="eyebrow">Registered teams</p><h2>${escapeHtml(event.title)}</h2></div>
+        <span class="event-capacity">${details.length}/${event.teamLimit} teams</span>
+      </div>
+      ${
+        details.length
+          ? `<div class="management-list">${details.map((detail, index) => eventRegistrationCard(detail, index + 1)).join('')}</div>`
+          : '<p>No teams have registered yet.</p>'
+      }
+    </section>`;
+}
+
+function eventRegistrationCard(detail: EventRegistrationDetail, index: number) {
+  const memberNames = new Map(detail.members.map((member) => [member.userId, member.displayName]));
+  const listNames = (ids: string[]) => ids.map((id) => escapeHtml(memberNames.get(id) ?? id)).join(', ') || 'None selected';
+  return `<div class="admin-team-row">
+    <div>
+      <strong>${index}. ${escapeHtml(detail.team?.name ?? detail.registration.teamId)}</strong><br />
+      <small>Registered ${escapeHtml(formatDateTime(detail.registration.createdAt))}</small><br />
+      <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
+      <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
+    </div>
+  </div>`;
+}
+
+function eventManagementPage(events: Event[], counts: Record<string, number>) {
+  return `<p><a href="/">← Back to dashboard</a></p>
+    <section class="card">
+      <h2>Create event</h2>
+      ${eventForm('/event-management/events')}
+    </section>
+    <section class="card">
+      <h2>Existing events</h2>
+      ${
+        events.length
+          ? `<div class="management-list">${events.map((event) => managedEventRow(event, counts[event.id] ?? 0)).join('')}</div>`
+          : '<p>No events have been created yet.</p>'
+      }
+    </section>`;
+}
+
+function eventEditPage(event: Event, registrationCount: number) {
+  return `<p><a href="/event-management">← Back to event management</a></p>
+    <section class="card">
+      <div class="section-heading-row">
+        <div><p class="eyebrow">${registrationCount}/${event.teamLimit} teams registered</p><h2>Edit event</h2></div>
+        <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">View registered teams</a>
+      </div>
+      ${eventForm(`/event-management/events/${encodeURIComponent(event.id)}`, event)}
+    </section>`;
+}
+
+function managedEventRow(event: Event, registrationCount: number) {
+  return `<div class="admin-team-row">
+    <div>
+      <strong>${escapeHtml(event.title)}</strong> <span class="pill">${eventStateLabel(eventState(event))}</span><br />
+      <small>${escapeHtml(formatDateTime(event.startsAt))} · ${registrationCount}/${event.teamLimit} teams · registration ${escapeHtml(eventRegistrationStateLabel(eventRegistrationState(event, registrationCount)))}</small>
+    </div>
+    <div class="admin-team-actions">
+      <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">Teams</a>
+      <a class="button" href="/event-management/events/${encodeURIComponent(event.id)}/edit">Edit</a>
+    </div>
+  </div>`;
+}
+
+function eventForm(action: string, event?: Event) {
+  return `<form method="post" action="${escapeHtml(action)}" class="stacked-form">
+    <label>Title <input name="title" required maxlength="120" value="${escapeHtml(event?.title ?? '')}" /></label>
+    <label>Description <textarea name="description" required rows="4" maxlength="2000">${escapeHtml(event?.description ?? '')}</textarea></label>
+    <div class="form-grid">
+      <label>Team registration limit <input name="teamLimit" type="number" min="1" required value="${event?.teamLimit ?? 8}" /></label>
+      <label>Main players required <input name="requiredMainPlayers" type="number" min="0" required value="${event?.requiredMainPlayers ?? 5}" /></label>
+      <label>Substitutes required <input name="requiredSubstitutes" type="number" min="0" required value="${event?.requiredSubstitutes ?? 0}" /></label>
+      <label>Event starts <input name="startsAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.startsAt))}" /></label>
+      <label>Event ends <input name="endsAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.endsAt))}" /></label>
+      <label>Registration opens <input name="registrationOpensAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationOpensAt))}" /></label>
+      <label>Registration closes <input name="registrationClosesAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
+    </div>
+    <button type="submit">${event ? 'Save event' : 'Create event'}</button>
+  </form>`;
+}
+
+function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string) {
+  if (!members.length) return `<p><small>${emptyMessage}</small></p>`;
+  return `<p><small>Select at least ${requiredCount}.</small></p><div class="checkbox-list">${members.map((member) => `<label class="checkbox-row"><input type="checkbox" name="${name}" value="${escapeHtml(member.userId)}" /> <span>${escapeHtml(member.displayName)} <small>@${escapeHtml(member.username)}</small></span></label>`).join('')}</div>`;
+}
+
+function eventMeta(label: string, value: string) {
+  return `<div class="stat-card"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function parseEventForm(body: Request['body']): EventFormFields {
+  const title = String(body.title ?? '').trim().slice(0, 120);
+  const description = String(body.description ?? '').trim().slice(0, 2000);
+  const teamLimit = parsePositiveInteger(body.teamLimit, 'Team registration limit', 1);
+  const requiredMainPlayers = parsePositiveInteger(body.requiredMainPlayers, 'Main players required', 0);
+  const requiredSubstitutes = parsePositiveInteger(body.requiredSubstitutes, 'Substitutes required', 0);
+  const startsAt = parseDateTimeInput(body.startsAt, 'Event start date');
+  const endsAt = parseDateTimeInput(body.endsAt, 'Event end date');
+  const registrationOpensAt = parseDateTimeInput(body.registrationOpensAt, 'Registration open date');
+  const registrationClosesAt = parseDateTimeInput(body.registrationClosesAt, 'Registration close date');
+
+  if (!title) throw new Error('Event title is required.');
+  if (!description) throw new Error('Event description is required.');
+  if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) throw new Error('Event end date must be after the start date.');
+  if (new Date(registrationClosesAt).getTime() <= new Date(registrationOpensAt).getTime()) throw new Error('Registration close date must be after the open date.');
+
+  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt };
+}
+
+function parsePositiveInteger(value: unknown, label: string, minimum: number) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < minimum) throw new Error(`${label} must be ${minimum === 0 ? 'zero or greater' : `at least ${minimum}`}.`);
+  return number;
+}
+
+function parseDateTimeInput(value: unknown, label: string) {
+  const raw = String(value ?? '').trim();
+  const date = new Date(raw);
+  if (!raw || Number.isNaN(date.getTime())) throw new Error(`${label} is required.`);
+  return date.toISOString();
+}
+
+function validateEventRegistration(event: Event, members: TeamMember[], mainPlayerIds: string[], substitutePlayerIds: string[], registrationCount: number) {
+  const registrationState = eventRegistrationState(event, registrationCount);
+  if (registrationState === 'full') throw new Error('This event has reached its team registration limit.');
+  if (registrationState === 'not-open') throw new Error('Registration is not open yet for this event.');
+  if (registrationState === 'closed') throw new Error('Registration has closed for this event.');
+
+  const mainMemberIds = new Set(members.filter((member) => member.role === 'main').map((member) => member.userId));
+  const subMemberIds = new Set(members.filter((member) => member.role === 'sub').map((member) => member.userId));
+  const duplicateIds = mainPlayerIds.filter((id) => substitutePlayerIds.includes(id));
+  if (duplicateIds.length) throw new Error('A player cannot be selected as both a main player and a substitute.');
+  if (mainPlayerIds.length < event.requiredMainPlayers) throw new Error(`This event requires at least ${event.requiredMainPlayers} main player${event.requiredMainPlayers === 1 ? '' : 's'}.`);
+  if (substitutePlayerIds.length < event.requiredSubstitutes) throw new Error(`This event requires at least ${event.requiredSubstitutes} substitute${event.requiredSubstitutes === 1 ? '' : 's'}.`);
+  if (mainPlayerIds.some((id) => !mainMemberIds.has(id))) throw new Error('Main player selections must come from team members with the Main role.');
+  if (substitutePlayerIds.some((id) => !subMemberIds.has(id))) throw new Error('Substitute selections must come from team members with the Sub role.');
+}
+
+function eventState(event: Event) {
+  const now = Date.now();
+  if (now < new Date(event.startsAt).getTime()) return 'upcoming';
+  if (now <= new Date(event.endsAt).getTime()) return 'live';
+  return 'ended';
+}
+
+function eventStateLabel(state: ReturnType<typeof eventState>) {
+  return state === 'live' ? 'Live' : state === 'upcoming' ? 'Upcoming' : 'Ended';
+}
+
+function eventRegistrationState(event: Event, registrationCount: number) {
+  const now = Date.now();
+  if (registrationCount >= event.teamLimit) return 'full';
+  if (now < new Date(event.registrationOpensAt).getTime()) return 'not-open';
+  if (now > new Date(event.registrationClosesAt).getTime()) return 'closed';
+  return 'open';
+}
+
+function eventRegistrationStateLabel(state: ReturnType<typeof eventRegistrationState>) {
+  return ({ open: 'open', full: 'full', 'not-open': 'not open yet', closed: 'closed' } as const)[state];
+}
+
+function toDateTimeLocalValue(value?: string) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString().slice(0, 16);
 }
 
 function administratorPage(
@@ -919,7 +1326,8 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .85rem clamp(1rem, 4vw, 3rem); border-bottom: 1px solid rgba(255,255,255,.08); background: rgba(11, 12, 15, .82); backdrop-filter: blur(18px); }
     .brand { display: inline-flex; align-items: center; gap: .75rem; color: var(--text); font-weight: 800; letter-spacing: .02em; }
     .brand-mark { width: 2.35rem; height: 2.35rem; border-radius: .8rem; box-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 10px 30px rgba(201,8,32,.24); }
-    .nav-shell { display: flex; align-items: center; gap: 1rem; }
+    .nav-shell { display: flex; align-items: center; gap: 1rem; flex: 1; justify-content: space-between; }
+    .nav-groups { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex: 1; }
     .nav-links { display: flex; align-items: center; gap: .35rem; padding: .25rem; border: 1px solid rgba(255,255,255,.08); border-radius: 999px; background: rgba(255,255,255,.035); }
     .nav-links a { color: var(--muted); padding: .55rem .9rem; border-radius: 999px; font-size: .94rem; font-weight: 700; }
     .nav-links a.active, .nav-links a:hover { color: var(--text); background: var(--red-soft); box-shadow: inset 0 0 0 1px rgba(239,35,60,.28); }
@@ -935,8 +1343,9 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .button, button { background: linear-gradient(135deg, var(--red), #8f0617); color: white; border: 0; border-radius: .8rem; padding: .78rem 1rem; text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font-weight: 800; box-shadow: 0 12px 30px rgba(201,8,32,.22); }
     button:hover, .button:hover { transform: translateY(-1px); color: white; }
     .secondary { background: #2b2f38; box-shadow: none; } .danger { background: linear-gradient(135deg, #ef233c, #9f0719); } .danger-zone { border-color: rgba(239,35,60,.45); }
-    input, select { border-radius: .7rem; border: 1px solid var(--line); padding: .68rem .78rem; margin-left: .5rem; background: #0f1116; color: var(--text); outline: none; }
-    input:focus, select:focus { border-color: var(--red-strong); box-shadow: 0 0 0 3px rgba(239,35,60,.18); }
+    input, select, textarea { border-radius: .7rem; border: 1px solid var(--line); padding: .68rem .78rem; margin-left: .5rem; background: #0f1116; color: var(--text); outline: none; }
+    textarea { min-height: 8rem; resize: vertical; }
+    input:focus, select:focus, textarea:focus { border-color: var(--red-strong); box-shadow: 0 0 0 3px rgba(239,35,60,.18); }
     input[type="color"] { width: 4rem; height: 2.6rem; padding: .2rem; vertical-align: middle; }
     .card { background: linear-gradient(180deg, rgba(32,35,43,.96), rgba(23,25,31,.96)); border: 1px solid rgba(255,255,255,.08); border-radius: 1.1rem; padding: 1.15rem; margin: 1rem 0; box-shadow: 0 18px 45px rgba(0,0,0,.24); }
     .member-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; margin: 1rem 0; }
@@ -950,7 +1359,19 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .selected-member { display: inline-flex; align-items: center; gap: .4rem; background: var(--red-soft); border: 1px solid rgba(239,35,60,.24); border-radius: 999px; padding: .35rem .45rem .35rem .75rem; }
     .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #3a1017; box-shadow: none; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
-    .management-list { display: grid; gap: .75rem; }
+    .management-list, .event-list { display: grid; gap: .75rem; }
+    .event-card { border-color: rgba(239,35,60,.2); }
+    .event-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
+    .event-capacity { border: 1px solid rgba(239,35,60,.32); border-radius: 999px; padding: .35rem .7rem; background: var(--red-soft); color: #ffd4d9; font-weight: 900; }
+    .event-meta-grid, .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .75rem; margin: 1rem 0; }
+    .stacked-form { display: grid; gap: 1rem; }
+    .stacked-form label { display: grid; gap: .35rem; font-weight: 800; }
+    .stacked-form input, .stacked-form select, .stacked-form textarea { margin-left: 0; width: 100%; }
+    fieldset { border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
+    legend { padding: 0 .35rem; font-weight: 900; }
+    .checkbox-list { display: grid; gap: .5rem; }
+    .checkbox-row { display: flex; align-items: center; gap: .6rem; background: #12141a; border: 1px solid var(--line); border-radius: .85rem; padding: .7rem; }
+    .checkbox-row input { width: auto; margin: 0; }
     .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
@@ -971,7 +1392,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .16rem .5rem; border-radius: 999px; background: var(--red-soft); color: #ffb3bc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
     small { color: var(--muted); } code { background: #0f1116; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .35rem; color: #ffd4d9; }
-    @media (max-width: 720px) { .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell { justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 720px) { .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell, .nav-groups { align-items: stretch; flex-direction: column; justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main></body>
@@ -980,6 +1401,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
 
 function navigation(options: LayoutOptions) {
   const activeClass = (key: LayoutOptions['active']) => options.active === key ? ' class="active"' : '';
+  const eventManagementLink = options.user && options.isAdmin ? `<a href="/event-management"${activeClass('event-management')}>Event management</a>` : '';
   const adminLink = options.user && options.isAdmin ? `<a href="/administrator"${activeClass('administrator')}>Administrator</a>` : '';
   const developerLink = options.user && (options.isDeveloper || isDeveloperUser(options.user)) ? `<a href="/developer"${activeClass('developer')}>Developer</a>` : '';
   const userControls = options.user
@@ -989,12 +1411,14 @@ function navigation(options: LayoutOptions) {
   return `<header class="topbar">
     <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle Team Hub</span></a>
     <div class="nav-shell">
-      <nav class="nav-links" aria-label="Primary navigation">
-        <a href="/"${activeClass('dashboard')}>Dashboard</a>
-        ${options.user ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
-        ${adminLink}
-        ${developerLink}
-      </nav>
+      <div class="nav-groups">
+        <nav class="nav-links" aria-label="Primary navigation">
+          <a href="/"${activeClass('dashboard')}>Dashboard</a>
+          ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
+          ${options.user ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
+        </nav>
+        ${(eventManagementLink || adminLink || developerLink) ? `<nav class="nav-links" aria-label="Administration navigation">${eventManagementLink}${adminLink}${developerLink}</nav>` : ''}
+      </div>
       ${userControls}
     </div>
   </header>`;

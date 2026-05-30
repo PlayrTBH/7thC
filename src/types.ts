@@ -38,6 +38,33 @@ export type TeamInvite = {
   respondedAt?: string;
 };
 
+export type Event = {
+  id: string;
+  title: string;
+  description: string;
+  teamLimit: number;
+  requiredMainPlayers: number;
+  requiredSubstitutes: number;
+  startsAt: string;
+  endsAt: string;
+  registrationOpensAt: string;
+  registrationClosesAt: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+};
+
+export type EventRegistration = {
+  id: string;
+  eventId: string;
+  teamId: string;
+  captainId: string;
+  mainPlayerIds: string[];
+  substitutePlayerIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type BotActivityType = 'Playing' | 'Watching' | 'Listening' | 'Competing';
 export type BotStatus = 'online' | 'idle' | 'dnd' | 'invisible';
 
@@ -56,5 +83,7 @@ export type StoreShape = {
   teams: Team[];
   members: TeamMember[];
   invites: TeamInvite[];
+  events: Event[];
+  eventRegistrations: EventRegistration[];
   settings: AdministratorSettings;
 };

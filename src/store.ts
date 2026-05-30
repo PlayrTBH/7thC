@@ -1,11 +1,13 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 
 const initialStore: StoreShape = {
   teams: [],
   members: [],
   invites: [],
+  events: [],
+  eventRegistrations: [],
   settings: {}
 };
 
@@ -32,6 +34,67 @@ export class JsonStore {
   async getTeams() {
     const data = await this.read();
     return [...data.teams].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async getEvents() {
+    const data = await this.read();
+    return [...data.events].sort((a, b) => a.startsAt.localeCompare(b.startsAt) || a.title.localeCompare(b.title));
+  }
+
+  async getEvent(eventId: string) {
+    const data = await this.read();
+    return data.events.find((event) => event.id === eventId);
+  }
+
+  async getEventRegistrations(eventId: string) {
+    const data = await this.read();
+    return data.eventRegistrations
+      .filter((registration) => registration.eventId === eventId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async getEventRegistration(eventId: string, teamId: string) {
+    const data = await this.read();
+    return data.eventRegistrations.find((registration) => registration.eventId === eventId && registration.teamId === teamId);
+  }
+
+  async getEventRegistrationCounts() {
+    const data = await this.read();
+    return data.eventRegistrations.reduce<Record<string, number>>((counts, registration) => {
+      counts[registration.eventId] = (counts[registration.eventId] ?? 0) + 1;
+      return counts;
+    }, {});
+  }
+
+  async addEvent(event: Event) {
+    await this.update((data) => {
+      data.events.push(event);
+      return data;
+    });
+  }
+
+  async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt'>) {
+    await this.update((data) => {
+      const event = data.events.find((item) => item.id === eventId);
+      if (!event) throw new Error('Event not found.');
+      Object.assign(event, updates, { updatedAt: new Date().toISOString() });
+      return data;
+    });
+  }
+
+  async addEventRegistration(registration: EventRegistration) {
+    await this.update((data) => {
+      const event = data.events.find((item) => item.id === registration.eventId);
+      if (!event) throw new Error('Event not found.');
+      if (!data.teams.some((team) => team.id === registration.teamId)) throw new Error('Team not found.');
+      if (data.eventRegistrations.some((item) => item.eventId === registration.eventId && item.teamId === registration.teamId)) {
+        throw new Error('Your team is already registered for this event.');
+      }
+      const registrationCount = data.eventRegistrations.filter((item) => item.eventId === registration.eventId).length;
+      if (registrationCount >= event.teamLimit) throw new Error('This event has reached its team registration limit.');
+      data.eventRegistrations.push(registration);
+      return data;
+    });
   }
 
   async getAdministratorSettings() {
@@ -142,6 +205,7 @@ export class JsonStore {
       data.teams = data.teams.filter((team) => team.id !== teamId);
       data.members = data.members.filter((member) => member.teamId !== teamId);
       data.invites = data.invites.filter((invite) => invite.teamId !== teamId);
+      data.eventRegistrations = data.eventRegistrations.filter((registration) => registration.teamId !== teamId);
       return data;
     });
   }
@@ -260,6 +324,8 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     teams: data.teams ?? [],
     members: data.members ?? [],
     invites: data.invites ?? [],
+    events: data.events ?? [],
+    eventRegistrations: data.eventRegistrations ?? [],
     settings: data.settings ?? {}
   };
 
@@ -285,6 +351,12 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
       joinedAt: invite.respondedAt ?? invite.createdAt
     });
   }
+
+  const teamIds = new Set(normalized.teams.map((team) => team.id));
+  const eventIds = new Set(normalized.events.map((event) => event.id));
+  normalized.eventRegistrations = normalized.eventRegistrations.filter(
+    (registration) => teamIds.has(registration.teamId) && eventIds.has(registration.eventId)
+  );
 
   for (const team of normalized.teams) {
     const owner = normalized.members.find((member) => member.teamId === team.id && member.userId === team.ownerId);
