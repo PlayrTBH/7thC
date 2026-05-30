@@ -56,6 +56,13 @@ export class JsonStore {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
+  async getEventRegistrationsForTeam(teamId: string) {
+    const data = await this.read();
+    return data.eventRegistrations
+      .filter((registration) => registration.teamId === teamId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   async getEventRegistration(eventId: string, teamId: string) {
     const data = await this.read();
     return data.eventRegistrations.find((registration) => registration.eventId === eventId && registration.teamId === teamId);
