@@ -11,6 +11,7 @@ import {
   PermissionsBitField,
   type ColorResolvable,
   type Guild,
+  type GuildInvitableChannelResolvable,
   type Role,
   type GuildMember,
   ActivityType,
@@ -83,6 +84,7 @@ export class TeamBot {
       }
       this.client.once(Events.ClientReady, () => resolve());
     });
+    await this.getGuildInviteUrl();
     await this.ensureTeamRolesDisplayed();
     await this.applyDeveloperSettings(await this.store.getDeveloperSettings());
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
@@ -91,6 +93,24 @@ export class TeamBot {
   async getGuild() {
     const guild = await this.client.guilds.fetch(config.DISCORD_GUILD_ID);
     return guild.fetch();
+  }
+
+
+  async getGuildInviteUrl() {
+    const settings = await this.store.getAdministratorSettings();
+    if (settings.discordInviteUrl) return settings.discordInviteUrl;
+
+    const guild = await this.getGuild();
+    const channel = await findInviteChannel(guild);
+    const invite = await guild.invites.create(channel, {
+      maxAge: 0,
+      maxUses: 0,
+      unique: false,
+      reason: 'Permanent website invite created by 7th Circle Team Hub'
+    });
+    const inviteUrl = invite.url;
+    await this.store.updateDiscordInviteUrl(inviteUrl);
+    return inviteUrl;
   }
 
   async getGuildMember(userId: string) {
@@ -699,6 +719,25 @@ function unique(values: string[]) {
   return [...new Set(values)];
 }
 
+
+async function findInviteChannel(guild: Guild): Promise<GuildInvitableChannelResolvable> {
+  const me = await guild.members.fetchMe();
+  const channels = await guild.channels.fetch();
+  const candidates = [
+    guild.systemChannelId ? channels.get(guild.systemChannelId) : undefined,
+    ...channels.values()
+  ];
+
+  const channel = candidates.find((item) => {
+    if (!item) return false;
+    if (![ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice, ChannelType.GuildStageVoice, ChannelType.GuildForum, ChannelType.GuildMedia].includes(item.type)) return false;
+    return item.permissionsFor(me)?.has([PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.CreateInstantInvite]) ?? false;
+  });
+
+  if (!channel) throw new Error('Bot needs Create Instant Invite permission in at least one server channel.');
+  return channel as GuildInvitableChannelResolvable;
+}
+
 async function renameGuildChannel(guild: Guild, channelId: string, name: string, reason: string) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel || !('setName' in channel)) return;
@@ -707,14 +746,15 @@ async function renameGuildChannel(guild: Guild, channelId: string, name: string,
 
 async function assertBotPermissions(guild: Guild) {
   const me = await guild.members.fetchMe();
-  const needed = [PermissionsBitField.Flags.ManageRoles, PermissionsBitField.Flags.ManageChannels];
+  const needed = [PermissionsBitField.Flags.ManageRoles, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.CreateInstantInvite];
   if (!me.permissions.has(needed)) {
-    throw new Error('Bot needs Manage Roles and Manage Channels permissions.');
+    throw new Error('Bot needs Manage Roles, Manage Channels, and Create Instant Invite permissions.');
   }
 }
 
 export type TeamBotApi = Pick<
   TeamBot,
+  | 'getGuildInviteUrl'
   | 'getGuildMember'
   | 'getAdministratorAccess'
   | 'getTeamMemberDetails'

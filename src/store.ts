@@ -147,6 +147,13 @@ export class JsonStore {
     });
   }
 
+  async updateDiscordInviteUrl(discordInviteUrl: string) {
+    await this.update((data) => {
+      data.settings = { ...data.settings, discordInviteUrl };
+      return data;
+    });
+  }
+
   async getDeveloperSettings() {
     const data = await this.read();
     return data.settings.developer ?? {};

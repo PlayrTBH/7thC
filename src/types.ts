@@ -77,6 +77,7 @@ export type DeveloperSettings = {
 
 export type AdministratorSettings = {
   adminRoleId?: string;
+  discordInviteUrl?: string;
   developer?: DeveloperSettings;
 };
 
