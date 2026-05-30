@@ -410,7 +410,7 @@ export class TeamBot {
     await this.store.transferTeamOwnership(teamId, newOwnerId);
   }
 
-  async kickTeamMember(teamId: string, userId: string) {
+  async kickTeamMember(teamId: string, userId: string, options: { notify?: boolean } = { notify: true }) {
     const team = await this.store.getTeam(teamId);
     if (!team) throw new Error('Team not found.');
     if (team.ownerId === userId) throw new Error('Team owners cannot be kicked. Delete the team instead.');
@@ -422,12 +422,16 @@ export class TeamBot {
       await this.removeOrganizationalRoles(member);
     }
     await this.store.removeTeamMember(teamId, userId);
+
+    if (options.notify ?? true) {
+      await this.sendTeamKickDm(userId, team);
+    }
   }
 
   async leaveTeam(userId: string) {
     const team = await this.store.getTeamForUser(userId);
     if (!team) throw new Error('You are not currently in a team.');
-    await this.kickTeamMember(team.id, userId);
+    await this.kickTeamMember(team.id, userId, { notify: false });
   }
 
   async setTeamRoleColor(teamId: string, rawColor: string) {
@@ -483,6 +487,22 @@ export class TeamBot {
     await guild.channels.delete(team.categoryId, 'Team deleted').catch(() => undefined);
     await guild.roles.delete(team.roleId, 'Team deleted').catch(() => undefined);
     await this.store.removeTeam(teamId);
+  }
+
+  private async sendTeamKickDm(userId: string, team: Team) {
+    const guild = await this.getGuild();
+    const member = await guild.members.fetch(userId).catch(() => null);
+    const recipient = member?.user ?? (await this.client.users.fetch(userId).catch(() => null));
+    if (!recipient) return;
+
+    await recipient
+      .send({
+        content: `You have been kicked from "${team.name}" team.`,
+        allowedMentions: { parse: [] }
+      })
+      .catch((error) => {
+        console.warn(`Unable to send team kick DM to ${userId} for team ${team.id}:`, error);
+      });
   }
 
   private async createAndSendInvites(guild: Guild, inviter: GuildMember, team: Team, inviteeIds: string[]) {
