@@ -16,12 +16,18 @@ function optionalUrl(name: string, fallback: string) {
   }
 }
 
-function optionalPort(name: string, fallback: number) {
+function optionalPort(name: string, fallback: number): number {
+  return optionalPositiveInteger(name, fallback);
+}
+
+function optionalPositiveInteger(name: string): number | undefined;
+function optionalPositiveInteger(name: string, fallback: number): number;
+function optionalPositiveInteger(name: string, fallback?: number) {
   const raw = process.env[name];
   if (!raw) return fallback;
-  const port = Number(raw);
-  if (!Number.isInteger(port) || port <= 0) throw new Error(`${name} must be a positive integer`);
-  return port;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
 }
 
 const sessionSecret = required('SESSION_SECRET');
@@ -38,7 +44,8 @@ export const config = {
   SESSION_SECRET: sessionSecret,
   DATA_FILE: process.env.DATA_FILE ?? './data/store.json',
   SESSION_FILE:
-    process.env.SESSION_FILE ?? join(dirname(process.env.DATA_FILE ?? './data/store.json'), 'sessions.json')
+    process.env.SESSION_FILE ?? join(dirname(process.env.DATA_FILE ?? './data/store.json'), 'sessions.json'),
+  WEB_CONCURRENCY: optionalPositiveInteger('WEB_CONCURRENCY')
 };
 
 export const discordRedirectUri = `${config.PUBLIC_URL}/auth/discord/callback`;

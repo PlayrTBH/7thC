@@ -95,7 +95,9 @@ export class TeamBot {
 
   async getGuildMember(userId: string) {
     const guild = await this.getGuild();
-    return guild.members.fetch(userId).catch(() => null);
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member) return null;
+    return { id: member.id, displayName: member.displayName, username: member.user.username };
   }
 
   async getAdministratorAccess(userId: string) {
@@ -710,3 +712,25 @@ async function assertBotPermissions(guild: Guild) {
     throw new Error('Bot needs Manage Roles and Manage Channels permissions.');
   }
 }
+
+export type TeamBotApi = Pick<
+  TeamBot,
+  | 'getGuildMember'
+  | 'getAdministratorAccess'
+  | 'getTeamMemberDetails'
+  | 'getGuildRoles'
+  | 'getDeveloperStats'
+  | 'restart'
+  | 'updateDeveloperSettings'
+  | 'searchInvitableMembers'
+  | 'createTeam'
+  | 'getTeamInviteDetails'
+  | 'inviteTeamMembers'
+  | 'setTeamRoleColor'
+  | 'renameTeam'
+  | 'setTeamMemberRole'
+  | 'kickTeamMember'
+  | 'transferTeamOwnership'
+  | 'deleteTeam'
+  | 'leaveTeam'
+>;

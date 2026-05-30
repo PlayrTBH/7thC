@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import session from 'express-session';
 import { config, DEVELOPER_DISCORD_USER_ID, discordRedirectUri } from './config.js';
-import type { TeamBot } from './bot.js';
+import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
@@ -19,7 +19,7 @@ declare module 'express-session' {
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
-export function createWebApp(bot: TeamBot, store: JsonStore) {
+export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
 
   app.set('trust proxy', 1);
@@ -596,7 +596,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-function requireGuildAdministrator(bot: TeamBot) {
+function requireGuildAdministrator(bot: TeamBotApi) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
@@ -612,7 +612,7 @@ function requireGuildAdministrator(bot: TeamBot) {
   };
 }
 
-function requireGuildOwner(bot: TeamBot) {
+function requireGuildOwner(bot: TeamBotApi) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       const access = await bot.getAdministratorAccess(req.session.discordUser!.id);
@@ -640,7 +640,7 @@ function isDeveloperUser(user?: DiscordUser) {
   return user?.id === DEVELOPER_DISCORD_USER_ID;
 }
 
-function requireTeamManager(bot: TeamBot, store: JsonStore) {
+function requireTeamManager(bot: TeamBotApi, store: JsonStore) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = req.session.discordUser!;
@@ -683,7 +683,7 @@ type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requ
 type EventRegistrationDetail = {
   registration: EventRegistration;
   team?: Team;
-  members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>;
+  members: Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>;
 };
 
 function eventsPage(events: Event[], counts: Record<string, number>, currentTeam: Team | undefined, currentUserId: string, userRegisteredEventIds: Set<string>) {
@@ -732,7 +732,7 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
 function eventRegistrationPage(
   event: Event,
   team: Team,
-  members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>,
+  members: Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>,
   registrationCount: number,
   existingRegistration?: EventRegistration
 ) {
@@ -858,7 +858,7 @@ function eventForm(action: string, event?: Event) {
   </form>`;
 }
 
-function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string, selectedIds: string[] = []) {
+function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string, selectedIds: string[] = []) {
   if (!members.length) return `<p><small>${emptyMessage}</small></p>`;
   const selected = new Set(selectedIds);
   return `<p><small>Select at least ${requiredCount}.</small></p><div class="checkbox-list modern-checkbox-list">${members.map((member) => {
@@ -1011,7 +1011,7 @@ function administratorSettingsForm(roles: Array<{ id: string; name: string; mana
 }
 
 function developerPage(
-  stats: Awaited<ReturnType<TeamBot['getDeveloperStats']>>,
+  stats: Awaited<ReturnType<TeamBotApi['getDeveloperStats']>>,
   teamCount: number,
   settings: { botStatus?: BotStatus; activityName?: string; activityType?: BotActivityType },
   logs: CapturedLog[]
