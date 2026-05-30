@@ -402,7 +402,18 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         return;
       }
 
-      res.send(layout('Team', teamPageSection(currentTeam, user.id), { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
+      const [members, teamRegistrations, events] = await Promise.all([
+        bot.getTeamMemberDetails(currentTeam.id),
+        store.getEventRegistrationsForTeam(currentTeam.id),
+        store.getEvents()
+      ]);
+      const eventsById = new Map(events.map((event) => [event.id, event]));
+      const registrationDetails = teamRegistrations
+        .map((registration) => ({ registration, event: eventsById.get(registration.eventId) }))
+        .filter((detail): detail is TeamPageRegistrationDetail => Boolean(detail.event))
+        .sort((a, b) => a.event.startsAt.localeCompare(b.event.startsAt) || a.event.title.localeCompare(b.event.title));
+
+      res.send(layout('Team', teamPageSection(currentTeam, user.id, members, registrationDetails), { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -691,6 +702,13 @@ type EventRegistrationDetail = {
   team?: Team;
   members: Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>;
 };
+
+type TeamPageRegistrationDetail = {
+  registration: EventRegistration;
+  event: Event;
+};
+
+type TeamMemberDetail = Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>[number];
 
 function eventsPage(events: Event[], counts: Record<string, number>, currentTeam: Team | undefined, currentUserId: string, userRegisteredEventIds: Set<string>) {
   const visibleEvents = events.filter((event) => eventState(event) !== 'ended');
@@ -1142,26 +1160,98 @@ function formatBytes(bytes: number) {
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-function teamPageSection(team: Team | undefined, userId: string) {
+function teamPageSection(
+  team: Team | undefined,
+  userId: string,
+  members: TeamMemberDetail[] = [],
+  registrations: TeamPageRegistrationDetail[] = []
+) {
   if (!team) {
     return `<p>You are not currently in a team.</p><p><a class="button" href="/teams/new">Create Team</a></p>`;
   }
 
-  if (team.ownerId === userId) {
-    return `<h2>Your team</h2>
-      <div class="card">
-        <p><strong>${escapeHtml(team.name)}</strong> — role <code>${escapeHtml(team.roleId)}</code></p>
-        <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage Team</a></p>
-      </div>`;
-  }
+  const isCaptain = team.ownerId === userId;
+  const currentMember = members.find((member) => member.userId === userId);
+  return `<section class="card">
+      <div class="section-heading-row">
+        <div>
+          <p class="eyebrow">${isCaptain ? 'Team captain' : 'Team member'}</p>
+          <h2>${escapeHtml(team.name)}</h2>
+          <p><small>Your role: <strong>${escapeHtml(teamRoleLabel(currentMember?.role ?? (isCaptain ? 'captain' : 'main')))}</strong> · Discord role <code>${escapeHtml(team.roleId)}</code></small></p>
+        </div>
+        ${isCaptain ? `<a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage Team</a>` : ''}
+      </div>
+      ${
+        isCaptain
+          ? '<p>Use the manage page to invite members, update roles, edit team settings, or delete the team.</p>'
+          : `<form method="post" action="/teams/leave" onsubmit="return confirm('Leave ${escapeJsString(team.name)}? You will lose access to its private channels.');">
+              <button class="danger" type="submit">Leave team</button>
+            </form>`
+      }
+    </section>
 
-  return `<h2>Your team</h2>
-    <div class="card">
-      <p>You are currently a member of <strong>${escapeHtml(team.name)}</strong>.</p>
-      <form method="post" action="/teams/leave" onsubmit="return confirm('Leave ${escapeJsString(team.name)}? You will lose access to its private channels.');">
-        <button class="danger" type="submit">Leave team</button>
-      </form>
-    </div>`;
+    <section class="card">
+      <div class="section-heading-row">
+        <div>
+          <p class="eyebrow">Roster</p>
+          <h2>Team members and roles</h2>
+        </div>
+        <span class="event-capacity">${members.length} member${members.length === 1 ? '' : 's'}</span>
+      </div>
+      ${teamRosterSection(members)}
+    </section>
+
+    <section class="card">
+      <div class="section-heading-row">
+        <div>
+          <p class="eyebrow">Registrations</p>
+          <h2>Registered events</h2>
+        </div>
+        <span class="event-capacity">${registrations.length} event${registrations.length === 1 ? '' : 's'}</span>
+      </div>
+      ${teamRegisteredEventsSection(registrations, members)}
+    </section>`;
+}
+
+function teamRosterSection(members: TeamMemberDetail[]) {
+  if (!members.length) return '<p>No team members were found.</p>';
+
+  return `<div class="management-list">
+    ${members.map((member) => teamRosterMember(member)).join('')}
+  </div>`;
+}
+
+function teamRosterMember(member: TeamMemberDetail) {
+  return `<div class="managed-member">
+    ${member.avatarUrl ? `<img src="${escapeHtml(member.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
+    <div class="member-info">
+      <strong>${escapeHtml(member.displayName)}</strong> ${member.isOwner ? '<span class="pill">captain</span>' : ''}<br />
+      <small>@${escapeHtml(member.username)}</small>
+    </div>
+    <span class="role-label">${escapeHtml(teamRoleLabel(member.role))}</span>
+  </div>`;
+}
+
+function teamRegisteredEventsSection(registrations: TeamPageRegistrationDetail[], members: TeamMemberDetail[]) {
+  if (!registrations.length) return '<p>This team is not registered for any events yet.</p>';
+
+  return `<div class="management-list">
+    ${registrations.map((detail) => teamRegisteredEvent(detail, members)).join('')}
+  </div>`;
+}
+
+function teamRegisteredEvent(detail: TeamPageRegistrationDetail, members: TeamMemberDetail[]) {
+  const memberNames = new Map(members.map((member) => [member.userId, member.displayName]));
+  const listNames = (ids: string[]) => ids.map((id) => escapeHtml(memberNames.get(id) ?? id)).join(', ') || 'None selected';
+  return `<div class="admin-team-row">
+    <div>
+      <strong>${escapeHtml(detail.event.title)}</strong> <span class="pill">${escapeHtml(eventStateLabel(eventState(detail.event)))}</span><br />
+      <small>${escapeHtml(formatDateTime(detail.event.startsAt))} – ${escapeHtml(formatDateTime(detail.event.endsAt))}</small><br />
+      <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
+      <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
+    </div>
+    <a class="button secondary" href="/events/${encodeURIComponent(detail.event.id)}/registrations">View event teams</a>
+  </div>`;
 }
 
 function teamForm() {
