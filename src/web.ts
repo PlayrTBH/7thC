@@ -63,7 +63,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const user = req.session.discordUser;
       if (!user) {
-        res.send(layout('7th Circle', `<section class="hero-card login-card"><p class="eyebrow">7th Circle</p><h2>Log in</h2><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
+        const inviteUrl = await bot.getGuildInviteUrl();
+        res.send(layout('7th Circle', homePage(inviteUrl)));
         return;
       }
 
@@ -96,14 +97,28 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
       const user = await exchangeCodeForUser(code);
       const member = await bot.getGuildMember(user.id);
-      if (!member) {
-        res.status(403).send(layout('Not in server', '<p>Your Discord account is not a member of the configured server.</p>'));
-        return;
-      }
-
       req.session.discordUser = user;
       delete req.session.oauthState;
-      res.redirect('/events');
+      res.redirect(member ? '/events' : '/join-discord');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+
+  app.get('/join-discord', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [inviteUrl, member, administratorAccess] = await Promise.all([
+        bot.getGuildInviteUrl(),
+        bot.getGuildMember(user.id),
+        bot.getAdministratorAccess(user.id)
+      ]);
+      if (member) {
+        res.redirect('/events');
+        return;
+      }
+      res.status(403).send(layout('Join the Discord', joinDiscordPage(inviteUrl), { user, isAdmin: administratorAccess.isAdmin }));
     } catch (error) {
       next(error);
     }
@@ -394,7 +409,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     res.redirect('/developer#logs');
   });
 
-  app.get('/members/search', requireAuth, async (req, res, next) => {
+  app.get('/members/search', requireAuth, requireGuildMembership(bot), async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
       const query = typeof req.query.query === 'string' ? req.query.query : '';
@@ -434,7 +449,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     }
   });
 
-  app.get('/teams/new', requireAuth, async (req, res, next) => {
+  app.get('/teams/new', requireAuth, requireGuildMembership(bot), async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
       const [currentTeam, administratorAccess] = await Promise.all([
@@ -452,7 +467,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     }
   });
 
-  app.post('/teams', requireAuth, async (req, res, next) => {
+  app.post('/teams', requireAuth, requireGuildMembership(bot), async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
       const teamName = String(req.body.teamName ?? '');
@@ -672,6 +687,27 @@ function isDeveloperUser(user?: DiscordUser) {
   return user?.id === DEVELOPER_DISCORD_USER_ID;
 }
 
+
+function requireGuildMembership(bot: TeamBotApi) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = req.session.discordUser!;
+      const member = await bot.getGuildMember(user.id);
+      if (!member) {
+        const [inviteUrl, administratorAccess] = await Promise.all([
+          bot.getGuildInviteUrl(),
+          bot.getAdministratorAccess(user.id)
+        ]);
+        res.status(403).send(layout('Join the Discord', joinDiscordPage(inviteUrl), { user, isAdmin: administratorAccess.isAdmin }));
+        return;
+      }
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
 function requireTeamManager(bot: TeamBotApi, store: JsonStore) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -694,6 +730,38 @@ function requireTeamManager(bot: TeamBotApi, store: JsonStore) {
       next(error);
     }
   };
+}
+
+
+function homePage(inviteUrl: string) {
+  return `<section class="hero-card home-hero">
+      <div>
+        <p class="eyebrow">7th Circle</p>
+        <h2>Team hub for the 7th Circle Discord</h2>
+        <p>Join the server, log in with Discord, create your team, invite teammates, and register for events from one place.</p>
+        <div class="hero-actions">
+          <a class="button discord-button" href="${escapeHtml(inviteUrl)}" target="_blank" rel="noopener noreferrer">Join Discord</a>
+          <a class="button secondary" href="/auth/discord">Log in with Discord</a>
+        </div>
+      </div>
+      <div class="discord-panel" aria-hidden="true">
+        <span class="discord-icon">☾</span>
+        <strong>Discord required</strong>
+        <small>Membership unlocks team creation and private channels.</small>
+      </div>
+    </section>`;
+}
+
+function joinDiscordPage(inviteUrl: string) {
+  return `<section class="hero-card join-card">
+      <p class="eyebrow">Discord membership required</p>
+      <h2>Join the 7th Circle Discord to continue</h2>
+      <p>Your website login is connected, but this Discord account is not in the server yet. Join the server, then return here to refresh your access before creating a team.</p>
+      <div class="hero-actions">
+        <a class="button discord-button" href="${escapeHtml(inviteUrl)}" target="_blank" rel="noopener noreferrer">Join Discord</a>
+        <a class="button secondary" href="/join-discord">I joined — check again</a>
+      </div>
+    </section>`;
 }
 
 function settingsPage(user: DiscordUser) {
@@ -1616,6 +1684,13 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .hero-card { position: relative; overflow: hidden; padding: clamp(1.5rem, 5vw, 4rem); border: 1px solid rgba(239,35,60,.28); border-radius: 1.5rem; background: linear-gradient(145deg, rgba(32,35,43,.94), rgba(12,13,17,.96)); box-shadow: var(--shadow); }
     .hero-card::after { content: "7"; position: absolute; right: clamp(1rem, 7vw, 5rem); bottom: -2.5rem; color: rgba(201,8,32,.18); font-size: clamp(10rem, 28vw, 20rem); font-weight: 950; line-height: .8; }
     .hero-card h2 { max-width: 720px; margin: .25rem 0 1rem; font-size: clamp(2.25rem, 7vw, 5.5rem); line-height: .9; }
+    .hero-card p:not(.eyebrow) { color: var(--muted); max-width: 42rem; font-size: 1.05rem; line-height: 1.6; }
+    .home-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(13rem, 18rem); gap: clamp(1rem, 5vw, 3rem); align-items: center; }
+    .hero-actions { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.4rem; }
+    .discord-panel { position: relative; z-index: 1; display: grid; gap: .45rem; padding: 1.2rem; border: 1px solid rgba(88,101,242,.38); border-radius: 1.15rem; background: linear-gradient(145deg, rgba(88,101,242,.22), rgba(18,20,26,.86)); box-shadow: 0 20px 45px rgba(88,101,242,.12); }
+    .discord-icon { display: grid; place-items: center; width: 3rem; height: 3rem; border-radius: 1rem; background: #5865f2; color: #fff; font-size: 1.5rem; font-weight: 900; }
+    .discord-button { background: linear-gradient(135deg, #5865f2, #3843c7); box-shadow: 0 12px 30px rgba(88,101,242,.25); }
+    .join-card { max-width: 820px; margin: 0 auto; }
     .eyebrow { margin: 0 0 .75rem; color: var(--red-strong); text-transform: uppercase; letter-spacing: .16em; font-size: .78rem; font-weight: 900; }
     .button, button { background: linear-gradient(135deg, var(--red), #8f0617); color: white; border: 0; border-radius: .8rem; padding: .78rem 1rem; text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font-weight: 800; box-shadow: 0 12px 30px rgba(201,8,32,.22); }
     button:hover, .button:hover { transform: translateY(-1px); color: white; }
@@ -1686,7 +1761,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .16rem .5rem; border-radius: 999px; background: var(--red-soft); color: #ffb3bc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
     small { color: var(--muted); } code { background: #0f1116; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .35rem; color: #ffd4d9; }
-    @media (max-width: 720px) { .event-photo-field { grid-template-columns: 1fr; align-items: stretch; } .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell, .nav-groups { align-items: stretch; flex-direction: column; justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 720px) { .home-hero { grid-template-columns: 1fr; } .discord-panel { display: none; } .event-photo-field { grid-template-columns: 1fr; align-items: stretch; } .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell, .nav-groups { align-items: stretch; flex-direction: column; justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main><script>
