@@ -1,3 +1,4 @@
+import { dirname, join } from 'node:path';
 import 'dotenv/config';
 
 function required(name: string) {
@@ -35,7 +36,9 @@ export const config = {
   HOST: process.env.HOST ?? '0.0.0.0',
   PORT: optionalPort('PORT', 3000),
   SESSION_SECRET: sessionSecret,
-  DATA_FILE: process.env.DATA_FILE ?? './data/store.json'
+  DATA_FILE: process.env.DATA_FILE ?? './data/store.json',
+  SESSION_FILE:
+    process.env.SESSION_FILE ?? join(dirname(process.env.DATA_FILE ?? './data/store.json'), 'sessions.json')
 };
 
 export const discordRedirectUri = `${config.PUBLIC_URL}/auth/discord/callback`;

@@ -110,6 +110,7 @@ HOST=0.0.0.0
 PORT=3000
 SESSION_SECRET=replace_with_a_long_random_secret
 DATA_FILE=./data/store.json
+SESSION_FILE=./data/sessions.json
 ```
 
 Generate a session secret with:
@@ -242,6 +243,8 @@ If the VM cannot reach `http://192.168.1.117:3000` or your Cloudflare Tunnel doe
 - Put the app behind HTTPS and set `PUBLIC_URL` to the public HTTPS URL.
 - Use a process manager such as systemd, Docker, or PM2 to keep `npm start` running.
 - The default persistence layer is a JSON file at `DATA_FILE`; back it up if you rely on invite history.
+- Web login sessions are stored in `SESSION_FILE` (defaulting to `sessions.json` next to `DATA_FILE`)
+  with a 7-day cookie lifetime, avoiding Express' in-memory production session store.
 - Discord users can block DMs from server members. Those invites are marked `failed_dm` in the JSON store and will need manual follow-up.
 - Keep `.env` and `data/` private. They contain secrets and Discord IDs.
 

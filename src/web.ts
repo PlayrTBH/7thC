@@ -5,6 +5,7 @@ import { config, DEVELOPER_DISCORD_USER_ID, discordRedirectUri } from './config.
 import type { TeamBot } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
+import { JsonSessionStore } from './session-store.js';
 import type { BotActivityType, BotStatus, DiscordUser, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 declare module 'express-session' {
@@ -13,6 +14,8 @@ declare module 'express-session' {
     oauthState?: string;
   }
 }
+
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function createWebApp(bot: TeamBot, store: JsonStore) {
   const app = express();
@@ -26,13 +29,15 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
   app.use(
     session({
       name: 'teamhub.sid',
+      store: new JsonSessionStore(config.SESSION_FILE),
       secret: config.SESSION_SECRET,
       resave: false,
       saveUninitialized: false,
       cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: config.PUBLIC_URL.startsWith('https://')
+        secure: config.PUBLIC_URL.startsWith('https://'),
+        maxAge: SESSION_MAX_AGE_MS
       }
     })
   );
