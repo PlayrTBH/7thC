@@ -57,22 +57,11 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const user = req.session.discordUser;
       if (!user) {
-        res.send(layout('7th Circle Team Hub', `<section class="hero-card login-card"><p class="eyebrow">7th Circle Team Hub</p><h2>Log in</h2><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
+        res.send(layout('7th Circle', `<section class="hero-card login-card"><p class="eyebrow">7th Circle</p><h2>Log in</h2><p><a class="button" href="/auth/discord">Log in with Discord</a></p></section>`));
         return;
       }
 
-      const currentTeam = await store.getTeamForUser(user.id);
-      const administratorAccess = await bot.getAdministratorAccess(user.id);
-      res.send(
-        layout(
-          'Dashboard',
-          `<p class="page-intro">Logged in as <strong>${escapeHtml(displayUser(user))}</strong>.</p>
-           ${administratorAccess.isAdmin ? '<p><a class="button secondary" href="/administrator">Administrator page</a></p>' : ''}
-           ${isDeveloperUser(user) ? '<p><a class="button secondary" href="/developer">Developer panel</a></p>' : ''}
-           ${dashboardTeamSection(currentTeam, user.id)}`,
-          { user, isAdmin: administratorAccess.isAdmin, active: 'dashboard' }
-        )
-      );
+      res.redirect('/events');
     } catch (error) {
       next(error);
     }
@@ -108,7 +97,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 
       req.session.discordUser = user;
       delete req.session.oauthState;
-      res.redirect('/');
+      res.redirect('/events');
     } catch (error) {
       next(error);
     }
@@ -395,6 +384,24 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     }
   });
 
+  app.get('/team', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [currentTeam, administratorAccess] = await Promise.all([
+        store.getTeamForUser(user.id),
+        bot.getAdministratorAccess(user.id)
+      ]);
+      if (!currentTeam) {
+        res.redirect('/teams/new');
+        return;
+      }
+
+      res.send(layout('Team', teamPageSection(currentTeam, user.id), { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/teams/new', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
@@ -403,11 +410,11 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
         bot.getAdministratorAccess(user.id)
       ]);
       if (currentTeam) {
-        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
+        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/events">Back to events</a></p>`, { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
         return;
       }
 
-      res.send(layout('Create a team', teamForm(), { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }));
+      res.send(layout('Create Team', teamForm(), { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }));
     } catch (error) {
       next(error);
     }
@@ -426,7 +433,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           'Team created',
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
            <p>${teamCreatedInviteMessage(invites.length)}</p>
-           <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`,
+           <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage Team</a> <a class="button secondary" href="/events">Back to events</a></p>`,
           { user, isAdmin: administratorAccess.isAdmin, currentTeam: team, active: 'teams' }
         )
       );
@@ -511,7 +518,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const team = res.locals.team as Team;
       await bot.deleteTeam(team.id);
-      res.redirect(res.locals.canManageAllTeams ? '/administrator' : '/');
+      res.redirect(res.locals.canManageAllTeams ? '/administrator' : '/events');
     } catch (error) {
       next(error);
     }
@@ -521,7 +528,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     try {
       const user = req.session.discordUser!;
       await bot.leaveTeam(user.id);
-      res.redirect('/');
+      res.redirect('/events');
     } catch (error) {
       next(error);
     }
@@ -537,7 +544,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
-type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; currentTeam?: Team; active?: 'dashboard' | 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; currentTeam?: Team; active?: 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#020202"/>
@@ -664,7 +671,7 @@ function settingsPage(user: DiscordUser) {
       <p class="eyebrow">Account</p>
       <h2>${escapeHtml(displayUser(user))}</h2>
       <p><small>@${escapeHtml(user.username)} · Discord ID <code>${escapeHtml(user.id)}</code></small></p>
-      <p>Use this page to confirm which Discord account is connected to 7th Circle Team Hub.</p>
+      <p>Use this page to confirm which Discord account is connected to 7th Circle.</p>
       <p><a class="button danger" href="/logout">Log out</a></p>
     </div>
   </section>`;
@@ -794,7 +801,7 @@ function eventRegistrationCard(detail: EventRegistrationDetail, index: number, e
 }
 
 function eventManagementPage(events: Event[], counts: Record<string, number>) {
-  return `<p><a href="/">← Back to dashboard</a></p>
+  return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
       <h2>Create event</h2>
       ${eventForm('/event-management/events')}
@@ -960,7 +967,7 @@ function administratorPage(
   roles: Array<{ id: string; name: string; managed: boolean; position: number }>,
   adminRoleId?: string
 ) {
-  return `<p><a href="/">← Back to dashboard</a></p>
+  return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
       <h2>All teams</h2>
       ${
@@ -1009,7 +1016,7 @@ function developerPage(
   settings: { botStatus?: BotStatus; activityName?: string; activityType?: BotActivityType },
   logs: CapturedLog[]
 ) {
-  return `<p><a href="/">← Back to dashboard</a></p>
+  return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
       <h2>Bot performance</h2>
       <div class="stat-grid">
@@ -1129,16 +1136,16 @@ function formatBytes(bytes: number) {
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-function dashboardTeamSection(team: Team | undefined, userId: string) {
+function teamPageSection(team: Team | undefined, userId: string) {
   if (!team) {
-    return `<p>You are not currently in a team.</p><p><a class="button" href="/teams/new">Create a team</a></p>`;
+    return `<p>You are not currently in a team.</p><p><a class="button" href="/teams/new">Create Team</a></p>`;
   }
 
   if (team.ownerId === userId) {
     return `<h2>Your team</h2>
       <div class="card">
         <p><strong>${escapeHtml(team.name)}</strong> — role <code>${escapeHtml(team.roleId)}</code></p>
-        <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a></p>
+        <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage Team</a></p>
       </div>`;
   }
 
@@ -1154,7 +1161,7 @@ function dashboardTeamSection(team: Team | undefined, userId: string) {
 function teamForm() {
   return `<form method="post" action="/teams" onsubmit="const button = this.querySelector('button[type=submit]'); if (button) { button.disabled = true; button.textContent = 'Creating team…'; }">
     <label>Team name <input name="teamName" maxlength="80" required /></label>
-    ${invitePicker('Create team', 'You can invite server members now, or create the team first and invite members later from the manage team page.')}
+    ${invitePicker('Create Team', 'You can invite server members now, or create the team first and invite members later from the manage team page.')}
   </form>
   ${inviteSearchScript()}`;
 }
@@ -1266,7 +1273,7 @@ function manageTeamPage(
   invites: Array<TeamInvite & { displayName: string; username: string; avatarUrl: string }>,
   canManageAllTeams = false
 ) {
-  return `<p><a href="${canManageAllTeams ? '/administrator' : '/'}">← Back to ${canManageAllTeams ? 'administrator' : 'dashboard'}</a></p>
+  return `<p><a href="${canManageAllTeams ? '/administrator' : '/team'}">← Back to ${canManageAllTeams ? 'administrator' : 'team'}</a></p>
     <section class="card">
       <h2>Team name</h2>
       <p><small>Rename the Discord role and private team channels for this team.</small></p>
@@ -1396,7 +1403,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(title)} · 7th Circle Team Hub</title>
+  <title>${escapeHtml(title)} · 7th Circle</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <style>
     :root { color-scheme: dark; --bg: #0b0c0f; --panel: #17191f; --panel-strong: #20232b; --muted: #a8b0bd; --text: #f4f6fb; --line: #30343d; --red: #c90820; --red-strong: #ef233c; --red-soft: rgba(201, 8, 32, .16); --shadow: 0 24px 70px rgba(0, 0, 0, .45); }
@@ -1502,13 +1509,13 @@ function navigation(options: LayoutOptions) {
     : '<a class="button" href="/auth/discord">Log in</a>';
 
   return `<header class="topbar">
-    <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle Team Hub</span></a>
+    <a class="brand" href="${options.user ? '/events' : '/'}"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle</span></a>
     <div class="nav-shell">
       <div class="nav-groups">
         <nav class="nav-links" aria-label="Primary navigation">
-          <a href="/"${activeClass('dashboard')}>Dashboard</a>
           ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
-          ${options.user && !currentTeam ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
+          ${options.user && currentTeam ? `<a href="/team"${activeClass('teams')}>Team</a>` : ''}
+          ${options.user && !currentTeam ? `<a href="/teams/new"${activeClass('teams')}>Create Team</a>` : ''}
         </nav>
         ${(eventManagementLink || adminLink || developerLink) ? `<nav class="nav-links" aria-label="Administration navigation">${eventManagementLink}${adminLink}${developerLink}</nav>` : ''}
       </div>
