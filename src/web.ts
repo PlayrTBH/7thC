@@ -23,7 +23,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
 
   app.set('trust proxy', 1);
-  app.use(express.urlencoded({ extended: false }));
+  app.use(express.urlencoded({ extended: false, limit: '6mb' }));
   app.get('/favicon.svg', (_req, res) => {
     res.type('image/svg+xml').send(FAVICON_SVG);
   });
@@ -695,7 +695,7 @@ function settingsPage(user: DiscordUser) {
 }
 
 
-type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt'>;
+type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl'>;
 
 type EventRegistrationDetail = {
   registration: EventRegistration;
@@ -725,7 +725,7 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
   const registrationState = eventRegistrationState(event, registrationCount);
   const canRegister = currentTeam?.ownerId === currentUserId && registrationState === 'open';
   const canEditRegistration = currentTeam?.ownerId === currentUserId && isRegistered && isRegistrationWindowOpen(event);
-  return `<section class="card event-card">
+  return `<section class="card event-card${event.backgroundImageDataUrl ? ' event-card-with-photo' : ''}"${event.backgroundImageDataUrl ? ` style="--event-photo: url('${escapeCssUrl(event.backgroundImageDataUrl)}');"` : ''}>
     <div class="section-heading-row">
       <div>
         <p class="eyebrow">${eventStateLabel(state)}</p>
@@ -734,6 +734,7 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
       <span class="event-capacity">${registrationCount}/${event.teamLimit} teams</span>
     </div>
     <p>${escapeHtml(event.description)}</p>
+    <p class="timezone-note">adjusted for your timezone</p>
     <div class="event-meta-grid">
       ${eventMeta('Event starts', formatDateTime(event.startsAt))}
       ${eventMeta('Event ends', formatDateTime(event.endsAt))}
@@ -776,7 +777,7 @@ function eventRegistrationPage(
         ${eventMeta('Required main players', String(event.requiredMainPlayers))}
         ${eventMeta('Required substitutes', String(event.requiredSubstitutes))}
         ${eventMeta('Teams registered', `${registrationCount}/${event.teamLimit}`)}
-        ${eventMeta('Registration closes', formatShortDate(event.registrationClosesAt))}
+        ${eventMeta('Registration closes', formatDateTime(event.registrationClosesAt))}
       </div>
       <form method="post" action="/events/${encodeURIComponent(event.id)}/register" class="stacked-form">
         <fieldset>
@@ -816,7 +817,7 @@ function eventRegistrationCard(detail: EventRegistrationDetail, index: number, e
   return `<div class="admin-team-row">
     <div>
       <strong>${index}. ${escapeHtml(detail.team?.name ?? detail.registration.teamId)}</strong><br />
-      <small>Registered ${escapeHtml(formatDateTime(detail.registration.createdAt))}</small><br />
+      <small>Registered ${formatDateTime(detail.registration.createdAt)}</small><br />
       <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
       <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
     </div>
@@ -855,7 +856,7 @@ function managedEventRow(event: Event, registrationCount: number) {
   return `<div class="admin-team-row">
     <div>
       <strong>${escapeHtml(event.title)}</strong> <span class="pill">${eventStateLabel(eventState(event))}</span><br />
-      <small>${escapeHtml(formatDateTime(event.startsAt))} · ${registrationCount}/${event.teamLimit} teams · registration ${escapeHtml(eventRegistrationStateLabel(eventRegistrationState(event, registrationCount)))}</small>
+      <small>${formatDateTime(event.startsAt)} · ${registrationCount}/${event.teamLimit} teams · registration ${escapeHtml(eventRegistrationStateLabel(eventRegistrationState(event, registrationCount)))}</small>
     </div>
     <div class="admin-team-actions">
       <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">Teams</a>
@@ -878,8 +879,24 @@ function eventForm(action: string, event?: Event) {
       <label>Registration opens <input name="registrationOpensAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationOpensAt))}" /></label>
       <label>Registration closes <input name="registrationClosesAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
     </div>
+    ${eventPhotoField(event)}
     <button type="submit">${event ? 'Save event' : 'Create event'}</button>
   </form>`;
+}
+
+function eventPhotoField(event?: Event) {
+  const hasPhoto = Boolean(event?.backgroundImageDataUrl);
+  return `<div class="event-photo-field" data-event-photo-field>
+      <div>
+        <label>Event background photo
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-event-photo-input />
+        </label>
+        <small>Upload a PNG, JPEG, WebP, or GIF up to 2 MB. The photo appears behind the event card.</small>
+        <input type="hidden" name="backgroundImageDataUrl" value="${escapeHtml(event?.backgroundImageDataUrl ?? '')}" data-event-photo-data />
+      </div>
+      <div class="event-photo-preview${hasPhoto ? '' : ' is-empty'}" data-event-photo-preview${hasPhoto ? ` style="background-image: url('${escapeCssUrl(event!.backgroundImageDataUrl!)}');"` : ''}>${hasPhoto ? '' : 'No photo'}</div>
+      <button class="secondary" type="button" data-event-photo-clear${hasPhoto ? '' : ' disabled'}>Clear photo</button>
+    </div>`;
 }
 
 function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBotApi['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string, selectedIds: string[] = []) {
@@ -892,7 +909,7 @@ function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBotApi
 }
 
 function eventMeta(label: string, value: string) {
-  return `<div class="stat-card"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`;
+  return `<div class="stat-card"><small>${escapeHtml(label)}</small><strong>${value}</strong></div>`;
 }
 
 function parseEventForm(body: Request['body']): EventFormFields {
@@ -905,13 +922,24 @@ function parseEventForm(body: Request['body']): EventFormFields {
   const endsAt = parseDateTimeInput(body.endsAt, 'Event end date');
   const registrationOpensAt = parseDateTimeInput(body.registrationOpensAt, 'Registration open date');
   const registrationClosesAt = parseDateTimeInput(body.registrationClosesAt, 'Registration close date');
+  const backgroundImageDataUrl = parseEventPhotoDataUrl(body.backgroundImageDataUrl);
 
   if (!title) throw new Error('Event title is required.');
   if (!description) throw new Error('Event description is required.');
   if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) throw new Error('Event end date must be after the start date.');
   if (new Date(registrationClosesAt).getTime() <= new Date(registrationOpensAt).getTime()) throw new Error('Registration close date must be after the open date.');
 
-  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt };
+  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt, backgroundImageDataUrl };
+}
+
+function parseEventPhotoDataUrl(value: unknown) {
+  const dataUrl = String(value ?? '').trim();
+  if (!dataUrl) return undefined;
+  if (dataUrl.length > 2_800_000) throw new Error('Event background photo must be 2 MB or smaller.');
+  if (!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) {
+    throw new Error('Event background photo must be a PNG, JPEG, WebP, or GIF image.');
+  }
+  return dataUrl;
 }
 
 function parsePositiveInteger(value: unknown, label: string, minimum: number) {
@@ -969,8 +997,8 @@ function eventRegistrationStateLabel(state: ReturnType<typeof eventRegistrationS
 
 function eventRegistrationDateSummary(event: Event) {
   return Date.now() < new Date(event.registrationOpensAt).getTime()
-    ? `Registration opening ${formatShortDate(event.registrationOpensAt)}`
-    : `Registration closes on ${formatShortDate(event.registrationClosesAt)}`;
+    ? `Registration opening ${formatDateTime(event.registrationOpensAt)}`
+    : `Registration closes on ${formatDateTime(event.registrationClosesAt)}`;
 }
 
 function isRegistrationWindowOpen(event: Event) {
@@ -1115,7 +1143,7 @@ function statCard(label: string, value: string) {
 }
 
 function logRow(log: CapturedLog) {
-  return `<div class="log-row log-${log.level}"><span>${escapeHtml(formatDateTime(log.createdAt))}</span><span>${escapeHtml(log.level.toUpperCase())}</span><pre>${escapeHtml(log.message)}</pre></div>`;
+  return `<div class="log-row log-${log.level}"><span>${formatDateTime(log.createdAt)}</span><span>${escapeHtml(log.level.toUpperCase())}</span><pre>${escapeHtml(log.message)}</pre></div>`;
 }
 
 function botStatusOptions(selected: BotStatus) {
@@ -1246,7 +1274,7 @@ function teamRegisteredEvent(detail: TeamPageRegistrationDetail, members: TeamMe
   return `<div class="admin-team-row">
     <div>
       <strong>${escapeHtml(detail.event.title)}</strong> <span class="pill">${escapeHtml(eventStateLabel(eventState(detail.event)))}</span><br />
-      <small>${escapeHtml(formatDateTime(detail.event.startsAt))} – ${escapeHtml(formatDateTime(detail.event.endsAt))}</small><br />
+      <small>${formatDateTime(detail.event.startsAt)} – ${formatDateTime(detail.event.endsAt)}</small><br />
       <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
       <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
     </div>
@@ -1431,7 +1459,7 @@ function pendingInvite(invite: TeamInvite & { displayName: string; username: str
     ${invite.avatarUrl ? `<img src="${escapeHtml(invite.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
     <div class="member-info">
       <strong>${escapeHtml(invite.displayName)}</strong> <span class="pill">pending</span><br />
-      <small>@${escapeHtml(invite.username)} · invited ${escapeHtml(formatDateTime(invite.createdAt))}</small>
+      <small>@${escapeHtml(invite.username)} · invited ${formatDateTime(invite.createdAt)}</small>
     </div>
   </div>`;
 }
@@ -1482,14 +1510,14 @@ function parseTeamMemberRole(role: unknown): TeamMemberRole {
 
 function formatDateTime(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return `<time datetime="${escapeHtml(date.toISOString())}" data-local-date-time>${escapeHtml(date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }))}</time>`;
 }
 
 function formatShortDate(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: '2-digit' });
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return `<time datetime="${escapeHtml(date.toISOString())}" data-local-date>${escapeHtml(date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: '2-digit', timeZone: 'UTC' }))}</time>`;
 }
 
 function layout(title: string, body: string, options: LayoutOptions = {}) {
@@ -1544,10 +1572,16 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #3a1017; box-shadow: none; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
     .management-list, .event-list { display: grid; gap: .75rem; }
-    .event-card { border-color: rgba(239,35,60,.2); }
+    .event-card { position: relative; overflow: hidden; border-color: rgba(239,35,60,.2); }
+    .event-card > * { position: relative; z-index: 1; }
+    .event-card-with-photo::before { content: ""; position: absolute; inset: 0; z-index: 0; background-image: linear-gradient(90deg, rgba(23,25,31,.95), rgba(23,25,31,.78)), var(--event-photo); background-size: cover; background-position: center; filter: saturate(.9); }
+    .timezone-note { margin: .85rem 0 -.35rem; color: var(--muted); font-size: .82rem; font-weight: 800; }
     .event-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
     .event-capacity { border: 1px solid rgba(239,35,60,.32); border-radius: 999px; padding: .35rem .7rem; background: var(--red-soft); color: #ffd4d9; font-weight: 900; }
     .event-meta-grid, .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .75rem; margin: 1rem 0; }
+    .event-photo-field { display: grid; grid-template-columns: minmax(0, 1fr) 12rem auto; gap: .75rem; align-items: end; padding: .85rem; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; }
+    .event-photo-preview { min-height: 6.5rem; border: 1px solid rgba(255,255,255,.12); border-radius: .8rem; background-color: #0f1116; background-size: cover; background-position: center; display: grid; place-items: center; color: var(--muted); font-size: .82rem; font-weight: 800; }
+    .event-photo-preview.is-empty { border-style: dashed; }
     .stacked-form { display: grid; gap: 1rem; }
     .stacked-form label { display: grid; gap: .35rem; font-weight: 800; }
     .stacked-form input, .stacked-form select, .stacked-form textarea { margin-left: 0; width: 100%; }
@@ -1587,10 +1621,66 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .16rem .5rem; border-radius: 999px; background: var(--red-soft); color: #ffb3bc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
     small { color: var(--muted); } code { background: #0f1116; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .35rem; color: #ffd4d9; }
-    @media (max-width: 720px) { .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell, .nav-groups { align-items: stretch; flex-direction: column; justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 720px) { .event-photo-field { grid-template-columns: 1fr; align-items: stretch; } .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell, .nav-groups { align-items: stretch; flex-direction: column; justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
-<body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main></body>
+<body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main><script>
+  (() => {
+    const dateTimeFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    const dateFormatter = new Intl.DateTimeFormat(undefined, { month: '2-digit', day: '2-digit', year: '2-digit' });
+    document.querySelectorAll('[data-local-date-time]').forEach((element) => {
+      const value = element.getAttribute('datetime');
+      const date = value ? new Date(value) : undefined;
+      if (date && !Number.isNaN(date.getTime())) element.textContent = dateTimeFormatter.format(date);
+    });
+    document.querySelectorAll('[data-local-date]').forEach((element) => {
+      const value = element.getAttribute('datetime');
+      const date = value ? new Date(value) : undefined;
+      if (date && !Number.isNaN(date.getTime())) element.textContent = dateFormatter.format(date);
+    });
+
+    document.querySelectorAll('[data-event-photo-field]').forEach((field) => {
+      const input = field.querySelector('[data-event-photo-input]');
+      const hidden = field.querySelector('[data-event-photo-data]');
+      const preview = field.querySelector('[data-event-photo-preview]');
+      const clear = field.querySelector('[data-event-photo-clear]');
+      if (!(input instanceof HTMLInputElement) || !(hidden instanceof HTMLInputElement) || !(preview instanceof HTMLElement) || !(clear instanceof HTMLButtonElement)) return;
+
+      const renderPreview = (dataUrl) => {
+        hidden.value = dataUrl;
+        preview.style.backgroundImage = dataUrl ? "url('" + dataUrl + "')" : '';
+        preview.textContent = dataUrl ? '' : 'No photo';
+        preview.classList.toggle('is-empty', !dataUrl);
+        clear.disabled = !dataUrl;
+      };
+
+      input.addEventListener('change', () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
+          alert('Please choose a PNG, JPEG, WebP, or GIF image.');
+          input.value = '';
+          return;
+        }
+        if (file.size > 2 * 1024 * 1024) {
+          alert('Please choose an image that is 2 MB or smaller.');
+          input.value = '';
+          return;
+        }
+        const reader = new FileReader();
+        reader.addEventListener('load', () => {
+          if (typeof reader.result === 'string') renderPreview(reader.result);
+        });
+        reader.readAsDataURL(file);
+      });
+
+      clear.addEventListener('click', () => {
+        input.value = '';
+        renderPreview('');
+      });
+    });
+  })();
+</script></body>
 </html>`;
 }
 
@@ -1632,6 +1722,10 @@ function displayUser(user: DiscordUser) {
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]!);
+}
+
+function escapeCssUrl(value: string) {
+  return value.replace(/[\\'"()\n\r\f]/g, (character) => `\\${character}`);
 }
 
 function escapeJsString(value: string) {
