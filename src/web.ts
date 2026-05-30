@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import session from 'express-session';
@@ -16,6 +17,7 @@ declare module 'express-session' {
 }
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
 export function createWebApp(bot: TeamBot, store: JsonStore) {
   const app = express();
@@ -41,6 +43,15 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       }
     })
   );
+
+  app.use(async (req, _res, next) => {
+    try {
+      const currentTeam = req.session.discordUser ? await store.getTeamForUser(req.session.discordUser.id) : undefined;
+      requestLayoutContext.run({ currentTeam }, () => next());
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.get('/', async (req, res, next) => {
     try {
@@ -348,7 +359,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
         bot.getAdministratorAccess(user.id)
       ]);
       if (currentTeam) {
-        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }));
+        res.status(400).send(layout('Already in a team', `<p>You are already in <strong>${escapeHtml(currentTeam.name)}</strong>. Leave or delete your current team before creating another one.</p><p><a class="button" href="/">Back to dashboard</a></p>`, { user, isAdmin: administratorAccess.isAdmin, currentTeam, active: 'teams' }));
         return;
       }
 
@@ -372,7 +383,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           `<p><strong>${escapeHtml(team.name)}</strong> was created with a role, private category, text channel, and voice channel.</p>
            <p>${teamCreatedInviteMessage(invites.length)}</p>
            <p><a class="button" href="/teams/${encodeURIComponent(team.id)}">Manage team</a> <a class="button secondary" href="/">Back to dashboard</a></p>`,
-          { user, isAdmin: administratorAccess.isAdmin, active: 'teams' }
+          { user, isAdmin: administratorAccess.isAdmin, currentTeam: team, active: 'teams' }
         )
       );
     } catch (error) {
@@ -482,7 +493,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
-type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; active?: 'dashboard' | 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; currentTeam?: Team; active?: 'dashboard' | 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#020202"/>
@@ -1400,6 +1411,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
 }
 
 function navigation(options: LayoutOptions) {
+  const currentTeam = options.currentTeam ?? requestLayoutContext.getStore()?.currentTeam;
   const activeClass = (key: LayoutOptions['active']) => options.active === key ? ' class="active"' : '';
   const eventManagementLink = options.user && options.isAdmin ? `<a href="/event-management"${activeClass('event-management')}>Event management</a>` : '';
   const adminLink = options.user && options.isAdmin ? `<a href="/administrator"${activeClass('administrator')}>Administrator</a>` : '';
@@ -1415,7 +1427,7 @@ function navigation(options: LayoutOptions) {
         <nav class="nav-links" aria-label="Primary navigation">
           <a href="/"${activeClass('dashboard')}>Dashboard</a>
           ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
-          ${options.user ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
+          ${options.user && !currentTeam ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
         </nav>
         ${(eventManagementLink || adminLink || developerLink) ? `<nav class="nav-links" aria-label="Administration navigation">${eventManagementLink}${adminLink}${developerLink}</nav>` : ''}
       </div>
