@@ -49,6 +49,7 @@ export type Event = {
   endsAt: string;
   registrationOpensAt: string;
   registrationClosesAt: string;
+  backgroundImageDataUrl?: string;
   createdAt: string;
   updatedAt: string;
   createdBy: string;
