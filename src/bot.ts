@@ -46,10 +46,16 @@ export class TeamBot {
         if (action === 'accept') {
           await this.acceptInvite(inviteId, interaction.user.id);
           await interaction.reply({ content: 'Invite accepted. Your team roles have been added.', ephemeral: true });
+          await interaction.message.delete().catch((deleteError) => {
+            console.warn(`Unable to delete accepted invite DM ${inviteId}:`, deleteError);
+          });
         }
         if (action === 'decline') {
           await this.declineInvite(inviteId, interaction.user.id);
           await interaction.reply({ content: 'Invite declined.', ephemeral: true });
+          await interaction.message.delete().catch((deleteError) => {
+            console.warn(`Unable to delete declined invite DM ${inviteId}:`, deleteError);
+          });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unable to process this invite.';
