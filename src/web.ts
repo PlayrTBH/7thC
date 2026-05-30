@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import session from 'express-session';
-import { config, discordRedirectUri } from './config.js';
+import { config, DEVELOPER_DISCORD_USER_ID, discordRedirectUri } from './config.js';
 import type { TeamBot } from './bot.js';
 import type { JsonStore } from './store.js';
-import type { DiscordUser, Team, TeamInvite, TeamMemberRole } from './types.js';
+import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
+import type { BotActivityType, BotStatus, DiscordUser, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -51,6 +52,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           'Dashboard',
           `<p class="page-intro">Logged in as <strong>${escapeHtml(displayUser(user))}</strong>.</p>
            ${administratorAccess.isAdmin ? '<p><a class="button secondary" href="/administrator">Administrator page</a></p>' : ''}
+           ${isDeveloperUser(user) ? '<p><a class="button secondary" href="/developer">Developer panel</a></p>' : ''}
            ${dashboardTeamSection(currentTeam, user.id)}`,
           { user, isAdmin: administratorAccess.isAdmin, active: 'dashboard' }
         )
@@ -141,6 +143,43 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
     } catch (error) {
       next(error);
     }
+  });
+
+  app.get('/developer', requireAuth, requireDeveloper, async (req, res, next) => {
+    try {
+      const [stats, teams, settings] = await Promise.all([bot.getDeveloperStats(), store.getTeams(), store.getDeveloperSettings()]);
+      const logs = getRecentLogs(250);
+      res.send(layout('Developer panel', developerPage(stats, teams.length, settings, logs), { user: req.session.discordUser, isDeveloper: true, active: 'developer' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/developer/restart', requireAuth, requireDeveloper, async (_req, res, next) => {
+    try {
+      await bot.restart();
+      res.redirect('/developer');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/developer/config', requireAuth, requireDeveloper, async (req, res, next) => {
+    try {
+      const botStatus = parseBotStatus(req.body.botStatus);
+      const activityType = parseActivityType(req.body.activityType);
+      const activityName = String(req.body.activityName ?? '').trim().slice(0, 128) || undefined;
+      await bot.updateDeveloperSettings({ botStatus, activityType, activityName });
+      res.redirect('/developer');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/developer/logs/clear', requireAuth, requireDeveloper, (req, res) => {
+    console.warn(`Developer ${req.session.discordUser!.id} cleared the in-memory web log buffer.`);
+    clearLogs();
+    res.redirect('/developer#logs');
   });
 
   app.get('/members/search', requireAuth, async (req, res, next) => {
@@ -296,7 +335,7 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
-type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; active?: 'dashboard' | 'teams' | 'administrator' | 'settings' };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; active?: 'dashboard' | 'teams' | 'administrator' | 'settings' | 'developer' };
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#020202"/>
@@ -377,6 +416,18 @@ function requireGuildOwner(bot: TeamBot) {
       next(error);
     }
   };
+}
+
+function requireDeveloper(req: Request, res: Response, next: NextFunction) {
+  if (!req.session.discordUser || !isDeveloperUser(req.session.discordUser)) {
+    res.status(403).send(layout('Not allowed', '<p>Only the configured developer Discord account can access this panel.</p><p><a href="/">Back home</a></p>', { user: req.session.discordUser }));
+    return;
+  }
+  next();
+}
+
+function isDeveloperUser(user?: DiscordUser) {
+  return user?.id === DEVELOPER_DISCORD_USER_ID;
 }
 
 function requireTeamManager(bot: TeamBot, store: JsonStore) {
@@ -463,6 +514,132 @@ function administratorSettingsForm(roles: Array<{ id: string; name: string; mana
       <button type="submit">Save settings</button>
     </form>
   </section>`;
+}
+
+function developerPage(
+  stats: Awaited<ReturnType<TeamBot['getDeveloperStats']>>,
+  teamCount: number,
+  settings: { botStatus?: BotStatus; activityName?: string; activityType?: BotActivityType },
+  logs: CapturedLog[]
+) {
+  return `<p><a href="/">← Back to dashboard</a></p>
+    <section class="card">
+      <h2>Bot performance</h2>
+      <div class="stat-grid">
+        ${statCard('Bot uptime', formatDuration(stats.bot.uptimeMs))}
+        ${statCard('Process uptime', formatDuration(stats.process.uptimeMs))}
+        ${statCard('Gateway latency', `${stats.bot.websocketPingMs} ms`)}
+        ${statCard('Memory RSS', formatBytes(stats.process.memoryRssBytes))}
+        ${statCard('Heap used', formatBytes(stats.process.memoryHeapUsedBytes))}
+        ${statCard('Node.js', stats.process.nodeVersion)}
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Discord servers and cache</h2>
+      <div class="stat-grid">
+        ${statCard('Configured server', stats.guild.name)}
+        ${statCard('Server members', String(stats.guild.memberCount))}
+        ${statCard('Channels', String(stats.guild.channelCount))}
+        ${statCard('Roles', String(stats.guild.roleCount))}
+        ${statCard('Managed teams', String(teamCount))}
+        ${statCard('Cached guilds', String(stats.cache.guilds))}
+        ${statCard('Cached users', String(stats.cache.users))}
+        ${statCard('Cached channels', String(stats.cache.channels))}
+      </div>
+      <p><small>Server ID <code>${escapeHtml(stats.guild.id)}</code> · Owner ID <code>${escapeHtml(stats.guild.ownerId)}</code> · Bot <code>${escapeHtml(stats.bot.tag)}</code> (<code>${escapeHtml(stats.bot.id)}</code>)</small></p>
+    </section>
+
+    <section class="card danger-zone">
+      <h2>Restart bot connection</h2>
+      <p>Reconnects the Discord client and reapplies team role placement and developer presence settings. The website process stays online.</p>
+      <form method="post" action="/developer/restart" onsubmit="return confirm('Restart the Discord bot connection now?');">
+        <button class="danger" type="submit">Restart bot</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Bot configuration</h2>
+      <p><small>Runtime presence settings are stored in the JSON data file and reapplied whenever the bot starts.</small></p>
+      <form method="post" action="/developer/config" class="inline-form">
+        <label>Status
+          <select name="botStatus">
+            ${botStatusOptions(settings.botStatus ?? 'online')}
+          </select>
+        </label>
+        <label>Activity type
+          <select name="activityType">
+            ${activityTypeOptions(settings.activityType ?? 'Playing')}
+          </select>
+        </label>
+        <label>Activity <input name="activityName" maxlength="128" value="${escapeHtml(settings.activityName ?? '')}" placeholder="Managing teams" /></label>
+        <button type="submit">Save configuration</button>
+      </form>
+      <p><small>Environment-backed values are read-only here: public URL <code>${escapeHtml(config.PUBLIC_URL)}</code>, host <code>${escapeHtml(config.HOST)}</code>, port <code>${config.PORT}</code>, data file <code>${escapeHtml(config.DATA_FILE)}</code>.</small></p>
+    </section>
+
+    <section class="card" id="logs">
+      <div class="section-heading-row">
+        <div>
+          <h2>Web logs</h2>
+          <p><small>Recent in-memory console output from this Node.js process. Restarting the process clears this buffer.</small></p>
+        </div>
+        <form method="post" action="/developer/logs/clear" onsubmit="return confirm('Clear the in-memory log buffer?');">
+          <button class="secondary" type="submit">Clear logs</button>
+        </form>
+      </div>
+      <div class="log-viewer">${logs.length ? logs.map(logRow).join('') : '<p>No logs captured yet.</p>'}</div>
+    </section>`;
+}
+
+function statCard(label: string, value: string) {
+  return `<div class="stat-card"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function logRow(log: CapturedLog) {
+  return `<div class="log-row log-${log.level}"><span>${escapeHtml(formatDateTime(log.createdAt))}</span><span>${escapeHtml(log.level.toUpperCase())}</span><pre>${escapeHtml(log.message)}</pre></div>`;
+}
+
+function botStatusOptions(selected: BotStatus) {
+  return (['online', 'idle', 'dnd', 'invisible'] as BotStatus[])
+    .map((status) => `<option value="${status}"${status === selected ? ' selected' : ''}>${status}</option>`)
+    .join('');
+}
+
+function activityTypeOptions(selected: BotActivityType) {
+  return (['Playing', 'Watching', 'Listening', 'Competing'] as BotActivityType[])
+    .map((type) => `<option value="${type}"${type === selected ? ' selected' : ''}>${type}</option>`)
+    .join('');
+}
+
+function parseBotStatus(status: unknown): BotStatus {
+  if (status === 'online' || status === 'idle' || status === 'dnd' || status === 'invisible') return status;
+  throw new Error('Invalid bot status.');
+}
+
+function parseActivityType(activityType: unknown): BotActivityType {
+  if (activityType === 'Playing' || activityType === 'Watching' || activityType === 'Listening' || activityType === 'Competing') return activityType;
+  throw new Error('Invalid activity type.');
+}
+
+function formatDuration(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [days ? `${days}d` : '', hours ? `${hours}h` : '', minutes ? `${minutes}m` : '', `${seconds}s`].filter(Boolean).join(' ');
+}
+
+function formatBytes(bytes: number) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 function dashboardTeamSection(team: Team | undefined, userId: string) {
@@ -769,6 +946,17 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .selected-member button { border-radius: 999px; padding: .1rem .45rem; background: #3a1017; box-shadow: none; }
     .managed-member { flex-wrap: wrap; justify-content: space-between; }
     .management-list { display: grid; gap: .75rem; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
+    .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
+    .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
+    .section-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+    .log-viewer { display: grid; gap: .5rem; max-height: 38rem; overflow: auto; border: 1px solid var(--line); border-radius: 1rem; padding: .75rem; background: #0f1116; }
+    .log-row { display: grid; grid-template-columns: 12rem 4.5rem minmax(0, 1fr); gap: .75rem; align-items: start; border-bottom: 1px solid rgba(255,255,255,.06); padding-bottom: .5rem; }
+    .log-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .log-row span { color: var(--muted); font-size: .78rem; font-weight: 800; }
+    .log-row pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .log-error span:nth-child(2) { color: #ff8f9a; }
+    .log-warn span:nth-child(2) { color: #ffd166; }
     .admin-team-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; flex-wrap: wrap; }
     .admin-team-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
     .member-info { flex: 1 1 12rem; }
@@ -778,7 +966,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .pill, .role-label { display: inline-block; margin-left: .35rem; padding: .16rem .5rem; border-radius: 999px; background: var(--red-soft); color: #ffb3bc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
     small { color: var(--muted); } code { background: #0f1116; border: 1px solid var(--line); border-radius: .35rem; padding: .15rem .35rem; color: #ffd4d9; }
-    @media (max-width: 720px) { .topbar { align-items: stretch; flex-direction: column; } .nav-shell { justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 720px) { .log-row { grid-template-columns: 1fr; } .topbar { align-items: stretch; flex-direction: column; } .nav-shell { justify-content: space-between; } .nav-links { overflow-x: auto; border-radius: .9rem; } .account-link span { display: none; } main { padding-top: 2rem; } .profile-card { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>${nav}<main><header class="page-header"><h1>${escapeHtml(title)}</h1></header>${body}</main></body>
@@ -788,6 +976,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
 function navigation(options: LayoutOptions) {
   const activeClass = (key: LayoutOptions['active']) => options.active === key ? ' class="active"' : '';
   const adminLink = options.user && options.isAdmin ? `<a href="/administrator"${activeClass('administrator')}>Administrator</a>` : '';
+  const developerLink = options.user && (options.isDeveloper || isDeveloperUser(options.user)) ? `<a href="/developer"${activeClass('developer')}>Developer</a>` : '';
   const userControls = options.user
     ? `<a class="account-link${options.active === 'settings' ? ' active' : ''}" href="/settings" title="Open account settings"><img src="${escapeHtml(discordAvatarUrl(options.user))}" alt="" /><span>${escapeHtml(displayUser(options.user))}</span></a>`
     : '<a class="button" href="/auth/discord">Log in</a>';
@@ -799,6 +988,7 @@ function navigation(options: LayoutOptions) {
         <a href="/"${activeClass('dashboard')}>Dashboard</a>
         ${options.user ? `<a href="/teams/new"${activeClass('teams')}>Create team</a>` : ''}
         ${adminLink}
+        ${developerLink}
       </nav>
       ${userControls}
     </div>

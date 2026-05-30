@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 
 const initialStore: StoreShape = {
   teams: [],
@@ -42,6 +42,24 @@ export class JsonStore {
   async updateAdministratorSettings(settings: AdministratorSettings) {
     await this.update((data) => {
       data.settings = { ...data.settings, ...settings };
+      return data;
+    });
+  }
+
+  async getDeveloperSettings() {
+    const data = await this.read();
+    return data.settings.developer ?? {};
+  }
+
+  async updateDeveloperSettings(settings: DeveloperSettings) {
+    await this.update((data) => {
+      data.settings = {
+        ...data.settings,
+        developer: {
+          ...data.settings.developer,
+          ...settings
+        }
+      };
       return data;
     });
   }

@@ -38,8 +38,18 @@ export type TeamInvite = {
   respondedAt?: string;
 };
 
+export type BotActivityType = 'Playing' | 'Watching' | 'Listening' | 'Competing';
+export type BotStatus = 'online' | 'idle' | 'dnd' | 'invisible';
+
+export type DeveloperSettings = {
+  botStatus?: BotStatus;
+  activityName?: string;
+  activityType?: BotActivityType;
+};
+
 export type AdministratorSettings = {
   adminRoleId?: string;
+  developer?: DeveloperSettings;
 };
 
 export type StoreShape = {

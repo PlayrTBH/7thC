@@ -12,14 +12,23 @@ import {
   type ColorResolvable,
   type Guild,
   type Role,
-  type GuildMember
+  type GuildMember,
+  ActivityType,
+  type PresenceStatusData
 } from 'discord.js';
 import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
+
+const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
+  Playing: ActivityType.Playing,
+  Watching: ActivityType.Watching,
+  Listening: ActivityType.Listening,
+  Competing: ActivityType.Competing
+};
 
 const organizationalRoleConfig: Record<TeamMemberRole, { name: string; color: ColorResolvable }> = {
   sub: { name: 'Team Sub', color: organizationRoleColor },
@@ -35,6 +44,7 @@ export class TeamBot {
   });
 
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
+  private restartOperation?: Promise<void>;
 
   constructor(private readonly store: JsonStore) {
     this.client.on(Events.InteractionCreate, async (interaction) => {
@@ -74,6 +84,7 @@ export class TeamBot {
       this.client.once(Events.ClientReady, () => resolve());
     });
     await this.ensureTeamRolesDisplayed();
+    await this.applyDeveloperSettings(await this.store.getDeveloperSettings());
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
   }
 
@@ -105,6 +116,77 @@ export class TeamBot {
       .filter((role) => role.id !== guild.roles.everyone.id)
       .map((role) => ({ id: role.id, name: role.name, managed: role.managed, position: role.position }))
       .sort((a, b) => b.position - a.position || a.name.localeCompare(b.name));
+  }
+
+  async getDeveloperStats() {
+    const guild = await this.getGuild();
+    const [roles, channels] = await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
+    const memory = process.memoryUsage();
+
+    return {
+      bot: {
+        tag: this.client.user?.tag ?? 'Unknown',
+        id: this.client.user?.id ?? 'Unknown',
+        ready: this.client.isReady(),
+        uptimeMs: this.client.uptime ?? 0,
+        websocketPingMs: this.client.ws.ping,
+        status: this.client.user?.presence.status ?? 'unknown'
+      },
+      process: {
+        uptimeMs: Math.round(process.uptime() * 1000),
+        memoryRssBytes: memory.rss,
+        memoryHeapUsedBytes: memory.heapUsed,
+        nodeVersion: process.version
+      },
+      guild: {
+        id: guild.id,
+        name: guild.name,
+        ownerId: guild.ownerId,
+        memberCount: guild.memberCount,
+        roleCount: roles.size,
+        channelCount: channels.size
+      },
+      cache: {
+        guilds: this.client.guilds.cache.size,
+        users: this.client.users.cache.size,
+        channels: this.client.channels.cache.size
+      }
+    };
+  }
+
+  async updateDeveloperSettings(settings: DeveloperSettings) {
+    await this.store.updateDeveloperSettings(settings);
+    await this.applyDeveloperSettings(settings);
+  }
+
+  async restart() {
+    if (!this.restartOperation) {
+      this.restartOperation = (async () => {
+        console.warn('Developer requested Discord bot restart.');
+        this.client.destroy();
+        await this.start();
+      })().finally(() => {
+        this.restartOperation = undefined;
+      });
+    }
+
+    return this.restartOperation;
+  }
+
+  async applyDeveloperSettings(settings: DeveloperSettings) {
+    if (!this.client.user) return;
+    const activityName = settings.activityName?.trim();
+    this.client.user.setPresence({
+      status: (settings.botStatus ?? 'online') as PresenceStatusData,
+      activities: activityName
+        ? [
+            {
+              name: activityName.slice(0, 128),
+              type: activityTypeMap[settings.activityType ?? 'Playing']
+            }
+          ]
+        : []
+    });
   }
 
   async ensureTeamRolesDisplayed() {
