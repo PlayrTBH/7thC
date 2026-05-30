@@ -111,6 +111,8 @@ PORT=3000
 SESSION_SECRET=replace_with_a_long_random_secret
 DATA_FILE=./data/store.json
 SESSION_FILE=./data/sessions.json
+# Optional: number of website worker processes; defaults to CPU cores minus one
+WEB_CONCURRENCY=2
 ```
 
 Generate a session secret with:
@@ -124,7 +126,7 @@ openssl rand -hex 32
 
 Discord user ID `743956656429203535` has access to a dedicated **Developer** link after logging in. The panel includes:
 
-- bot and process uptime, Discord gateway latency, memory usage, Node.js version, and cache counts;
+- bot and primary-process uptime, Discord gateway latency, memory usage, Node.js version, and cache counts;
 - configured server details including member, channel, and role counts;
 - a restart action that reconnects the Discord bot client without stopping the website process;
 - runtime bot presence configuration for status and activity text/type;
@@ -162,7 +164,7 @@ Open <http://localhost:3000>, log in with Discord, create a team, and optionally
 docker compose up -d --build
 ```
 
-The compose file reads `.env`, exposes port 3000, and persists the JSON store in `./data`.
+The compose file reads `.env`, exposes port 3000, and persists the JSON store in `./data`. By default, the app starts one primary Discord bot process and multiple website worker processes (CPU cores minus one); set `WEB_CONCURRENCY` in `.env` to pin the number of web workers for smaller VMs.
 
 
 
@@ -242,7 +244,7 @@ If the VM cannot reach `http://192.168.1.117:3000` or your Cloudflare Tunnel doe
 
 - Put the app behind HTTPS and set `PUBLIC_URL` to the public HTTPS URL.
 - Use a process manager such as systemd, Docker, or PM2 to keep `npm start` running.
-- The default persistence layer is a JSON file at `DATA_FILE`; back it up if you rely on invite history.
+- The default persistence layer is a JSON file at `DATA_FILE`; back it up if you rely on invite history. File locks are used so multiple website workers and the Discord bot process can safely share this JSON file.
 - Web login sessions are stored in `SESSION_FILE` (defaulting to `sessions.json` next to `DATA_FILE`)
   with a 7-day cookie lifetime, avoiding Express' in-memory production session store.
 - Discord users can block DMs from server members. Those invites are marked `failed_dm` in the JSON store and will need manual follow-up.

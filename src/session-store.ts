@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import session from 'express-session';
+import { withFileLock } from './file-lock.js';
 
 type SessionRecord = {
   session: session.SessionData;
@@ -17,14 +18,16 @@ export class JsonSessionStore extends session.Store {
   }
 
   get(sid: string, callback: (err: unknown, session?: session.SessionData | null) => void) {
-    this.enqueue(async () => {
-      const data = await this.read();
-      const { pruned, removed } = pruneExpiredSessions(data);
-      if (removed > 0) await this.write(pruned);
+    this.enqueue(() =>
+      withFileLock(this.filePath, async () => {
+        const data = await this.read();
+        const { pruned, removed } = pruneExpiredSessions(data);
+        if (removed > 0) await this.write(pruned);
 
-      const record = pruned[sid];
-      return record?.session ?? null;
-    })
+        const record = pruned[sid];
+        return record?.session ?? null;
+      })
+    )
       .then((storedSession) => callback(null, storedSession))
       .catch((error: unknown) => callback(error));
   }
@@ -83,17 +86,19 @@ export class JsonSessionStore extends session.Store {
 
   private async write(data: SessionFile) {
     await mkdir(dirname(this.filePath), { recursive: true });
-    const tempPath = `${this.filePath}.${process.pid}.tmp`;
+    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
     await rename(tempPath, this.filePath);
   }
 
   private async update(mutator: (data: SessionFile) => SessionFile) {
-    await this.enqueue(async () => {
-      const data = await this.read();
-      const { pruned } = pruneExpiredSessions(data);
-      await this.write(mutator(pruned));
-    });
+    await this.enqueue(() =>
+      withFileLock(this.filePath, async () => {
+        const data = await this.read();
+        const { pruned } = pruneExpiredSessions(data);
+        await this.write(mutator(pruned));
+      })
+    );
   }
 
   private async enqueue<T>(operation: () => Promise<T>) {

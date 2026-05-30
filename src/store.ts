@@ -1,6 +1,7 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
   teams: [],
@@ -18,12 +19,14 @@ export class JsonStore {
 
   async init() {
     await mkdir(dirname(this.filePath), { recursive: true });
-    try {
-      const data = await this.read();
-      await this.write(data);
-    } catch {
-      await this.write(initialStore);
-    }
+    await withFileLock(this.filePath, async () => {
+      try {
+        const data = await this.readUnlocked();
+        await this.writeUnlocked(data);
+      } catch {
+        await this.writeUnlocked(initialStore);
+      }
+    });
   }
 
   async getTeamsByOwner(ownerId: string) {
@@ -329,19 +332,28 @@ export class JsonStore {
   }
 
   private async read(): Promise<StoreShape> {
+    return withFileLock(this.filePath, () => this.readUnlocked());
+  }
+
+  private async readUnlocked(): Promise<StoreShape> {
     const raw = await readFile(this.filePath, 'utf8');
     return normalizeStore(JSON.parse(raw) as Partial<StoreShape>);
   }
 
-  private async write(data: StoreShape) {
-    await writeFile(this.filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  private async writeUnlocked(data: StoreShape) {
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    await rename(tempPath, this.filePath);
   }
 
   private async update(mutator: (data: StoreShape) => StoreShape) {
-    const next = this.queue.then(async () => {
-      const current = await this.read();
-      await this.write(mutator(current));
-    });
+    const next = this.queue.then(async () =>
+      withFileLock(this.filePath, async () => {
+        const current = await this.readUnlocked();
+        await this.writeUnlocked(mutator(current));
+      })
+    );
     this.queue = next.catch(() => undefined);
     await next;
   }
