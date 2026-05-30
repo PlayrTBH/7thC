@@ -338,9 +338,15 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/developer', requireAuth, requireDeveloper, async (req, res, next) => {
     try {
-      const [stats, teams, settings] = await Promise.all([bot.getDeveloperStats(), store.getTeams(), store.getDeveloperSettings()]);
+      const user = req.session.discordUser!;
+      const [stats, teams, settings, administratorAccess] = await Promise.all([
+        bot.getDeveloperStats(),
+        store.getTeams(),
+        store.getDeveloperSettings(),
+        bot.getAdministratorAccess(user.id)
+      ]);
       const logs = getRecentLogs(250);
-      res.send(layout('Developer panel', developerPage(stats, teams.length, settings, logs), { user: req.session.discordUser, isDeveloper: true, active: 'developer' }));
+      res.send(layout('Developer panel', developerPage(stats, teams.length, settings, logs), { user, isAdmin: administratorAccess.isAdmin, isDeveloper: true, active: 'developer' }));
     } catch (error) {
       next(error);
     }
