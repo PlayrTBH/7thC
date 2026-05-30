@@ -97,6 +97,34 @@ export class JsonStore {
     });
   }
 
+  async updateEventRegistration(eventId: string, teamId: string, updates: Pick<EventRegistration, 'captainId' | 'mainPlayerIds' | 'substitutePlayerIds'>) {
+    await this.update((data) => {
+      const registration = data.eventRegistrations.find((item) => item.eventId === eventId && item.teamId === teamId);
+      if (!registration) throw new Error('Registration not found.');
+      Object.assign(registration, updates, { updatedAt: new Date().toISOString() });
+      return data;
+    });
+  }
+
+  async removeEventRegistration(eventId: string, teamId: string) {
+    await this.update((data) => {
+      const before = data.eventRegistrations.length;
+      data.eventRegistrations = data.eventRegistrations.filter((registration) => !(registration.eventId === eventId && registration.teamId === teamId));
+      if (data.eventRegistrations.length === before) throw new Error('Registration not found.');
+      return data;
+    });
+  }
+
+  async removeEvent(eventId: string) {
+    await this.update((data) => {
+      const before = data.events.length;
+      data.events = data.events.filter((event) => event.id !== eventId);
+      if (data.events.length === before) throw new Error('Event not found.');
+      data.eventRegistrations = data.eventRegistrations.filter((registration) => registration.eventId !== eventId);
+      return data;
+    });
+  }
+
   async getAdministratorSettings() {
     const data = await this.read();
     return data.settings;

@@ -138,7 +138,12 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
         store.getTeamForUser(user.id),
         bot.getAdministratorAccess(user.id)
       ]);
-      res.send(layout('Events', eventsPage(events, counts, currentTeam, user.id), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+      const userRegisteredEventIds = new Set(
+        currentTeam
+          ? (await Promise.all(events.map((event) => store.getEventRegistration(event.id, currentTeam.id)))).filter(Boolean).map((registration) => registration!.eventId)
+          : []
+      );
+      res.send(layout('Events', eventsPage(events, counts, currentTeam, user.id, userRegisteredEventIds), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
     } catch (error) {
       next(error);
     }
@@ -182,21 +187,40 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       const members = await store.getTeamMembers(team.id);
       const mainPlayerIds = selectedMemberIds(req.body.mainPlayerIds);
       const substitutePlayerIds = selectedMemberIds(req.body.substitutePlayerIds);
+      const existingRegistration = await store.getEventRegistration(event.id, team.id);
       const registrationCount = (await store.getEventRegistrations(event.id)).length;
-      validateEventRegistration(event, members, mainPlayerIds, substitutePlayerIds, registrationCount);
+      validateEventRegistration(event, members, mainPlayerIds, substitutePlayerIds, registrationCount, Boolean(existingRegistration));
 
       const now = new Date().toISOString();
-      await store.addEventRegistration({
-        id: crypto.randomUUID(),
-        eventId: event.id,
-        teamId: team.id,
-        captainId: user.id,
-        mainPlayerIds,
-        substitutePlayerIds,
-        createdAt: now,
-        updatedAt: now
-      });
+      if (existingRegistration) {
+        await store.updateEventRegistration(event.id, team.id, { captainId: user.id, mainPlayerIds, substitutePlayerIds });
+      } else {
+        await store.addEventRegistration({
+          id: crypto.randomUUID(),
+          eventId: event.id,
+          teamId: team.id,
+          captainId: user.id,
+          mainPlayerIds,
+          substitutePlayerIds,
+          createdAt: now,
+          updatedAt: now
+        });
+      }
       res.redirect(`/events/${encodeURIComponent(event.id)}/registrations`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/events/:eventId/register/delete', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [event, team] = await Promise.all([store.getEvent(req.params.eventId), store.getTeamForUser(user.id)]);
+      if (!event) throw new Error('Event not found.');
+      if (!team || team.ownerId !== user.id) throw new Error('Only a team captain can remove a team registration.');
+      if (!isRegistrationWindowOpen(event)) throw new Error('Registration changes are closed for this event.');
+      await store.removeEventRegistration(event.id, team.id);
+      res.redirect('/events');
     } catch (error) {
       next(error);
     }
@@ -218,7 +242,18 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
           members: await bot.getTeamMemberDetails(registration.teamId)
         }))
       );
-      res.send(layout(`${event.title} registrations`, eventRegistrationsPage(event, details), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+      res.send(layout(`${event.title} registrations`, eventRegistrationsPage(event, details, administratorAccess.isAdmin), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/events/:eventId/registrations/:teamId/delete', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const event = await store.getEvent(req.params.eventId);
+      if (!event) throw new Error('Event not found.');
+      await store.removeEventRegistration(event.id, req.params.teamId);
+      res.redirect(`/events/${encodeURIComponent(event.id)}/registrations`);
     } catch (error) {
       next(error);
     }
@@ -264,6 +299,15 @@ export function createWebApp(bot: TeamBot, store: JsonStore) {
       if (!existing) throw new Error('Event not found.');
       const parsed = parseEventForm(req.body);
       await store.updateEvent(existing.id, parsed);
+      res.redirect('/event-management');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/event-management/events/:eventId/delete', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await store.removeEvent(req.params.eventId);
       res.redirect('/event-management');
     } catch (error) {
       next(error);
@@ -635,20 +679,21 @@ type EventRegistrationDetail = {
   members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>;
 };
 
-function eventsPage(events: Event[], counts: Record<string, number>, currentTeam: Team | undefined, currentUserId: string) {
+function eventsPage(events: Event[], counts: Record<string, number>, currentTeam: Team | undefined, currentUserId: string, userRegisteredEventIds: Set<string>) {
   const visibleEvents = events.filter((event) => eventState(event) !== 'ended');
   return `<p class="page-intro">Upcoming and live events are listed in chronological order. Team captains can register once their roster meets the event requirements.</p>
     ${
       visibleEvents.length
-        ? `<div class="event-list">${visibleEvents.map((event) => eventCard(event, counts[event.id] ?? 0, currentTeam, currentUserId)).join('')}</div>`
+        ? `<div class="event-list">${visibleEvents.map((event) => eventCard(event, counts[event.id] ?? 0, currentTeam, currentUserId, userRegisteredEventIds.has(event.id))).join('')}</div>`
         : '<section class="card"><h2>No upcoming or live events</h2><p>Check back after administrators create the next event.</p></section>'
     }`;
 }
 
-function eventCard(event: Event, registrationCount: number, currentTeam: Team | undefined, currentUserId: string) {
+function eventCard(event: Event, registrationCount: number, currentTeam: Team | undefined, currentUserId: string, isRegistered: boolean) {
   const state = eventState(event);
   const registrationState = eventRegistrationState(event, registrationCount);
   const canRegister = currentTeam?.ownerId === currentUserId && registrationState === 'open';
+  const canEditRegistration = currentTeam?.ownerId === currentUserId && isRegistered && isRegistrationWindowOpen(event);
   return `<section class="card event-card">
     <div class="section-heading-row">
       <div>
@@ -661,7 +706,7 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
     <div class="event-meta-grid">
       ${eventMeta('Event starts', formatDateTime(event.startsAt))}
       ${eventMeta('Event ends', formatDateTime(event.endsAt))}
-      ${eventMeta('Registration', `${formatDateTime(event.registrationOpensAt)} → ${formatDateTime(event.registrationClosesAt)}`)}
+      ${eventMeta('Registration', eventRegistrationDateSummary(event))}
       ${eventMeta('Roster required', `${event.requiredMainPlayers} main, ${event.requiredSubstitutes} sub${event.requiredSubstitutes === 1 ? '' : 's'}`)}
     </div>
     <div class="event-actions">
@@ -669,7 +714,8 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
       ${registrationState === 'full' ? '<span class="pill">Full</span>' : ''}
       ${registrationState === 'not-open' ? '<span class="pill">Registration not open</span>' : ''}
       ${registrationState === 'closed' ? '<span class="pill">Registration closed</span>' : ''}
-      ${canRegister ? `<a class="button" href="/events/${encodeURIComponent(event.id)}/register">Register</a>` : ''}
+      ${canRegister ? `<a class="button" href="/events/${encodeURIComponent(event.id)}/register">${isRegistered ? 'Edit registration' : 'Register'}</a>` : ''}
+      ${!canRegister && canEditRegistration ? `<a class="button" href="/events/${encodeURIComponent(event.id)}/register">Edit registration</a>` : ''}
       ${!currentTeam ? '<small>Create a team as captain to register.</small>' : ''}
       ${currentTeam && currentTeam.ownerId !== currentUserId ? '<small>Only your team captain can register.</small>' : ''}
     </div>
@@ -683,42 +729,42 @@ function eventRegistrationPage(
   registrationCount: number,
   existingRegistration?: EventRegistration
 ) {
-  const mainMembers = members.filter((member) => member.role === 'main');
+  const mainMembers = members.filter((member) => member.role === 'main' || member.role === 'captain');
   const subMembers = members.filter((member) => member.role === 'sub');
   const registrationState = eventRegistrationState(event, registrationCount);
-  if (existingRegistration) {
-    return `<p><a href="/events">← Back to events</a></p><section class="card"><h2>${escapeHtml(team.name)} is already registered</h2><p>Your team has already been added to this event.</p><p><a class="button" href="/events/${encodeURIComponent(event.id)}/registrations">View registered teams</a></p></section>`;
-  }
-  if (registrationState !== 'open') {
+  if (registrationState !== 'open' && !(existingRegistration && isRegistrationWindowOpen(event))) {
     return `<p><a href="/events">← Back to events</a></p><section class="card"><h2>Registration is ${eventRegistrationStateLabel(registrationState)}</h2><p>This event cannot accept new registrations right now.</p></section>`;
   }
 
   return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
       <p class="eyebrow">${escapeHtml(team.name)}</p>
-      <h2>Select roster for ${escapeHtml(event.title)}</h2>
-      <p>Choose the players who will compete from your <strong>Main</strong> role and the substitute players from your <strong>Sub</strong> role.</p>
+      <h2>${existingRegistration ? 'Edit roster for' : 'Select roster for'} ${escapeHtml(event.title)}</h2>
+      <p>Choose the players who will compete from your <strong>Main</strong> role or the team captain, and any substitute players from your <strong>Sub</strong> role. You can return here later to update or remove this registration while registration is open.</p>
       <div class="event-meta-grid">
         ${eventMeta('Required main players', String(event.requiredMainPlayers))}
         ${eventMeta('Required substitutes', String(event.requiredSubstitutes))}
         ${eventMeta('Teams registered', `${registrationCount}/${event.teamLimit}`)}
-        ${eventMeta('Registration closes', formatDateTime(event.registrationClosesAt))}
+        ${eventMeta('Registration closes', formatShortDate(event.registrationClosesAt))}
       </div>
       <form method="post" action="/events/${encodeURIComponent(event.id)}/register" class="stacked-form">
         <fieldset>
           <legend>Main players</legend>
-          ${memberCheckboxList('mainPlayerIds', mainMembers, event.requiredMainPlayers, 'No team members currently have the Main role.')}
+          ${memberCheckboxList('mainPlayerIds', mainMembers, event.requiredMainPlayers, 'No team members currently have the Main role or Captain role.', existingRegistration?.mainPlayerIds)}
         </fieldset>
         <fieldset>
           <legend>Substitute players</legend>
-          ${memberCheckboxList('substitutePlayerIds', subMembers, event.requiredSubstitutes, 'No team members currently have the Sub role.')}
+          ${memberCheckboxList('substitutePlayerIds', subMembers, event.requiredSubstitutes, 'No team members currently have the Sub role.', existingRegistration?.substitutePlayerIds)}
         </fieldset>
-        <button type="submit">Register team</button>
+        <div class="event-actions">
+          <button type="submit">${existingRegistration ? 'Save registration' : 'Register team'}</button>
+        </div>
       </form>
+      ${existingRegistration ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/register/delete" onsubmit="return confirm('Remove ${escapeJsString(team.name)} from ${escapeJsString(event.title)}?');"><button class="danger" type="submit">Remove registration</button></form>` : ''}
     </section>`;
 }
 
-function eventRegistrationsPage(event: Event, details: EventRegistrationDetail[]) {
+function eventRegistrationsPage(event: Event, details: EventRegistrationDetail[], isAdmin: boolean) {
   return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
       <div class="section-heading-row">
@@ -727,13 +773,13 @@ function eventRegistrationsPage(event: Event, details: EventRegistrationDetail[]
       </div>
       ${
         details.length
-          ? `<div class="management-list">${details.map((detail, index) => eventRegistrationCard(detail, index + 1)).join('')}</div>`
+          ? `<div class="management-list">${details.map((detail, index) => eventRegistrationCard(detail, index + 1, event, isAdmin)).join('')}</div>`
           : '<p>No teams have registered yet.</p>'
       }
     </section>`;
 }
 
-function eventRegistrationCard(detail: EventRegistrationDetail, index: number) {
+function eventRegistrationCard(detail: EventRegistrationDetail, index: number, event: Event, isAdmin: boolean) {
   const memberNames = new Map(detail.members.map((member) => [member.userId, member.displayName]));
   const listNames = (ids: string[]) => ids.map((id) => escapeHtml(memberNames.get(id) ?? id)).join(', ') || 'None selected';
   return `<div class="admin-team-row">
@@ -743,6 +789,7 @@ function eventRegistrationCard(detail: EventRegistrationDetail, index: number) {
       <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
       <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
     </div>
+    ${isAdmin ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/registrations/${encodeURIComponent(detail.registration.teamId)}/delete" onsubmit="return confirm('Force un-register ${escapeJsString(detail.team?.name ?? detail.registration.teamId)} from ${escapeJsString(event.title)}?');"><button class="danger" type="submit">Force un-register</button></form>` : ''}
   </div>`;
 }
 
@@ -782,6 +829,7 @@ function managedEventRow(event: Event, registrationCount: number) {
     <div class="admin-team-actions">
       <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">Teams</a>
       <a class="button" href="/event-management/events/${encodeURIComponent(event.id)}/edit">Edit</a>
+      <form method="post" action="/event-management/events/${encodeURIComponent(event.id)}/delete" onsubmit="return confirm('Delete ${escapeJsString(event.title)} and all registrations? This cannot be undone.');"><button class="danger" type="submit">Delete</button></form>
     </div>
   </div>`;
 }
@@ -803,9 +851,13 @@ function eventForm(action: string, event?: Event) {
   </form>`;
 }
 
-function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string) {
+function memberCheckboxList(name: string, members: Awaited<ReturnType<TeamBot['getTeamMemberDetails']>>, requiredCount: number, emptyMessage: string, selectedIds: string[] = []) {
   if (!members.length) return `<p><small>${emptyMessage}</small></p>`;
-  return `<p><small>Select at least ${requiredCount}.</small></p><div class="checkbox-list">${members.map((member) => `<label class="checkbox-row"><input type="checkbox" name="${name}" value="${escapeHtml(member.userId)}" /> <span>${escapeHtml(member.displayName)} <small>@${escapeHtml(member.username)}</small></span></label>`).join('')}</div>`;
+  const selected = new Set(selectedIds);
+  return `<p><small>Select at least ${requiredCount}.</small></p><div class="checkbox-list modern-checkbox-list">${members.map((member) => {
+    const checked = selected.has(member.userId) ? ' checked' : '';
+    return `<label class="checkbox-row modern-checkbox-row"><input type="checkbox" name="${name}" value="${escapeHtml(member.userId)}"${checked} /> <span class="checkbox-control" aria-hidden="true"></span><span class="checkbox-user"><strong>${escapeHtml(member.displayName)}</strong><small>@${escapeHtml(member.username)}</small></span></label>`;
+  }).join('')}</div>`;
 }
 
 function eventMeta(label: string, value: string) {
@@ -844,19 +896,20 @@ function parseDateTimeInput(value: unknown, label: string) {
   return date.toISOString();
 }
 
-function validateEventRegistration(event: Event, members: TeamMember[], mainPlayerIds: string[], substitutePlayerIds: string[], registrationCount: number) {
+function validateEventRegistration(event: Event, members: TeamMember[], mainPlayerIds: string[], substitutePlayerIds: string[], registrationCount: number, isExistingRegistration = false) {
   const registrationState = eventRegistrationState(event, registrationCount);
-  if (registrationState === 'full') throw new Error('This event has reached its team registration limit.');
+  if (registrationState === 'full' && !isExistingRegistration) throw new Error('This event has reached its team registration limit.');
   if (registrationState === 'not-open') throw new Error('Registration is not open yet for this event.');
   if (registrationState === 'closed') throw new Error('Registration has closed for this event.');
+  if (isExistingRegistration && !isRegistrationWindowOpen(event)) throw new Error('Registration changes are closed for this event.');
 
-  const mainMemberIds = new Set(members.filter((member) => member.role === 'main').map((member) => member.userId));
+  const mainMemberIds = new Set(members.filter((member) => member.role === 'main' || member.role === 'captain').map((member) => member.userId));
   const subMemberIds = new Set(members.filter((member) => member.role === 'sub').map((member) => member.userId));
   const duplicateIds = mainPlayerIds.filter((id) => substitutePlayerIds.includes(id));
   if (duplicateIds.length) throw new Error('A player cannot be selected as both a main player and a substitute.');
   if (mainPlayerIds.length < event.requiredMainPlayers) throw new Error(`This event requires at least ${event.requiredMainPlayers} main player${event.requiredMainPlayers === 1 ? '' : 's'}.`);
   if (substitutePlayerIds.length < event.requiredSubstitutes) throw new Error(`This event requires at least ${event.requiredSubstitutes} substitute${event.requiredSubstitutes === 1 ? '' : 's'}.`);
-  if (mainPlayerIds.some((id) => !mainMemberIds.has(id))) throw new Error('Main player selections must come from team members with the Main role.');
+  if (mainPlayerIds.some((id) => !mainMemberIds.has(id))) throw new Error('Main player selections must come from team members with the Main role or the team captain.');
   if (substitutePlayerIds.some((id) => !subMemberIds.has(id))) throw new Error('Substitute selections must come from team members with the Sub role.');
 }
 
@@ -881,6 +934,17 @@ function eventRegistrationState(event: Event, registrationCount: number) {
 
 function eventRegistrationStateLabel(state: ReturnType<typeof eventRegistrationState>) {
   return ({ open: 'open', full: 'full', 'not-open': 'not open yet', closed: 'closed' } as const)[state];
+}
+
+function eventRegistrationDateSummary(event: Event) {
+  return Date.now() < new Date(event.registrationOpensAt).getTime()
+    ? `Registration opening ${formatShortDate(event.registrationOpensAt)}`
+    : `Registration closes on ${formatShortDate(event.registrationClosesAt)}`;
+}
+
+function isRegistrationWindowOpen(event: Event) {
+  const now = Date.now();
+  return now >= new Date(event.registrationOpensAt).getTime() && now <= new Date(event.registrationClosesAt).getTime();
 }
 
 function toDateTimeLocalValue(value?: string) {
@@ -1319,6 +1383,12 @@ function formatDateTime(value: string) {
   return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+function formatShortDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: '2-digit' });
+}
+
 function layout(title: string, body: string, options: LayoutOptions = {}) {
   const nav = navigation(options);
   return `<!doctype html>
@@ -1383,6 +1453,17 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .checkbox-list { display: grid; gap: .5rem; }
     .checkbox-row { display: flex; align-items: center; gap: .6rem; background: #12141a; border: 1px solid var(--line); border-radius: .85rem; padding: .7rem; }
     .checkbox-row input { width: auto; margin: 0; }
+    .modern-checkbox-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .modern-checkbox-row { position: relative; align-items: stretch; gap: .75rem; padding: .85rem; cursor: pointer; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
+    .modern-checkbox-row:hover { border-color: rgba(239,35,60,.6); background: #171a22; transform: translateY(-1px); }
+    .modern-checkbox-row input { position: absolute; opacity: 0; pointer-events: none; }
+    .checkbox-control { display: grid; place-items: center; flex: 0 0 1.35rem; width: 1.35rem; height: 1.35rem; border: 1px solid rgba(255,255,255,.24); border-radius: .45rem; background: #0f1116; box-shadow: inset 0 0 0 2px rgba(0,0,0,.18); }
+    .checkbox-control::after { content: "✓"; opacity: 0; transform: scale(.65); color: white; font-weight: 950; transition: opacity .18s ease, transform .18s ease; }
+    .modern-checkbox-row input:checked + .checkbox-control { border-color: rgba(239,35,60,.95); background: linear-gradient(135deg, var(--red), #8f0617); box-shadow: 0 0 0 3px rgba(239,35,60,.18); }
+    .modern-checkbox-row input:checked + .checkbox-control::after { opacity: 1; transform: scale(1); }
+    .modern-checkbox-row:has(input:checked) { border-color: rgba(239,35,60,.72); background: linear-gradient(135deg, rgba(239,35,60,.16), rgba(18,20,26,.96)); }
+    .checkbox-user { display: grid; gap: .18rem; min-width: 0; }
+    .checkbox-user strong, .checkbox-user small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
