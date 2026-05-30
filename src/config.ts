@@ -39,3 +39,5 @@ export const config = {
 };
 
 export const discordRedirectUri = `${config.PUBLIC_URL}/auth/discord/callback`;
+
+export const DEVELOPER_DISCORD_USER_ID = '743956656429203535';

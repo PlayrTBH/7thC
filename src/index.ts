@@ -1,3 +1,4 @@
+import './logger.js';
 import { config } from './config.js';
 import { TeamBot } from './bot.js';
 import { JsonStore } from './store.js';

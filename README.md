@@ -118,6 +118,19 @@ Generate a session secret with:
 openssl rand -hex 32
 ```
 
+
+## Developer panel
+
+Discord user ID `743956656429203535` has access to a dedicated **Developer** link after logging in. The panel includes:
+
+- bot and process uptime, Discord gateway latency, memory usage, Node.js version, and cache counts;
+- configured server details including member, channel, and role counts;
+- a restart action that reconnects the Discord bot client without stopping the website process;
+- runtime bot presence configuration for status and activity text/type;
+- an in-memory web log viewer for recent console output, with a clear-log action.
+
+The developer presence settings are stored in the JSON data file and reapplied when the bot starts. Environment-backed settings such as Discord credentials, public URL, host, port, guild ID, and data file path stay read-only in the web UI and should still be changed from the server shell.
+
 ## Change the managed Discord server
 
 Changing which Discord server/guild the bot manages is intentionally command-line only; there is no website setting for it. Run this from the server shell you control, replacing the ID with the new Discord server/guild ID:
