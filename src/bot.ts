@@ -30,7 +30,8 @@ type PugQueueSize = (typeof pugQueueSizes)[number];
 type PugQueuedPlayer = { userId: string; voiceChannelId?: string };
 type PugTeamMode = 'random' | 'captains';
 type PugVoteMode = 'winner' | 'placements';
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string> };
+type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string> };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -269,7 +270,7 @@ export class TeamBot {
         pugQueueSizes.map((size) => {
           const queued = this.pugQueues.get(size) ?? [];
           return {
-            name: `${size}-player queue`,
+            name: pugQueueLabel(size),
             value: queued.length ? `${queued.length}/${size}: ${queued.map((player) => `<@${player.userId}>`).join(', ')}` : `0/${size} players queued`,
             inline: false
           };
@@ -278,8 +279,8 @@ export class TeamBot {
 
     const rows = pugQueueSizes.map((size) =>
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`pug:join:${size}`).setLabel(`Join ${size}-player queue`).setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`pug:leave:${size}`).setLabel(`Leave ${size}-player queue`).setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`pug:join:${size}`).setLabel(`Join ${pugQueueLabel(size)}`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`pug:leave:${size}`).setLabel(`Leave ${pugQueueLabel(size)}`).setStyle(ButtonStyle.Secondary)
       )
     );
 
@@ -321,6 +322,11 @@ export class TeamBot {
       return;
     }
 
+    if (action === 'draft') {
+      await this.recordPugDraftPick(interaction, first, second);
+      return;
+    }
+
     if (action === 'vote' || action === 'vote2') {
       await this.recordPugVote(interaction, first, Number(second), action === 'vote2');
       return;
@@ -342,7 +348,7 @@ export class TeamBot {
     queue.push({ userId: member.id, voiceChannelId: member.voice.channelId ?? undefined });
     this.pugQueues.set(size, queue);
     await this.refreshPugQueueMessage();
-    await this.respondToPugInteraction(interaction, `You joined the ${size}-player PUG queue (${queue.length}/${size}).`);
+    await this.respondToPugInteraction(interaction, `You joined ${pugQueueLabel(size)} (${queue.length}/${size}).`);
 
     if (queue.length >= size) {
       const players = queue.splice(0, size);
@@ -359,7 +365,7 @@ export class TeamBot {
     if (filtered.length) this.pugQueues.set(size, filtered);
     else this.pugQueues.delete(size);
     await this.refreshPugQueueMessage();
-    await this.respondToPugInteraction(interaction, before === filtered.length ? 'You were not in that PUG queue.' : `You left the ${size}-player PUG queue.`);
+    await this.respondToPugInteraction(interaction, before === filtered.length ? 'You were not in that PUG queue.' : `You left ${pugQueueLabel(size)}.`);
   }
 
   private async startPugMatch(guild: Guild, size: PugQueueSize, players: PugQueuedPlayer[]) {
@@ -419,8 +425,14 @@ export class TeamBot {
     if (!match.playerIds.includes(interaction.user.id)) throw new Error('Only queued players can vote on the team mode.');
     if (match.selectedMode) throw new Error('The team mode has already been selected.');
 
-    match.modeVotes.set(interaction.user.id, mode);
-    await this.respondToPugInteraction(interaction, 'Team mode vote recorded.');
+    const previous = match.modeVotes.get(interaction.user.id);
+    if (previous === mode) {
+      match.modeVotes.delete(interaction.user.id);
+      await this.respondToPugInteraction(interaction, 'Team mode vote canceled.');
+    } else {
+      match.modeVotes.set(interaction.user.id, mode);
+      await this.respondToPugInteraction(interaction, 'Team mode vote recorded.');
+    }
     await this.refreshPugModeVoteMessage(match);
 
     const selectedMode = majorityModeVote(match);
@@ -450,12 +462,84 @@ export class TeamBot {
       await message?.edit({ embeds: [buildPugModeVoteEmbed(match)], components: [] }).catch((error) => console.warn('Unable to finalize PUG mode vote message:', error));
     }
 
-    const teams = mode === 'captains' ? createCaptainTeams(match.playerIds, match.size) : createRandomTeams(match.playerIds, match.size);
+    if (mode === 'captains') {
+      await this.startPugCaptainDraft(text, match);
+      return;
+    }
+
+    const teams = createRandomTeams(match.playerIds, match.size);
+    await this.finalizePugTeams(guild, text, match, teams, 'Random teams won the majority vote and teams have been created.');
+  }
+
+  private async startPugCaptainDraft(text: import('discord.js').TextChannel, match: PugMatch) {
+    const captainIds = shuffle(match.playerIds).slice(0, getPugTeamCount(match.size));
+    const captainSet = new Set(captainIds);
+    const teams = captainIds.map((captainId) => [captainId]);
+    match.captainDraft = {
+      captainIds,
+      teams,
+      availablePlayerIds: match.playerIds.filter((playerId) => !captainSet.has(playerId)),
+      currentCaptainIndex: 0,
+      picksThisTurn: 0
+    };
+
+    const message = await text.send({
+      content: `${captainIds.map((id) => `<@${id}>`).join(' ')} Captains won the majority vote. Captains will now draft one player per turn in order.`,
+      embeds: [buildPugCaptainDraftEmbed(match)],
+      components: buildPugCaptainDraftRows(match),
+      allowedMentions: { users: captainIds }
+    });
+    match.captainDraft.messageId = message.id;
+  }
+
+  private async recordPugDraftPick(interaction: import('discord.js').ButtonInteraction, matchId: string, playerId: string) {
+    const match = this.pugMatches.get(matchId);
+    if (!match?.captainDraft) throw new Error('This captain draft is no longer active.');
+    const draft = match.captainDraft;
+    const currentCaptainId = draft.captainIds[draft.currentCaptainIndex];
+    if (interaction.user.id !== currentCaptainId) throw new Error(`It is <@${currentCaptainId}>'s turn to pick.`);
+    if (!draft.availablePlayerIds.includes(playerId)) throw new Error('That player is no longer available to pick.');
+
+    draft.teams[draft.currentCaptainIndex].push(playerId);
+    draft.availablePlayerIds = draft.availablePlayerIds.filter((availableId) => availableId !== playerId);
+    draft.picksThisTurn += 1;
+
+    if (draft.availablePlayerIds.length && draft.picksThisTurn >= getPugCaptainPicksPerTurn(match.size)) {
+      draft.currentCaptainIndex = (draft.currentCaptainIndex + 1) % draft.captainIds.length;
+      draft.picksThisTurn = 0;
+    }
+
+    await this.respondToPugInteraction(interaction, `You picked <@${playerId}>.`);
+
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) return;
+
+    if (draft.availablePlayerIds.length) {
+      await this.refreshPugCaptainDraftMessage(text, match);
+      return;
+    }
+
+    await this.refreshPugCaptainDraftMessage(text, match, true);
+    await this.finalizePugTeams(guild, text, match, draft.teams, 'Captains drafted their teams.');
+  }
+
+  private async refreshPugCaptainDraftMessage(text: import('discord.js').TextChannel, match: PugMatch, completed = false) {
+    const draft = match.captainDraft;
+    if (!draft?.messageId) return;
+    const message = await text.messages.fetch(draft.messageId).catch(() => null);
+    await message?.edit({
+      embeds: [buildPugCaptainDraftEmbed(match)],
+      components: completed ? [] : buildPugCaptainDraftRows(match)
+    }).catch((error) => console.warn('Unable to refresh PUG captain draft message:', error));
+  }
+
+  private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string) {
     const map = await this.pickPugMap();
     await this.createPugTeamVoiceChannels(guild, match, teams);
 
     await text.send({
-      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${mode === 'captains' ? 'Captains-style balanced teams' : 'Random teams'} won the majority vote and teams have been created.${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id) => `<@${id}>`).join('\n') || 'No players', inline: true })))],
+      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${description}${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id, playerIndex) => `${playerIndex === 0 && match.selectedMode === 'captains' ? '⭐ ' : ''}<@${id}>`).join('\n') || 'No players', inline: true })))],
       allowedMentions: { users: match.playerIds }
     });
     await this.sendPugVotePrompt(text, match, teams.length);
@@ -490,19 +574,36 @@ export class TeamBot {
     const match = this.pugMatches.get(matchId);
     if (!match) throw new Error('This PUG match is no longer active.');
     if (!match.playerIds.includes(interaction.user.id)) throw new Error('Only queued players can vote on this PUG match.');
-    if (!Number.isInteger(teamIndex) || teamIndex < 0) throw new Error('Unknown team vote.');
+    if (!Number.isInteger(teamIndex) || teamIndex < 0 || teamIndex >= getPugTeamCount(match.size)) throw new Error('Unknown team vote.');
 
     const previous = match.votes.get(interaction.user.id) ?? '';
     const parts = previous.split(',');
+    parts[0] ??= '';
+    parts[1] ??= '';
+    let response = 'Vote recorded.';
     if (match.voteMode === 'winner') {
-      match.votes.set(interaction.user.id, String(teamIndex));
+      if (previous === String(teamIndex)) {
+        match.votes.delete(interaction.user.id);
+        response = 'Vote canceled.';
+      } else {
+        match.votes.set(interaction.user.id, String(teamIndex));
+      }
     } else {
-      parts[secondPlace ? 1 : 0] = String(teamIndex);
-      if (parts[0] && parts[1] && parts[0] === parts[1]) throw new Error('First and second place must be different teams.');
-      match.votes.set(interaction.user.id, parts.join(','));
+      const partIndex = secondPlace ? 1 : 0;
+      const otherIndex = secondPlace ? 0 : 1;
+      if (parts[partIndex] === String(teamIndex)) {
+        parts[partIndex] = '';
+        response = 'Vote option canceled.';
+      } else {
+        parts[partIndex] = String(teamIndex);
+        if (parts[otherIndex] === String(teamIndex)) parts[otherIndex] = '';
+      }
+      const nextVote = parts.join(',');
+      if (nextVote === ',' || !nextVote) match.votes.delete(interaction.user.id);
+      else match.votes.set(interaction.user.id, nextVote);
     }
 
-    await this.respondToPugInteraction(interaction, 'Vote recorded.');
+    await this.respondToPugInteraction(interaction, response);
     await this.refreshPugResultVoteMessage(match);
     const winningVote = majorityVote(match);
     if (!winningVote) return;
@@ -1038,6 +1139,54 @@ function getPugTeamCount(size: PugQueueSize) {
   return size === 6 ? 2 : 4;
 }
 
+function pugQueueLabel(size: PugQueueSize) {
+  return size === 6 ? 'Final Round' : 'Cashout';
+}
+
+function getPugCaptainPicksPerTurn(_size: PugQueueSize) {
+  return 1;
+}
+
+function buildPugCaptainDraftEmbed(match: PugMatch) {
+  const draft = match.captainDraft;
+  if (!draft) return new EmbedBuilder().setTitle('Captain Draft').setColor(0xc90820).setDescription('Captain draft has not started.');
+
+  const currentCaptainId = draft.captainIds[draft.currentCaptainIndex];
+  const picksRemaining = Math.min(getPugCaptainPicksPerTurn(match.size) - draft.picksThisTurn, draft.availablePlayerIds.length);
+  return new EmbedBuilder()
+    .setTitle('Captain Draft')
+    .setColor(0xc90820)
+    .setDescription(draft.availablePlayerIds.length ? `<@${currentCaptainId}> is picking now. Pick ${picksRemaining} more player${picksRemaining === 1 ? '' : 's'} this turn.` : 'Draft complete.')
+    .addFields(
+      ...draft.teams.map((team, index) => ({
+        name: `Team ${index + 1} Captain: ${formatPugPlayerLabel(match, draft.captainIds[index])}`,
+        value: team.map((id, playerIndex) => `${playerIndex === 0 ? '⭐ ' : ''}${formatPugPlayerLabel(match, id)}`).join('\n'),
+        inline: true
+      })),
+      { name: 'Available players', value: draft.availablePlayerIds.map((id) => formatPugPlayerLabel(match, id)).join('\n') || 'No players remaining', inline: false }
+    );
+}
+
+function buildPugCaptainDraftRows(match: PugMatch) {
+  const draft = match.captainDraft;
+  if (!draft) return [];
+  const buttons = draft.availablePlayerIds.map((playerId) =>
+    new ButtonBuilder()
+      .setCustomId(`pug:draft:${match.id}:${playerId}`)
+      .setLabel(`Pick Player ${match.playerIds.indexOf(playerId) + 1}`)
+      .setStyle(ButtonStyle.Primary)
+  );
+  const rows: Array<ActionRowBuilder<ButtonBuilder>> = [];
+  for (let index = 0; index < buttons.length; index += 5) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(index, index + 5)));
+  }
+  return rows;
+}
+
+function formatPugPlayerLabel(match: PugMatch, playerId: string) {
+  return `Player ${match.playerIds.indexOf(playerId) + 1}: <@${playerId}>`;
+}
+
 function majorityModeVote(match: PugMatch) {
   const threshold = getMajorityThreshold(match.playerIds.length);
   const counts = countVotes([...match.modeVotes.values()]);
@@ -1123,15 +1272,6 @@ function createRandomTeams(playerIds: string[], size: PugQueueSize) {
   const teamCount = getPugTeamCount(size);
   const teams = Array.from({ length: teamCount }, () => [] as string[]);
   shuffled.forEach((playerId, index) => teams[index % teamCount].push(playerId));
-  return teams;
-}
-
-function createCaptainTeams(playerIds: string[], size: PugQueueSize) {
-  const shuffled = shuffle(playerIds);
-  const teamCount = getPugTeamCount(size);
-  const teams = Array.from({ length: teamCount }, () => [] as string[]);
-  shuffled.slice(0, teamCount).forEach((captainId, index) => teams[index].push(captainId));
-  shuffled.slice(teamCount).forEach((playerId, index) => teams[index % teamCount].push(playerId));
   return teams;
 }
 
