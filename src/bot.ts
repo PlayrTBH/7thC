@@ -10,6 +10,7 @@ import {
   OverwriteType,
   Partials,
   PermissionsBitField,
+  MessageFlags,
   type ColorResolvable,
   type Guild,
   type GuildInvitableChannelResolvable,
@@ -61,14 +62,15 @@ export class TeamBot {
       if (!interaction.isButton()) return;
       if (interaction.customId.startsWith('pug:')) {
         try {
+          if (!interaction.deferred && !interaction.replied) {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          }
           await this.handlePugInteraction(interaction);
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unable to process this PUG action.';
-          if (interaction.deferred || interaction.replied) {
-            await interaction.followUp({ content: message, ephemeral: true });
-          } else {
-            await interaction.reply({ content: message, ephemeral: true });
-          }
+          await this.respondToPugInteraction(interaction, message).catch((responseError) => {
+            console.warn('Unable to send PUG interaction response:', responseError);
+          });
         }
         return;
       }
@@ -78,21 +80,21 @@ export class TeamBot {
       try {
         if (action === 'accept') {
           await this.acceptInvite(inviteId, interaction.user.id);
-          await interaction.reply({ content: 'Invite accepted. Your team roles have been added.', ephemeral: true });
+          await interaction.reply({ content: 'Invite accepted. Your team roles have been added.', flags: MessageFlags.Ephemeral });
           await interaction.message.delete().catch((deleteError) => {
             console.warn(`Unable to delete accepted invite DM ${inviteId}:`, deleteError);
           });
         }
         if (action === 'decline') {
           await this.declineInvite(inviteId, interaction.user.id);
-          await interaction.reply({ content: 'Invite declined.', ephemeral: true });
+          await interaction.reply({ content: 'Invite declined.', flags: MessageFlags.Ephemeral });
           await interaction.message.delete().catch((deleteError) => {
             console.warn(`Unable to delete declined invite DM ${inviteId}:`, deleteError);
           });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unable to process this invite.';
-        await interaction.reply({ content: message, ephemeral: true });
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
       }
     });
   }
@@ -295,6 +297,15 @@ export class TeamBot {
     await message?.edit(this.buildPugQueueMessage()).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
   }
 
+  private async respondToPugInteraction(interaction: import('discord.js').ButtonInteraction, content: string) {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+      return;
+    }
+
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+  }
+
   private async handlePugInteraction(interaction: import('discord.js').ButtonInteraction) {
     const [, action, first, second] = interaction.customId.split(':');
     if (action === 'join' || action === 'leave') {
@@ -331,7 +342,7 @@ export class TeamBot {
     queue.push({ userId: member.id, voiceChannelId: member.voice.channelId ?? undefined });
     this.pugQueues.set(size, queue);
     await this.refreshPugQueueMessage();
-    await interaction.reply({ content: `You joined the ${size}-player PUG queue (${queue.length}/${size}).`, ephemeral: true });
+    await this.respondToPugInteraction(interaction, `You joined the ${size}-player PUG queue (${queue.length}/${size}).`);
 
     if (queue.length >= size) {
       const players = queue.splice(0, size);
@@ -348,7 +359,7 @@ export class TeamBot {
     if (filtered.length) this.pugQueues.set(size, filtered);
     else this.pugQueues.delete(size);
     await this.refreshPugQueueMessage();
-    await interaction.reply({ content: before === filtered.length ? 'You were not in that PUG queue.' : `You left the ${size}-player PUG queue.`, ephemeral: true });
+    await this.respondToPugInteraction(interaction, before === filtered.length ? 'You were not in that PUG queue.' : `You left the ${size}-player PUG queue.`);
   }
 
   private async startPugMatch(guild: Guild, size: PugQueueSize, players: PugQueuedPlayer[]) {
@@ -409,7 +420,7 @@ export class TeamBot {
     if (match.selectedMode) throw new Error('The team mode has already been selected.');
 
     match.modeVotes.set(interaction.user.id, mode);
-    await interaction.reply({ content: 'Team mode vote recorded.', ephemeral: true });
+    await this.respondToPugInteraction(interaction, 'Team mode vote recorded.');
     await this.refreshPugModeVoteMessage(match);
 
     const selectedMode = majorityModeVote(match);
@@ -491,7 +502,7 @@ export class TeamBot {
       match.votes.set(interaction.user.id, parts.join(','));
     }
 
-    await interaction.reply({ content: 'Vote recorded.', ephemeral: true });
+    await this.respondToPugInteraction(interaction, 'Vote recorded.');
     await this.refreshPugResultVoteMessage(match);
     const winningVote = majorityVote(match);
     if (!winningVote) return;
