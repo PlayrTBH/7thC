@@ -27,11 +27,11 @@ import type { BotActivityType, BotStatus, DeveloperSettings, Team, TeamInvite, T
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const;
 type PugQueueSize = (typeof pugQueueSizes)[number];
-type PugQueuedPlayer = { userId: string; voiceChannelId?: string };
+type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugTeamMode = 'random' | 'captains';
 type PugVoteMode = 'winner' | 'placements';
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string> };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string> };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -345,7 +345,7 @@ export class TeamBot {
     }
 
     const queue = this.pugQueues.get(size) ?? [];
-    queue.push({ userId: member.id, voiceChannelId: member.voice.channelId ?? undefined });
+    queue.push({ userId: member.id, username: member.user.username, voiceChannelId: member.voice.channelId ?? undefined });
     this.pugQueues.set(size, queue);
     await this.refreshPugQueueMessage();
     await this.respondToPugInteraction(interaction, `You joined ${pugQueueLabel(size)} (${queue.length}/${size}).`);
@@ -382,11 +382,13 @@ export class TeamBot {
     const queueVoice = await guild.channels.create({ name: 'queue', type: ChannelType.GuildVoice, parent: category.id, permissionOverwrites: overwrites, reason: 'PUG queue voice channel created when queue filled' });
     const text = await guild.channels.create({ name: 'pug-match', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites, topic: `PUG match ${matchId}`, reason: 'PUG match text channel created when queue filled' });
 
-    const match: PugMatch = { id: matchId, size, playerIds, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map() };
+    const fetchedPlayers = await Promise.all(playerIds.map(async (playerId) => guild.members.fetch(playerId).catch(() => null)));
+    const playerUsernames = new Map(playerIds.map((playerId, index) => [playerId, fetchedPlayers[index]?.user.username ?? players[index].username]));
+    const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map() };
     this.pugMatches.set(matchId, match);
 
-    await Promise.all(players.map(async (player) => {
-      const member = await guild.members.fetch(player.userId).catch(() => null);
+    await Promise.all(players.map(async (player, index) => {
+      const member = fetchedPlayers[index];
       if (!member) return;
       if (player.voiceChannelId && member.voice.channelId) {
         await member.voice.setChannel(queueVoice, 'PUG queue filled').catch((error) => console.warn(`Unable to move PUG player ${player.userId}:`, error));
@@ -539,7 +541,7 @@ export class TeamBot {
     await this.createPugTeamVoiceChannels(guild, match, teams);
 
     await text.send({
-      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${description}${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id, playerIndex) => `${playerIndex === 0 && match.selectedMode === 'captains' ? '⭐ ' : ''}<@${id}>`).join('\n') || 'No players', inline: true })))],
+      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${description}${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id, playerIndex) => `${playerIndex === 0 && match.selectedMode === 'captains' ? '⭐ ' : ''}${formatPugPlayerLabel(match, id)}`).join('\n') || 'No players', inline: true })))],
       allowedMentions: { users: match.playerIds }
     });
     await this.sendPugVotePrompt(text, match, teams.length);
@@ -1156,7 +1158,7 @@ function buildPugCaptainDraftEmbed(match: PugMatch) {
   return new EmbedBuilder()
     .setTitle('Captain Draft')
     .setColor(0xc90820)
-    .setDescription(draft.availablePlayerIds.length ? `<@${currentCaptainId}> is picking now. Pick ${picksRemaining} more player${picksRemaining === 1 ? '' : 's'} this turn.` : 'Draft complete.')
+    .setDescription(draft.availablePlayerIds.length ? `${formatPugPlayerLabel(match, currentCaptainId)} is picking now. Pick ${picksRemaining} more player${picksRemaining === 1 ? '' : 's'} this turn.` : 'Draft complete.')
     .addFields(
       ...draft.teams.map((team, index) => ({
         name: `Team ${index + 1} Captain: ${formatPugPlayerLabel(match, draft.captainIds[index])}`,
@@ -1173,7 +1175,7 @@ function buildPugCaptainDraftRows(match: PugMatch) {
   const buttons = draft.availablePlayerIds.map((playerId) =>
     new ButtonBuilder()
       .setCustomId(`pug:draft:${match.id}:${playerId}`)
-      .setLabel(`Pick Player ${match.playerIds.indexOf(playerId) + 1}`)
+      .setLabel(truncateButtonLabel(getPugPlayerUsername(match, playerId)))
       .setStyle(ButtonStyle.Primary)
   );
   const rows: Array<ActionRowBuilder<ButtonBuilder>> = [];
@@ -1184,7 +1186,15 @@ function buildPugCaptainDraftRows(match: PugMatch) {
 }
 
 function formatPugPlayerLabel(match: PugMatch, playerId: string) {
-  return `Player ${match.playerIds.indexOf(playerId) + 1}: <@${playerId}>`;
+  return getPugPlayerUsername(match, playerId);
+}
+
+function getPugPlayerUsername(match: PugMatch, playerId: string) {
+  return match.playerUsernames.get(playerId) ?? 'Unknown player';
+}
+
+function truncateButtonLabel(label: string) {
+  return label.length > 80 ? `${label.slice(0, 77)}...` : label;
 }
 
 function majorityModeVote(match: PugMatch) {
