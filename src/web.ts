@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugSettings } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugMatchLog, PugSettings } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -377,6 +377,52 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       next(error);
     }
   });
+
+  app.get('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const state = await bot.getPugAdminState();
+      res.send(layout('PUG administration', administratorPugsPage(state.activeMatches, state.history), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/:matchId/delete', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await bot.deletePugMatch(req.params.matchId);
+      res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/:matchId/reset', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await bot.resetPugMatch(req.params.matchId);
+      res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/:matchId/teams', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await bot.forcePugTeams(req.params.matchId, parsePugTeams(String(req.body.teams ?? '')));
+      res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/:matchId/captains', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await bot.forcePugCaptains(req.params.matchId, parseDiscordIds(String(req.body.captainIds ?? '')));
+      res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
 
   app.get('/developer', requireAuth, requireDeveloper, async (req, res, next) => {
     try {
@@ -1124,6 +1170,11 @@ function administratorPage(
           : '<p>No teams have been created yet.</p>'
       }
     </section>
+    <section class="card">
+      <h2>PUG administration</h2>
+      <p><small>Review full PUG match history, inspect ongoing matches, delete or reset live matches, and force teams or captains from the dedicated administrator-only PUG section.</small></p>
+      <a class="button" href="/administrator/pugs">Open PUG administration</a>
+    </section>
     ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}
     ${administratorPugSettingsForm(pugSettings)}`;
 }
@@ -1178,6 +1229,108 @@ function administratorPugSettingsForm(settings?: PugSettings) {
     </form>
     ${settings?.queueMessageId ? `<p><small>Current queue message ID: <code>${escapeHtml(settings.queueMessageId)}</code></small></p>` : ''}
   </section>`;
+}
+
+
+function administratorPugsPage(activeMatches: PugMatchLog[], history: PugMatchLog[]) {
+  return `<p><a href="/administrator">← Back to administrator</a></p>
+    <section class="card">
+      <h2>Ongoing PUG matches</h2>
+      ${activeMatches.length ? `<div class="management-list">${activeMatches.map(pugActiveMatchCard).join('')}</div>` : '<p>No PUG matches are currently running.</p>'}
+    </section>
+    <section class="card">
+      <h2>Full PUG match history</h2>
+      ${history.length ? `<div class="pug-history">${history.map(pugHistoryCard).join('')}</div>` : '<p>No PUG matches have been logged yet.</p>'}
+    </section>`;
+}
+
+function pugActiveMatchCard(match: PugMatchLog) {
+  const teamText = formatPugTeamsForInput(match);
+  const captainsText = match.captainIds.length ? match.captainIds.join('\n') : '';
+  return `<div class="pug-admin-match">
+    ${pugMatchSummary(match)}
+    <div class="admin-team-actions">
+      <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/reset" onsubmit="return confirm('Reset this PUG match back to team selection?');"><button type="submit">Reset match</button></form>
+      <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/delete" onsubmit="return confirm('Delete this live PUG match and its Discord channels?');"><button class="danger" type="submit">Delete match</button></form>
+    </div>
+    <details>
+      <summary>Force change teams</summary>
+      <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/teams" class="stack-form">
+        <label>Teams <small>One team per line. Use Discord user IDs separated by spaces, commas, or mentions. Every player must appear exactly once.</small>
+          <textarea name="teams" rows="6" placeholder="123 456 789&#10;987 654 321">${escapeHtml(teamText)}</textarea>
+        </label>
+        <button type="submit">Force teams</button>
+      </form>
+    </details>
+    <details>
+      <summary>Force change captains</summary>
+      <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/captains" class="stack-form">
+        <label>Captain user IDs <small>One captain per line or separated by commas/spaces.</small>
+          <textarea name="captainIds" rows="4" placeholder="123456789&#10;987654321">${escapeHtml(captainsText)}</textarea>
+        </label>
+        <button type="submit">Force captains</button>
+      </form>
+    </details>
+  </div>`;
+}
+
+function pugHistoryCard(match: PugMatchLog) {
+  return `<div class="pug-admin-match">
+    ${pugMatchSummary(match)}
+    <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/delete" onsubmit="return confirm('Delete this PUG match log?');"><button class="danger" type="submit">Delete log</button></form>
+  </div>`;
+}
+
+function pugMatchSummary(match: PugMatchLog) {
+  return `<div class="admin-team-row">
+    <div>
+      <strong>${escapeHtml(pugQueueLabel(match.size))}</strong> <span class="pill">${escapeHtml(match.status)}</span><br />
+      <small>ID <code>${escapeHtml(match.id)}</code> · Created ${formatDateTime(match.createdAt)}${match.endedAt ? ` · Ended ${formatDateTime(match.endedAt)}` : ''}</small>
+    </div>
+    <div><small>${match.playerIds.length} players · ${match.mode ? escapeHtml(modeLabel(match.mode)) : 'mode pending'}${match.map ? ` · Map ${escapeHtml(match.map)}` : ''}</small></div>
+  </div>
+  <div class="pug-admin-grid">
+    <div><h3>Players</h3>${pugPlayerList(match, match.playerIds)}</div>
+    <div><h3>Teams</h3>${match.teams.length ? match.teams.map((team, index) => `<p><strong>Team ${index + 1}</strong><br />${pugPlayerList(match, team)}</p>`).join('') : '<p><small>Teams have not been created yet.</small></p>'}</div>
+    <div><h3>Results</h3><p>${match.result ? escapeHtml(match.result) : 'No result yet.'}</p>${pugVoteSummary(match)}</div>
+  </div>`;
+}
+
+function pugPlayerList(match: PugMatchLog, ids: string[]) {
+  return ids.map((id) => `<span class="pug-player">${escapeHtml(match.playerUsernames[id] ?? id)} <code>${escapeHtml(id)}</code></span>`).join('') || '<small>None</small>';
+}
+
+function pugVoteSummary(match: PugMatchLog) {
+  const entries = Object.entries(match.votes);
+  if (!entries.length) return '<p><small>No result votes have been cast.</small></p>';
+  return `<p><small>${entries.length} vote${entries.length === 1 ? '' : 's'} cast:</small></p><ul>${entries.map(([userId, vote]) => `<li>${escapeHtml(match.playerUsernames[userId] ?? userId)}: ${escapeHtml(formatPugVote(match, vote))}</li>`).join('')}</ul>`;
+}
+
+function formatPugVote(match: PugMatchLog, vote: string) {
+  if (match.voteMode !== 'placements') return `Team ${Number(vote) + 1}`;
+  const [first, second] = vote.split(',');
+  return `1st: ${first ? `Team ${Number(first) + 1}` : '—'}, 2nd: ${second ? `Team ${Number(second) + 1}` : '—'}`;
+}
+
+function formatPugTeamsForInput(match: PugMatchLog) {
+  const teams = match.teams.length ? match.teams : [];
+  return teams.map((team) => team.join(' ')).join('\n');
+}
+
+function parsePugTeams(value: string) {
+  return value.split(/\r?\n/).map((line) => parseDiscordIds(line)).filter((team) => team.length);
+}
+
+function parseDiscordIds(value: string) {
+  return [...value.matchAll(/\d{5,}/g)].map((match) => match[0]);
+}
+
+function pugQueueLabel(size: number) {
+  return size === 12 ? '12-player PUG' : '6-player PUG';
+}
+
+function modeLabel(mode: string) {
+  return mode === 'captains' ? 'Captains' : 'Random teams';
 }
 
 function developerPage(
@@ -1739,6 +1892,11 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .log-warn span:nth-child(2) { color: #ffd166; }
     .admin-team-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; flex-wrap: wrap; }
     .admin-team-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+    .pug-admin-match { display: grid; gap: .85rem; background: rgba(255,255,255,.025); border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
+    .pug-admin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
+    .pug-admin-grid h3 { margin: 0 0 .45rem; }
+    .pug-player { display: block; margin: .2rem 0; }
+    .pug-history { display: grid; gap: 1rem; }
     .member-info { flex: 1 1 12rem; }
     .member img, .managed-member img, .avatar-placeholder { width: 38px; height: 38px; border-radius: 999px; background: #2b2f38; object-fit: cover; }
     .profile-card { display: flex; align-items: center; gap: 1.25rem; }

@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugMatchLog, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -9,6 +9,7 @@ const initialStore: StoreShape = {
   invites: [],
   events: [],
   eventRegistrations: [],
+  pugMatchLogs: [],
   settings: {}
 };
 
@@ -131,6 +132,44 @@ export class JsonStore {
       data.events = data.events.filter((event) => event.id !== eventId);
       if (data.events.length === before) throw new Error('Event not found.');
       data.eventRegistrations = data.eventRegistrations.filter((registration) => registration.eventId !== eventId);
+      return data;
+    });
+  }
+
+
+  async getPugMatchLogs() {
+    const data = await this.read();
+    return [...data.pugMatchLogs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async getPugMatchLog(matchId: string) {
+    const data = await this.read();
+    return data.pugMatchLogs.find((match) => match.id === matchId);
+  }
+
+  async upsertPugMatchLog(match: PugMatchLog) {
+    await this.update((data) => {
+      const index = data.pugMatchLogs.findIndex((item) => item.id === match.id);
+      if (index >= 0) data.pugMatchLogs[index] = match;
+      else data.pugMatchLogs.push(match);
+      return data;
+    });
+  }
+
+  async updatePugMatchLog(matchId: string, updates: Partial<PugMatchLog>) {
+    await this.update((data) => {
+      const match = data.pugMatchLogs.find((item) => item.id === matchId);
+      if (!match) throw new Error('PUG match log not found.');
+      Object.assign(match, updates, { updatedAt: updates.updatedAt ?? new Date().toISOString() });
+      return data;
+    });
+  }
+
+  async removePugMatchLog(matchId: string) {
+    await this.update((data) => {
+      const before = data.pugMatchLogs.length;
+      data.pugMatchLogs = data.pugMatchLogs.filter((match) => match.id !== matchId);
+      if (data.pugMatchLogs.length === before) throw new Error('PUG match log not found.');
       return data;
     });
   }
@@ -387,6 +426,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     invites: data.invites ?? [],
     events: data.events ?? [],
     eventRegistrations: data.eventRegistrations ?? [],
+    pugMatchLogs: Array.isArray(data.pugMatchLogs) ? data.pugMatchLogs.map(normalizePugMatchLog) : [],
     settings: { ...data.settings, pugs: normalizePugSettings(data.settings?.pugs) }
   };
 
@@ -425,6 +465,31 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
   }
 
   return normalized;
+}
+
+function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
+  const now = new Date().toISOString();
+  return {
+    id: typeof match.id === 'string' ? match.id : cryptoRandomFallback(),
+    size: match.size === 12 ? 12 : 6,
+    playerIds: Array.isArray(match.playerIds) ? match.playerIds.filter((id): id is string => typeof id === 'string') : [],
+    playerUsernames: match.playerUsernames && typeof match.playerUsernames === 'object' && !Array.isArray(match.playerUsernames) ? Object.fromEntries(Object.entries(match.playerUsernames).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {},
+    teams: Array.isArray(match.teams) ? match.teams.map((team) => Array.isArray(team) ? team.filter((id): id is string => typeof id === 'string') : []) : [],
+    captainIds: Array.isArray(match.captainIds) ? match.captainIds.filter((id): id is string => typeof id === 'string') : [],
+    mode: match.mode === 'captains' || match.mode === 'random' ? match.mode : undefined,
+    map: typeof match.map === 'string' ? match.map : undefined,
+    voteMode: match.voteMode === 'winner' || match.voteMode === 'placements' ? match.voteMode : undefined,
+    votes: match.votes && typeof match.votes === 'object' && !Array.isArray(match.votes) ? Object.fromEntries(Object.entries(match.votes).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {},
+    result: typeof match.result === 'string' ? match.result : undefined,
+    status: match.status === 'completed' || match.status === 'reset' || match.status === 'deleted' ? match.status : 'ongoing',
+    createdAt: typeof match.createdAt === 'string' ? match.createdAt : now,
+    updatedAt: typeof match.updatedAt === 'string' ? match.updatedAt : now,
+    endedAt: typeof match.endedAt === 'string' ? match.endedAt : undefined
+  };
+}
+
+function cryptoRandomFallback() {
+  return `legacy-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSettings {
