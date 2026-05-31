@@ -106,6 +106,12 @@ run_local_update() {
 cd "$SCRIPT_DIR"
 say "$APP_NAME updater"
 
+if [[ ! -d .git && -n "${DISCORD_TEAM_HUB_REPO_DIR:-}" && -d "$DISCORD_TEAM_HUB_REPO_DIR/.git" ]]; then
+  note "Switching from bundled app directory ($SCRIPT_DIR) to repository checkout: $DISCORD_TEAM_HUB_REPO_DIR"
+  cd "$DISCORD_TEAM_HUB_REPO_DIR"
+  SCRIPT_DIR="$PWD"
+fi
+
 pull_latest
 
 case "$UPDATE_MODE" in

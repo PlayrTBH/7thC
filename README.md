@@ -176,7 +176,7 @@ From the installed repository directory, run one command:
 ./update.sh
 ```
 
-The updater preserves `.env` and `data/`, fetches the latest git changes, and then either rebuilds/restarts Docker Compose if that service exists or runs a local `npm install` and `npm run build`.
+The updater preserves `.env` and `data/`, fetches the latest git changes, and then either rebuilds/restarts Docker Compose if that service exists or runs a local `npm install` and `npm run build`. In Docker installs, the compose file mounts the repository checkout and Docker socket into the container so the developer panel can run the same updater from the real git checkout instead of the bundled `/app` directory.
 
 You can force a mode if needed:
 
@@ -190,6 +190,8 @@ If you installed with the default path from `install.sh`, this is usually:
 ```bash
 cd ~/discord-team-hub && ./update.sh
 ```
+
+If the developer-panel updater reports that `/app` is not a git checkout, update once from the repository directory with the command above. That rebuild picks up the Docker mount configuration required for future panel-triggered updates.
 
 ## Network troubleshooting
 
