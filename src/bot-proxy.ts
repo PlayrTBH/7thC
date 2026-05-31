@@ -40,7 +40,12 @@ const botMethods = [
   'transferTeamOwnership',
   'deleteTeam',
   'leaveTeam',
-  'publishPugQueueMessage'
+  'publishPugQueueMessage',
+  'getPugAdminState',
+  'deletePugMatch',
+  'resetPugMatch',
+  'forcePugTeams',
+  'forcePugCaptains'
 ] as const satisfies readonly (keyof TeamBotApi)[];
 
 export function createBotProxy(): TeamBotApi {

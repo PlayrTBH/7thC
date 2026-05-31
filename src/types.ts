@@ -81,6 +81,28 @@ export type PugSettings = {
   queueMessageId?: string;
 };
 
+export type PugTeamMode = 'random' | 'captains';
+export type PugVoteMode = 'winner' | 'placements';
+export type PugQueueSize = 6 | 12;
+
+export type PugMatchLog = {
+  id: string;
+  size: PugQueueSize;
+  playerIds: string[];
+  playerUsernames: Record<string, string>;
+  teams: string[][];
+  captainIds: string[];
+  mode?: PugTeamMode;
+  map?: string;
+  voteMode?: PugVoteMode;
+  votes: Record<string, string>;
+  result?: string;
+  status: 'ongoing' | 'completed' | 'reset' | 'deleted';
+  createdAt: string;
+  updatedAt: string;
+  endedAt?: string;
+};
+
 export type AdministratorSettings = {
   adminRoleId?: string;
   discordInviteUrl?: string;
@@ -94,5 +116,6 @@ export type StoreShape = {
   invites: TeamInvite[];
   events: Event[];
   eventRegistrations: EventRegistration[];
+  pugMatchLogs: PugMatchLog[];
   settings: AdministratorSettings;
 };
