@@ -1170,13 +1170,13 @@ function administratorPage(
           : '<p>No teams have been created yet.</p>'
       }
     </section>
-    <section class="card">
+    <section class="card" id="pugs">
       <h2>PUG administration</h2>
       <p><small>Review full PUG match history, inspect ongoing matches, delete or reset live matches, and force teams or captains from the dedicated administrator-only PUG section.</small></p>
       <a class="button" href="/administrator/pugs">Open PUG administration</a>
+      ${administratorPugSettingsForm(pugSettings)}
     </section>
-    ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}
-    ${administratorPugSettingsForm(pugSettings)}`;
+    ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}`;
 }
 
 function administratorTeamCard(team: Team, memberCount: number) {
@@ -1212,8 +1212,8 @@ function administratorSettingsForm(roles: Array<{ id: string; name: string; mana
 
 
 function administratorPugSettingsForm(settings?: PugSettings) {
-  return `<section class="card" id="pugs">
-    <h2>PUG queue settings</h2>
+  return `<div class="subsection">
+    <h3>PUG queue settings</h3>
     <p><small>Configure the Discord text channel where the bot posts the interactive PUG queue message and maintain the map pool used for completed lobbies.</small></p>
     <form method="post" action="/administrator/pugs" class="stack-form">
       <label>PUG queue text channel ID
@@ -1228,7 +1228,7 @@ function administratorPugSettingsForm(settings?: PugSettings) {
       <button type="submit">Publish queue message</button>
     </form>
     ${settings?.queueMessageId ? `<p><small>Current queue message ID: <code>${escapeHtml(settings.queueMessageId)}</code></small></p>` : ''}
-  </section>`;
+  </div>`;
 }
 
 
@@ -1838,6 +1838,8 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     input:focus, select:focus, textarea:focus { border-color: var(--red-strong); box-shadow: 0 0 0 3px rgba(239,35,60,.18); }
     input[type="color"] { width: 4rem; height: 2.6rem; padding: .2rem; vertical-align: middle; }
     .card { background: linear-gradient(180deg, rgba(32,35,43,.96), rgba(23,25,31,.96)); border: 1px solid rgba(255,255,255,.08); border-radius: 1.1rem; padding: 1.15rem; margin: 1rem 0; box-shadow: 0 18px 45px rgba(0,0,0,.24); }
+    .subsection { margin-top: 1.2rem; padding-top: 1.2rem; border-top: 1px solid rgba(255,255,255,.08); }
+    .subsection h3 { margin-top: 0; letter-spacing: -.02em; }
     .member-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; margin: 1rem 0; }
     .member, .managed-member { display: flex; align-items: center; gap: .75rem; background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .8rem; }
     .member-result { width: 100%; text-align: left; color: var(--text); box-shadow: none; }
