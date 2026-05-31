@@ -2,8 +2,12 @@ services:
   discord-team-hub:
     build: .
     env_file: .env
+    environment:
+      DISCORD_TEAM_HUB_REPO_DIR: ${PWD}
     ports:
       - "3000:3000"
     volumes:
+      - .:${PWD}
       - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

@@ -22,7 +22,9 @@ declare module 'express-session' {
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const UPDATE_SCRIPT_PATH = resolve(APP_ROOT, 'update.sh');
+const CONFIGURED_UPDATE_SCRIPT_PATH = process.env.UPDATE_SCRIPT_PATH ? resolve(process.env.UPDATE_SCRIPT_PATH) : undefined;
+const CONFIGURED_REPO_DIR = process.env.DISCORD_TEAM_HUB_REPO_DIR ? resolve(process.env.DISCORD_TEAM_HUB_REPO_DIR) : undefined;
+const UPDATE_SCRIPT_PATH = CONFIGURED_UPDATE_SCRIPT_PATH ?? resolve(CONFIGURED_REPO_DIR ?? APP_ROOT, 'update.sh');
 let activeUpdateProcess: ChildProcess | undefined;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
@@ -1190,7 +1192,7 @@ function developerPage(
 
     <section class="card danger-zone">
       <h2>Application update</h2>
-      <p>Runs <code>update.sh</code> from the app directory. Progress and failures are written to the web logs below.</p>
+      <p>Runs <code>update.sh</code> from the configured repository checkout. Progress and failures are written to the web logs below.</p>
       <form method="post" action="/developer/update" onsubmit="return confirm('Run update.sh now? This may rebuild or restart the running app.');">
         <button class="danger" type="submit">Update app</button>
       </form>
@@ -1236,12 +1238,12 @@ function startUpdateScript(developerUserId: string) {
   }
 
   if (!existsSync(UPDATE_SCRIPT_PATH)) {
-    throw new Error(`update.sh was not found at ${UPDATE_SCRIPT_PATH}. Rebuild the Docker image so the updater script is included.`);
+    throw new Error(`update.sh was not found at ${UPDATE_SCRIPT_PATH}. Rebuild the Docker image or check DISCORD_TEAM_HUB_REPO_DIR/UPDATE_SCRIPT_PATH.`);
   }
 
   console.warn(`Developer ${developerUserId} started update.sh from the web developer panel.`);
   const child = spawn(resolveBashExecutable(), [UPDATE_SCRIPT_PATH], {
-    cwd: APP_ROOT,
+    cwd: dirname(UPDATE_SCRIPT_PATH),
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
   });
