@@ -75,10 +75,17 @@ export type DeveloperSettings = {
   activityType?: BotActivityType;
 };
 
+export type PugSettings = {
+  queueChannelId?: string;
+  mapPool: string[];
+  queueMessageId?: string;
+};
+
 export type AdministratorSettings = {
   adminRoleId?: string;
   discordInviteUrl?: string;
   developer?: DeveloperSettings;
+  pugs?: PugSettings;
 };
 
 export type StoreShape = {

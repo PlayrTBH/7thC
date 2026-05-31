@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugSettings } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -332,7 +332,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
           memberCount: (await store.getTeamMembers(team.id)).length
         }))
       );
-      res.send(layout('Administrator', administratorPage(teamSummaries, access, roles, settings.adminRoleId), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+      res.send(layout('Administrator', administratorPage(teamSummaries, access, roles, settings.adminRoleId, settings.pugs), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -346,6 +346,33 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       }
       await store.updateAdministratorSettings({ adminRoleId });
       res.redirect('/administrator');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const existing = (await store.getAdministratorSettings()).pugs;
+      const pugs: PugSettings = {
+        queueChannelId: String(req.body.queueChannelId ?? '').trim() || undefined,
+        queueMessageId: existing?.queueMessageId,
+        mapPool: String(req.body.mapPool ?? '')
+          .split(/\r?\n|,/)
+          .map((map) => map.trim())
+          .filter(Boolean)
+      };
+      await store.updatePugSettings(pugs);
+      res.redirect('/administrator#pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/publish', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
+    try {
+      await bot.publishPugQueueMessage();
+      res.redirect('/administrator#pugs');
     } catch (error) {
       next(error);
     }
@@ -1085,7 +1112,8 @@ function administratorPage(
   teamSummaries: Array<{ team: Team; memberCount: number }>,
   access: AdministratorAccess,
   roles: Array<{ id: string; name: string; managed: boolean; position: number }>,
-  adminRoleId?: string
+  adminRoleId?: string,
+  pugSettings?: PugSettings
 ) {
   return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
@@ -1096,7 +1124,8 @@ function administratorPage(
           : '<p>No teams have been created yet.</p>'
       }
     </section>
-    ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}`;
+    ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}
+    ${administratorPugSettingsForm(pugSettings)}`;
 }
 
 function administratorTeamCard(team: Team, memberCount: number) {
@@ -1127,6 +1156,27 @@ function administratorSettingsForm(roles: Array<{ id: string; name: string; mana
       </label>
       <button type="submit">Save settings</button>
     </form>
+  </section>`;
+}
+
+
+function administratorPugSettingsForm(settings?: PugSettings) {
+  return `<section class="card" id="pugs">
+    <h2>PUG queue settings</h2>
+    <p><small>Configure the Discord text channel where the bot posts the interactive PUG queue message and maintain the map pool used for completed lobbies.</small></p>
+    <form method="post" action="/administrator/pugs" class="stack-form">
+      <label>PUG queue text channel ID
+        <input name="queueChannelId" value="${escapeHtml(settings?.queueChannelId ?? '')}" placeholder="Discord text channel ID" />
+      </label>
+      <label>Map pool
+        <textarea name="mapPool" rows="8" placeholder="One map per line">${escapeHtml((settings?.mapPool ?? []).join('\n'))}</textarea>
+      </label>
+      <button type="submit">Save PUG settings</button>
+    </form>
+    <form method="post" action="/administrator/pugs/publish" onsubmit="return confirm('Publish or refresh the PUG queue message in the configured channel?');">
+      <button type="submit">Publish queue message</button>
+    </form>
+    ${settings?.queueMessageId ? `<p><small>Current queue message ID: <code>${escapeHtml(settings.queueMessageId)}</code></small></p>` : ''}
   </section>`;
 }
 
