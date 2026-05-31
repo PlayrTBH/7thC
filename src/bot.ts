@@ -2,6 +2,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
   ChannelType,
   Client,
   Events,
@@ -23,6 +24,11 @@ import type { JsonStore } from './store.js';
 import type { BotActivityType, BotStatus, DeveloperSettings, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
+const pugQueueSizes = [6, 12] as const;
+type PugQueueSize = (typeof pugQueueSizes)[number];
+type PugQueuedPlayer = { userId: string; voiceChannelId?: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; voteMode?: 'winner' | 'placements'; votes: Map<string, string> };
+
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -40,16 +46,31 @@ const organizationalRoleConfig: Record<TeamMemberRole, { name: string; color: Co
 
 export class TeamBot {
   readonly client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.DirectMessages],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.DirectMessages],
     partials: [Partials.Channel]
   });
 
+  private readonly pugQueues = new Map<PugQueueSize, PugQueuedPlayer[]>();
+  private readonly pugMatches = new Map<string, PugMatch>();
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
   private restartOperation?: Promise<void>;
 
   constructor(private readonly store: JsonStore) {
     this.client.on(Events.InteractionCreate, async (interaction) => {
       if (!interaction.isButton()) return;
+      if (interaction.customId.startsWith('pug:')) {
+        try {
+          await this.handlePugInteraction(interaction);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unable to process this PUG action.';
+          if (interaction.deferred || interaction.replied) {
+            await interaction.followUp({ content: message, ephemeral: true });
+          } else {
+            await interaction.reply({ content: message, ephemeral: true });
+          }
+        }
+        return;
+      }
       if (!interaction.customId.startsWith('team-invite:')) return;
 
       const [, action, inviteId] = interaction.customId.split(':');
@@ -209,6 +230,265 @@ export class TeamBot {
           ]
         : []
     });
+  }
+
+
+  async publishPugQueueMessage() {
+    const settings = await this.store.getAdministratorSettings();
+    const pugs = settings.pugs;
+    if (!pugs?.queueChannelId) throw new Error('Configure a PUG queue channel before publishing the queue message.');
+
+    const guild = await this.getGuild();
+    await assertBotPermissions(guild);
+    const channel = await guild.channels.fetch(pugs.queueChannelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) throw new Error('The configured PUG queue channel must be a text channel.');
+
+    const payload = this.buildPugQueueMessage();
+    if (pugs.queueMessageId) {
+      const existing = await channel.messages.fetch(pugs.queueMessageId).catch(() => null);
+      if (existing) {
+        await existing.edit(payload);
+        return existing.id;
+      }
+    }
+
+    const message = await channel.send(payload);
+    await this.store.updatePugSettings({ ...pugs, queueMessageId: message.id });
+    return message.id;
+  }
+
+  private buildPugQueueMessage() {
+    const embed = new EmbedBuilder()
+      .setTitle('PUG Queue')
+      .setDescription('Join a pickup-game queue. If you are already in a voice channel when the queue fills, the bot will move you into the match queue channel automatically.')
+      .setColor(0xc90820)
+      .addFields(
+        pugQueueSizes.map((size) => {
+          const queued = this.pugQueues.get(size) ?? [];
+          return {
+            name: `${size}-player queue`,
+            value: queued.length ? `${queued.length}/${size}: ${queued.map((player) => `<@${player.userId}>`).join(', ')}` : `0/${size} players queued`,
+            inline: false
+          };
+        })
+      );
+
+    const rows = pugQueueSizes.map((size) =>
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`pug:join:${size}`).setLabel(`Join ${size}-player queue`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`pug:leave:${size}`).setLabel(`Leave ${size}-player queue`).setStyle(ButtonStyle.Secondary)
+      )
+    );
+
+    return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
+  }
+
+  private async refreshPugQueueMessage() {
+    const settings = await this.store.getAdministratorSettings();
+    const pugs = settings.pugs;
+    if (!pugs?.queueChannelId || !pugs.queueMessageId) return;
+    const guild = await this.getGuild();
+    const channel = await guild.channels.fetch(pugs.queueChannelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) return;
+    const message = await channel.messages.fetch(pugs.queueMessageId).catch(() => null);
+    await message?.edit(this.buildPugQueueMessage()).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
+  }
+
+  private async handlePugInteraction(interaction: import('discord.js').ButtonInteraction) {
+    const [, action, first, second] = interaction.customId.split(':');
+    if (action === 'join' || action === 'leave') {
+      const size = Number(first) as PugQueueSize;
+      if (!pugQueueSizes.includes(size)) throw new Error('Unknown PUG queue size.');
+      if (action === 'join') await this.joinPugQueue(interaction, size);
+      if (action === 'leave') await this.leavePugQueue(interaction, size);
+      return;
+    }
+
+    if (action === 'mode') {
+      await this.choosePugMode(interaction, first, second === 'captains' ? 'captains' : 'random');
+      return;
+    }
+
+    if (action === 'vote' || action === 'vote2') {
+      await this.recordPugVote(interaction, first, Number(second), action === 'vote2');
+      return;
+    }
+  }
+
+  private async joinPugQueue(interaction: import('discord.js').ButtonInteraction, size: PugQueueSize) {
+    const guild = await this.getGuild();
+    const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member || member.user.bot) throw new Error('Only server members can join the PUG queue.');
+
+    for (const [queueSize, players] of this.pugQueues) {
+      const existingIndex = players.findIndex((player) => player.userId === member.id);
+      if (existingIndex >= 0) players.splice(existingIndex, 1);
+      if (!players.length) this.pugQueues.delete(queueSize);
+    }
+
+    const queue = this.pugQueues.get(size) ?? [];
+    queue.push({ userId: member.id, voiceChannelId: member.voice.channelId ?? undefined });
+    this.pugQueues.set(size, queue);
+    await this.refreshPugQueueMessage();
+    await interaction.reply({ content: `You joined the ${size}-player PUG queue (${queue.length}/${size}).`, ephemeral: true });
+
+    if (queue.length >= size) {
+      const players = queue.splice(0, size);
+      if (!queue.length) this.pugQueues.delete(size);
+      await this.refreshPugQueueMessage();
+      await this.startPugMatch(guild, size, players);
+    }
+  }
+
+  private async leavePugQueue(interaction: import('discord.js').ButtonInteraction, size: PugQueueSize) {
+    const queue = this.pugQueues.get(size) ?? [];
+    const before = queue.length;
+    const filtered = queue.filter((player) => player.userId !== interaction.user.id);
+    if (filtered.length) this.pugQueues.set(size, filtered);
+    else this.pugQueues.delete(size);
+    await this.refreshPugQueueMessage();
+    await interaction.reply({ content: before === filtered.length ? 'You were not in that PUG queue.' : `You left the ${size}-player PUG queue.`, ephemeral: true });
+  }
+
+  private async startPugMatch(guild: Guild, size: PugQueueSize, players: PugQueuedPlayer[]) {
+    await assertBotPermissions(guild);
+    const matchId = randomUUID();
+    const playerIds = players.map((player) => player.userId);
+    const overwrites = [
+      { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] },
+      ...playerIds.map((userId) => ({ id: userId, type: OverwriteType.Member, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }))
+    ];
+
+    const lobby = await this.ensurePugLobbyChannel(guild);
+    const category = await guild.channels.create({ name: `PUG Match ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`, type: ChannelType.GuildCategory, permissionOverwrites: overwrites, reason: 'PUG match category created when queue filled' });
+    const queueVoice = await guild.channels.create({ name: 'queue', type: ChannelType.GuildVoice, parent: category.id, permissionOverwrites: overwrites, reason: 'PUG queue voice channel created when queue filled' });
+    const text = await guild.channels.create({ name: 'pug-match', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites, topic: `PUG match ${matchId}`, reason: 'PUG match text channel created when queue filled' });
+
+    const match: PugMatch = { id: matchId, size, playerIds, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], votes: new Map() };
+    this.pugMatches.set(matchId, match);
+
+    await Promise.all(players.map(async (player) => {
+      const member = await guild.members.fetch(player.userId).catch(() => null);
+      if (!member) return;
+      if (player.voiceChannelId && member.voice.channelId) {
+        await member.voice.setChannel(queueVoice, 'PUG queue filled').catch((error) => console.warn(`Unable to move PUG player ${player.userId}:`, error));
+        return;
+      }
+      await member.send({ content: `Your PUG queue is ready in **${guild.name}**. Join ${queueVoice.toString()} so the match can begin.` }).catch((error) => console.warn(`Unable to DM PUG player ${player.userId}:`, error));
+    }));
+
+    const modeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`pug:mode:${matchId}:random`).setLabel('Random teams').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`pug:mode:${matchId}:captains`).setLabel('Captains').setStyle(ButtonStyle.Primary)
+    );
+    await text.send({ content: `${playerIds.map((id) => `<@${id}>`).join(' ')} PUG queue is full. Waiting for everyone to join ${queueVoice.toString()} before team selection starts.`, allowedMentions: { users: playerIds } });
+    await this.waitForPugPlayersInQueue(guild, match);
+    await text.send({ content: `${playerIds.map((id) => `<@${id}>`).join(' ')} everyone is in the queue voice channel. Choose how teams should be created.`, components: [modeRow], allowedMentions: { users: playerIds } });
+  }
+
+  private async waitForPugPlayersInQueue(guild: Guild, match: PugMatch) {
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const members = await Promise.all(match.playerIds.map((userId) => guild.members.fetch(userId).catch(() => null)));
+      if (members.every((member) => member?.voice.channelId === match.queueVoiceChannelId)) return;
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+
+    const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (channel?.type === ChannelType.GuildText) {
+      await channel.send('Not every queued player joined the queue voice channel within 10 minutes. Continuing with team selection for the queued match.').catch(() => undefined);
+    }
+  }
+
+  private async choosePugMode(interaction: import('discord.js').ButtonInteraction, matchId: string, mode: 'random' | 'captains') {
+    const match = this.pugMatches.get(matchId);
+    if (!match) throw new Error('This PUG match is no longer active.');
+    if (!match.playerIds.includes(interaction.user.id)) throw new Error('Only queued players can choose the team mode.');
+    await interaction.deferUpdate();
+
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG text channel no longer exists.');
+
+    const teams = mode === 'captains' ? createCaptainTeams(match.playerIds, match.size) : createRandomTeams(match.playerIds, match.size);
+    const map = await this.pickPugMap();
+    await this.createPugTeamVoiceChannels(guild, match, teams);
+
+    await text.send({
+      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${mode === 'captains' ? 'Captains-style balanced teams' : 'Random teams'} have been created.${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id) => `<@${id}>`).join('\n') || 'No players', inline: true })))],
+      allowedMentions: { users: match.playerIds }
+    });
+    await this.sendPugVotePrompt(text, match, teams.length);
+  }
+
+  private async createPugTeamVoiceChannels(guild: Guild, match: PugMatch, teams: string[][]) {
+    for (const [index, team] of teams.entries()) {
+      const channel = await guild.channels.create({ name: `Team ${index + 1}`, type: ChannelType.GuildVoice, parent: match.categoryId, reason: 'PUG team voice channel created' });
+      match.teamVoiceChannelIds.push(channel.id);
+      await Promise.all(team.map(async (userId) => {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member?.voice.channelId) await member.voice.setChannel(channel, 'PUG teams assigned').catch(() => undefined);
+      }));
+    }
+  }
+
+  private async pickPugMap() {
+    const settings = await this.store.getAdministratorSettings();
+    const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
+    if (!maps.length) return undefined;
+    return maps[Math.floor(Math.random() * maps.length)];
+  }
+
+  private async sendPugVotePrompt(text: import('discord.js').TextChannel, match: PugMatch, teamCount: number) {
+    match.voteMode = teamCount === 2 ? 'winner' : 'placements';
+    const rows = buildPugVoteRows(match.id, teamCount, match.voteMode);
+    await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team.' : 'Vote for first and second place. A majority on matching placements ends the match.', components: rows });
+  }
+
+  private async recordPugVote(interaction: import('discord.js').ButtonInteraction, matchId: string, teamIndex: number, secondPlace: boolean) {
+    const match = this.pugMatches.get(matchId);
+    if (!match) throw new Error('This PUG match is no longer active.');
+    if (!match.playerIds.includes(interaction.user.id)) throw new Error('Only queued players can vote on this PUG match.');
+    if (!Number.isInteger(teamIndex) || teamIndex < 0) throw new Error('Unknown team vote.');
+
+    const previous = match.votes.get(interaction.user.id) ?? '';
+    const parts = previous.split(',');
+    if (match.voteMode === 'winner') {
+      match.votes.set(interaction.user.id, String(teamIndex));
+    } else {
+      parts[secondPlace ? 1 : 0] = String(teamIndex);
+      if (parts[0] && parts[1] && parts[0] === parts[1]) throw new Error('First and second place must be different teams.');
+      match.votes.set(interaction.user.id, parts.join(','));
+    }
+
+    await interaction.reply({ content: 'Vote recorded.', ephemeral: true });
+    const winningVote = majorityVote(match);
+    if (!winningVote) return;
+    await this.endPugMatch(match, winningVote);
+  }
+
+  private async endPugMatch(match: PugMatch, result: string) {
+    const guild = await this.getGuild();
+    const lobby = await this.ensurePugLobbyChannel(guild);
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (text?.type === ChannelType.GuildText) await text.send(`PUG match ended. Result: ${result}. Cleaning up channels now.`).catch(() => undefined);
+
+    await Promise.all(match.playerIds.map(async (userId) => {
+      const member = await guild.members.fetch(userId).catch(() => null);
+      if (member?.voice.channelId) await member.voice.setChannel(lobby, 'PUG match ended').catch(() => undefined);
+    }));
+
+    for (const channelId of [...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
+      await guild.channels.delete(channelId, 'PUG match ended').catch(() => undefined);
+    }
+    this.pugMatches.delete(match.id);
+  }
+
+  private async ensurePugLobbyChannel(guild: Guild) {
+    const channels = await guild.channels.fetch();
+    const existing = channels.find((channel) => channel?.type === ChannelType.GuildVoice && channel.name === 'PUG Lobby');
+    if (existing && existing.type === ChannelType.GuildVoice) return existing;
+    return guild.channels.create({ name: 'PUG Lobby', type: ChannelType.GuildVoice, reason: 'Persistent PUG lobby channel created by queue system' });
   }
 
   async ensureTeamRolesDisplayed() {
@@ -699,6 +979,62 @@ export class TeamBot {
   }
 }
 
+
+function createRandomTeams(playerIds: string[], size: PugQueueSize) {
+  const shuffled = shuffle(playerIds);
+  const teamCount = size === 6 ? 2 : 4;
+  const teams = Array.from({ length: teamCount }, () => [] as string[]);
+  shuffled.forEach((playerId, index) => teams[index % teamCount].push(playerId));
+  return teams;
+}
+
+function createCaptainTeams(playerIds: string[], size: PugQueueSize) {
+  const shuffled = shuffle(playerIds);
+  const teamCount = size === 6 ? 2 : 4;
+  const teams = Array.from({ length: teamCount }, () => [] as string[]);
+  shuffled.slice(0, teamCount).forEach((captainId, index) => teams[index].push(captainId));
+  shuffled.slice(teamCount).forEach((playerId, index) => teams[index % teamCount].push(playerId));
+  return teams;
+}
+
+function shuffle(values: string[]) {
+  const shuffled = [...values];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
+function buildPugVoteRows(matchId: string, teamCount: number, voteMode: 'winner' | 'placements') {
+  const winnerRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    Array.from({ length: teamCount }, (_, index) => new ButtonBuilder().setCustomId(`pug:vote:${matchId}:${index}`).setLabel(`${voteMode === 'winner' ? 'Winner' : 'First'}: Team ${index + 1}`).setStyle(ButtonStyle.Primary))
+  );
+  if (voteMode === 'winner') return [winnerRow];
+  return [
+    winnerRow,
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      Array.from({ length: teamCount }, (_, index) => new ButtonBuilder().setCustomId(`pug:vote2:${matchId}:${index}`).setLabel(`Second: Team ${index + 1}`).setStyle(ButtonStyle.Secondary))
+    )
+  ];
+}
+
+function majorityVote(match: PugMatch) {
+  const threshold = Math.floor(match.playerIds.length / 2) + 1;
+  const counts = new Map<string, number>();
+  for (const vote of match.votes.values()) {
+    if (!vote || vote.endsWith(',') || vote.startsWith(',')) continue;
+    counts.set(vote, (counts.get(vote) ?? 0) + 1);
+  }
+  for (const [vote, count] of counts) {
+    if (count < threshold) continue;
+    if (match.voteMode === 'winner') return `Team ${Number(vote) + 1} wins`;
+    const [first, second] = vote.split(',').map((value) => Number(value) + 1);
+    return `Team ${first} first place, Team ${second} second place`;
+  }
+  return undefined;
+}
+
 function normalizeTeamName(teamName: string) {
   const normalized = teamName.trim().replace(/\s+/g, ' ').slice(0, 80);
   if (normalized.length < 2) throw new Error('Team name must be at least 2 characters.');
@@ -746,9 +1082,9 @@ async function renameGuildChannel(guild: Guild, channelId: string, name: string,
 
 async function assertBotPermissions(guild: Guild) {
   const me = await guild.members.fetchMe();
-  const needed = [PermissionsBitField.Flags.ManageRoles, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.CreateInstantInvite];
+  const needed = [PermissionsBitField.Flags.ManageRoles, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.MoveMembers, PermissionsBitField.Flags.CreateInstantInvite];
   if (!me.permissions.has(needed)) {
-    throw new Error('Bot needs Manage Roles, Manage Channels, and Create Instant Invite permissions.');
+    throw new Error('Bot needs Manage Roles, Manage Channels, Move Members, and Create Instant Invite permissions.');
   }
 }
 
@@ -762,6 +1098,7 @@ export type TeamBotApi = Pick<
   | 'getDeveloperStats'
   | 'restart'
   | 'updateDeveloperSettings'
+  | 'publishPugQueueMessage'
   | 'searchInvitableMembers'
   | 'createTeam'
   | 'getTeamInviteDetails'

@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -143,6 +143,13 @@ export class JsonStore {
   async updateAdministratorSettings(settings: AdministratorSettings) {
     await this.update((data) => {
       data.settings = { ...data.settings, ...settings };
+      return data;
+    });
+  }
+
+  async updatePugSettings(pugs: PugSettings) {
+    await this.update((data) => {
+      data.settings = { ...data.settings, pugs };
       return data;
     });
   }
@@ -380,7 +387,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     invites: data.invites ?? [],
     events: data.events ?? [],
     eventRegistrations: data.eventRegistrations ?? [],
-    settings: data.settings ?? {}
+    settings: { ...data.settings, pugs: normalizePugSettings(data.settings?.pugs) }
   };
 
   for (const team of normalized.teams) {
@@ -418,4 +425,12 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
   }
 
   return normalized;
+}
+
+function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSettings {
+  return {
+    queueChannelId: settings?.queueChannelId,
+    queueMessageId: settings?.queueMessageId,
+    mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : []
+  };
 }
