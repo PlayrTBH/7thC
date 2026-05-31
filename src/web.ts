@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -1234,8 +1235,12 @@ function startUpdateScript(developerUserId: string) {
     throw new Error('An update is already running. Check the web logs for progress.');
   }
 
+  if (!existsSync(UPDATE_SCRIPT_PATH)) {
+    throw new Error(`update.sh was not found at ${UPDATE_SCRIPT_PATH}. Rebuild the Docker image so the updater script is included.`);
+  }
+
   console.warn(`Developer ${developerUserId} started update.sh from the web developer panel.`);
-  const child = spawn('bash', [UPDATE_SCRIPT_PATH], {
+  const child = spawn(resolveBashExecutable(), [UPDATE_SCRIPT_PATH], {
     cwd: APP_ROOT,
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
@@ -1258,6 +1263,20 @@ function startUpdateScript(developerUserId: string) {
     }
     console.error(`update.sh exited with ${signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`}.`);
   });
+}
+
+function resolveBashExecutable() {
+  if (process.env.BASH_PATH) {
+    return process.env.BASH_PATH;
+  }
+
+  for (const candidate of ['/bin/bash', '/usr/bin/bash']) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return 'bash';
 }
 
 function writeUpdateLogChunk(level: 'info' | 'error', chunk: string) {
