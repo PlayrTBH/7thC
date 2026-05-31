@@ -1,9 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import session from 'express-session';
 import { config, DEVELOPER_DISCORD_USER_ID, discordRedirectUri } from './config.js';
@@ -21,11 +17,6 @@ declare module 'express-session' {
 }
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const CONFIGURED_UPDATE_SCRIPT_PATH = process.env.UPDATE_SCRIPT_PATH ? resolve(process.env.UPDATE_SCRIPT_PATH) : undefined;
-const CONFIGURED_REPO_DIR = process.env.DISCORD_TEAM_HUB_REPO_DIR ? resolve(process.env.DISCORD_TEAM_HUB_REPO_DIR) : undefined;
-const UPDATE_SCRIPT_PATH = CONFIGURED_UPDATE_SCRIPT_PATH ?? resolve(CONFIGURED_REPO_DIR ?? APP_ROOT, 'update.sh');
-let activeUpdateProcess: ChildProcess | undefined;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
@@ -380,15 +371,6 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       await bot.restart();
       res.redirect('/developer');
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post('/developer/update', requireAuth, requireDeveloper, (req, res, next) => {
-    try {
-      startUpdateScript(req.session.discordUser!.id);
-      res.redirect('/developer#logs');
     } catch (error) {
       next(error);
     }
@@ -1190,14 +1172,6 @@ function developerPage(
       </form>
     </section>
 
-    <section class="card danger-zone">
-      <h2>Application update</h2>
-      <p>Runs <code>update.sh</code> from the configured repository checkout. Progress and failures are written to the web logs below.</p>
-      <form method="post" action="/developer/update" onsubmit="return confirm('Run update.sh now? This may rebuild or restart the running app.');">
-        <button class="danger" type="submit">Update app</button>
-      </form>
-    </section>
-
     <section class="card">
       <h2>Bot configuration</h2>
       <p><small>Runtime presence settings are stored in the JSON data file and reapplied whenever the bot starts.</small></p>
@@ -1230,66 +1204,6 @@ function developerPage(
       </div>
       <div class="log-viewer">${logs.length ? logs.map(logRow).join('') : '<p>No logs captured yet.</p>'}</div>
     </section>`;
-}
-
-function startUpdateScript(developerUserId: string) {
-  if (activeUpdateProcess) {
-    throw new Error('An update is already running. Check the web logs for progress.');
-  }
-
-  if (!existsSync(UPDATE_SCRIPT_PATH)) {
-    throw new Error(`update.sh was not found at ${UPDATE_SCRIPT_PATH}. Rebuild the Docker image or check DISCORD_TEAM_HUB_REPO_DIR/UPDATE_SCRIPT_PATH.`);
-  }
-
-  console.warn(`Developer ${developerUserId} started update.sh from the web developer panel.`);
-  const child = spawn(resolveBashExecutable(), [UPDATE_SCRIPT_PATH], {
-    cwd: dirname(UPDATE_SCRIPT_PATH),
-    env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  activeUpdateProcess = child;
-
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (chunk: string) => writeUpdateLogChunk('info', chunk));
-  child.stderr.on('data', (chunk: string) => writeUpdateLogChunk('error', chunk));
-  child.on('error', (error) => {
-    activeUpdateProcess = undefined;
-    console.error('update.sh failed to start:', error);
-  });
-  child.on('close', (code, signal) => {
-    activeUpdateProcess = undefined;
-    if (code === 0) {
-      console.warn('update.sh completed successfully.');
-      return;
-    }
-    console.error(`update.sh exited with ${signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`}.`);
-  });
-}
-
-function resolveBashExecutable() {
-  if (process.env.BASH_PATH) {
-    return process.env.BASH_PATH;
-  }
-
-  for (const candidate of ['/bin/bash', '/usr/bin/bash']) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return 'bash';
-}
-
-function writeUpdateLogChunk(level: 'info' | 'error', chunk: string) {
-  for (const line of chunk.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    if (level === 'error') {
-      console.error(`[update.sh] ${line}`);
-    } else {
-      console.log(`[update.sh] ${line}`);
-    }
-  }
 }
 
 function statCard(label: string, value: string) {
