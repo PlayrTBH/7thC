@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankSettings, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -11,6 +11,9 @@ const initialStore: StoreShape = {
   eventRegistrations: [],
   pugMatchLogs: [],
   pugEloRatings: [],
+  pugSeasonLeaderboards: [],
+  pugUserBadges: [],
+  pugUserBadgeSelections: [],
   settings: {}
 };
 
@@ -186,6 +189,62 @@ export class JsonStore {
     return normalizePugRankSettings(data.settings.pugs?.ranks);
   }
 
+  async getPugSeasons() {
+    const data = await this.read();
+    return [...(data.settings.pugs?.seasons ?? [])].sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+  }
+
+  async getActivePugSeason() {
+    const data = await this.read();
+    return getActivePugSeason(data);
+  }
+
+  async getPugSeasonLeaderboards() {
+    const data = await this.read();
+    return [...data.pugSeasonLeaderboards].sort((a, b) => b.seasonLabel.localeCompare(a.seasonLabel) || a.placement - b.placement);
+  }
+
+  async getPugUserBadges(userId: string) {
+    const data = await this.read();
+    return data.pugUserBadges.filter((badge) => badge.userId === userId).sort((a, b) => b.awardedAt.localeCompare(a.awardedAt));
+  }
+
+  async getPugUserBadgeSelection(userId: string) {
+    const data = await this.read();
+    return data.pugUserBadgeSelections.find((selection) => selection.userId === userId)?.badgeIds ?? [];
+  }
+
+  async setPugUserBadgeSelection(userId: string, badgeIds: string[]) {
+    await this.update((data) => {
+      const owned = new Set(data.pugUserBadges.filter((badge) => badge.userId === userId).map((badge) => badge.id));
+      const safeBadgeIds = [...new Set(badgeIds.filter((badgeId) => owned.has(badgeId)))].slice(0, 6);
+      const now = new Date().toISOString();
+      const existing = data.pugUserBadgeSelections.find((selection) => selection.userId === userId);
+      if (existing) Object.assign(existing, { badgeIds: safeBadgeIds, updatedAt: now });
+      else data.pugUserBadgeSelections.push({ userId, badgeIds: safeBadgeIds, updatedAt: now });
+      return data;
+    });
+  }
+
+  async updatePugSeason(seasonId: string, updates: Pick<PugSeason, 'label' | 'endsAt' | 'badgeRewards'>) {
+    await this.update((data) => {
+      const season = data.settings.pugs?.seasons?.find((item) => item.id === seasonId);
+      if (!season) throw new Error('PUG season not found.');
+      if (season.status !== 'active') throw new Error('Only the active season can be configured.');
+      season.label = updates.label;
+      season.endsAt = updates.endsAt;
+      season.badgeRewards = updates.badgeRewards;
+      return data;
+    });
+  }
+
+  async endActivePugSeason(nextSeasonLabel?: string) {
+    await this.update((data) => {
+      finalizeActivePugSeason(data, new Date().toISOString(), nextSeasonLabel);
+      return data;
+    });
+  }
+
   async getPugEloLeaderboard(limit = 10) {
     const data = await this.read();
     return [...data.pugEloRatings]
@@ -208,13 +267,16 @@ export class JsonStore {
     await this.update((data) => {
       const now = new Date().toISOString();
       const safeRating = Math.max(0, Math.round(rating));
+      const seasonId = getActivePugSeason(data).id;
       const existing = data.pugEloRatings.find((item) => item.userId === userId);
       if (existing) {
         existing.rating = safeRating;
+        existing.peakRating = Math.max(existing.peakRating ?? safeRating, safeRating);
+        existing.seasonId = seasonId;
         if (username) existing.username = username;
         existing.updatedAt = now;
       } else {
-        data.pugEloRatings.push({ userId, username, rating: safeRating, updatedAt: now });
+        data.pugEloRatings.push({ userId, username, rating: safeRating, peakRating: safeRating, seasonId, updatedAt: now });
       }
       return data;
     });
@@ -227,9 +289,11 @@ export class JsonStore {
       const existing = data.pugEloRatings.find((item) => item.userId === userId);
       if (existing) {
         existing.rating = settings.startingRating;
+        existing.peakRating = settings.startingRating;
+        existing.seasonId = getActivePugSeason(data).id;
         existing.updatedAt = now;
       } else {
-        data.pugEloRatings.push({ userId, rating: settings.startingRating, updatedAt: now });
+        data.pugEloRatings.push({ userId, rating: settings.startingRating, peakRating: settings.startingRating, seasonId: getActivePugSeason(data).id, updatedAt: now });
       }
       return data;
     });
@@ -239,7 +303,8 @@ export class JsonStore {
     await this.update((data) => {
       const settings = normalizePugEloSettings(data.settings.pugs?.elo);
       const now = new Date().toISOString();
-      data.pugEloRatings = data.pugEloRatings.map((rating) => ({ ...rating, rating: settings.startingRating, updatedAt: now }));
+      const seasonId = getActivePugSeason(data).id;
+      data.pugEloRatings = data.pugEloRatings.map((rating) => ({ ...rating, rating: settings.startingRating, peakRating: settings.startingRating, seasonId, updatedAt: now }));
       return data;
     });
   }
@@ -251,10 +316,12 @@ export class JsonStore {
         const existing = data.pugEloRatings.find((rating) => rating.userId === change.userId);
         if (existing) {
           existing.rating = change.after;
+          existing.peakRating = Math.max(existing.peakRating ?? change.before, change.after);
+          existing.seasonId = getActivePugSeason(data).id;
           if (change.username) existing.username = change.username;
           existing.updatedAt = now;
         } else {
-          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: change.after, updatedAt: now });
+          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: change.after, peakRating: Math.max(change.before, change.after), seasonId: getActivePugSeason(data).id, updatedAt: now });
         }
       }
       return data;
@@ -280,7 +347,7 @@ export class JsonStore {
           if (change.username) existing.username = change.username;
           existing.updatedAt = now;
         } else {
-          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: rolledBackRating, updatedAt: now });
+          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: rolledBackRating, peakRating: rolledBackRating, seasonId: getActivePugSeason(data).id, updatedAt: now });
         }
       }
 
@@ -545,6 +612,9 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     eventRegistrations: data.eventRegistrations ?? [],
     pugMatchLogs: Array.isArray(data.pugMatchLogs) ? data.pugMatchLogs.map(normalizePugMatchLog) : [],
     pugEloRatings: Array.isArray(data.pugEloRatings) ? data.pugEloRatings.map(normalizePugEloRating).filter(Boolean) as PugEloRating[] : [],
+    pugSeasonLeaderboards: Array.isArray(data.pugSeasonLeaderboards) ? data.pugSeasonLeaderboards.map(normalizePugSeasonLeaderboardEntry).filter(Boolean) as PugSeasonLeaderboardEntry[] : [],
+    pugUserBadges: Array.isArray(data.pugUserBadges) ? data.pugUserBadges.map(normalizePugUserBadge).filter(Boolean) as PugUserBadge[] : [],
+    pugUserBadgeSelections: Array.isArray(data.pugUserBadgeSelections) ? data.pugUserBadgeSelections.map(normalizePugUserBadgeSelection).filter(Boolean) as PugUserBadgeSelection[] : [],
     settings: { ...data.settings, pugs: normalizePugSettings(data.settings?.pugs) }
   };
 
@@ -582,6 +652,8 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     if (owner) owner.role = 'captain';
   }
 
+  ensurePugSeasonState(normalized);
+
   return normalized;
 }
 
@@ -618,7 +690,8 @@ function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSe
     mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : [],
     queueMessageId: typeof settings?.queueMessageId === 'string' ? settings.queueMessageId : undefined,
     elo: normalizePugEloSettings(settings?.elo),
-    ranks: normalizePugRankSettings(settings?.ranks)
+    ranks: normalizePugRankSettings(settings?.ranks),
+    seasons: normalizePugSeasons(settings?.seasons)
   };
 }
 
@@ -678,6 +751,8 @@ function normalizePugEloRating(rating: Partial<PugEloRating>) {
     userId: rating.userId,
     username: typeof rating.username === 'string' ? rating.username : undefined,
     rating: typeof rating.rating === 'number' && Number.isFinite(rating.rating) ? Math.max(0, Math.round(rating.rating)) : 20000,
+    peakRating: typeof rating.peakRating === 'number' && Number.isFinite(rating.peakRating) ? Math.max(0, Math.round(rating.peakRating)) : (typeof rating.rating === 'number' && Number.isFinite(rating.rating) ? Math.max(0, Math.round(rating.rating)) : 20000),
+    seasonId: typeof rating.seasonId === 'string' ? rating.seasonId : undefined,
     updatedAt: typeof rating.updatedAt === 'string' ? rating.updatedAt : new Date().toISOString()
   };
 }
@@ -693,4 +768,161 @@ function normalizePugEloChange(change: Partial<PugEloChange>) {
     after: typeof change.after === 'number' && Number.isFinite(change.after) ? Math.round(change.after) : 20000,
     delta: typeof change.delta === 'number' && Number.isFinite(change.delta) ? Math.round(change.delta) : 0
   };
+}
+
+function normalizePugSeasons(seasons: Partial<PugSeason>[] | undefined): PugSeason[] {
+  const normalized = Array.isArray(seasons) ? seasons.map(normalizePugSeason).filter(Boolean) as PugSeason[] : [];
+  if (!normalized.some((season) => season.status === 'active')) normalized.push(defaultPugSeason());
+  let activeSeen = false;
+  return normalized
+    .sort((a, b) => a.startsAt.localeCompare(b.startsAt) || a.id.localeCompare(b.id))
+    .map((season) => {
+      if (season.status !== 'active') return season;
+      if (!activeSeen) {
+        activeSeen = true;
+        return season;
+      }
+      return { ...season, status: 'completed', endedAt: season.endedAt ?? season.startsAt };
+    });
+}
+
+function normalizePugSeason(season: Partial<PugSeason>) {
+  if (typeof season.id !== 'string' || !season.id.trim()) return undefined;
+  return {
+    id: season.id.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-') || 's1',
+    label: typeof season.label === 'string' && season.label.trim() ? season.label.trim().slice(0, 32) : season.id.trim().toUpperCase(),
+    status: season.status === 'completed' ? 'completed' as const : 'active' as const,
+    startsAt: typeof season.startsAt === 'string' ? season.startsAt : new Date().toISOString(),
+    endsAt: typeof season.endsAt === 'string' && season.endsAt ? season.endsAt : undefined,
+    endedAt: typeof season.endedAt === 'string' && season.endedAt ? season.endedAt : undefined,
+    badgeRewards: Array.isArray(season.badgeRewards) ? season.badgeRewards.map(normalizePugSeasonBadgeReward).filter(Boolean) as PugSeasonBadgeReward[] : []
+  };
+}
+
+function normalizePugSeasonBadgeReward(reward: Partial<PugSeasonBadgeReward>) {
+  if (typeof reward.rankId !== 'string' || !reward.rankId.trim()) return undefined;
+  return {
+    rankId: reward.rankId.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-'),
+    label: typeof reward.label === 'string' && reward.label.trim() ? reward.label.trim().slice(0, 64) : 'Season Badge',
+    abbreviation: typeof reward.abbreviation === 'string' && reward.abbreviation.trim() ? reward.abbreviation.trim().slice(0, 12) : undefined,
+    iconDataUrl: isImageDataUrl(reward.iconDataUrl) ? reward.iconDataUrl : undefined
+  };
+}
+
+function normalizePugSeasonLeaderboardEntry(entry: Partial<PugSeasonLeaderboardEntry>) {
+  if (typeof entry.seasonId !== 'string' || typeof entry.userId !== 'string') return undefined;
+  return {
+    seasonId: entry.seasonId,
+    seasonLabel: typeof entry.seasonLabel === 'string' ? entry.seasonLabel : entry.seasonId.toUpperCase(),
+    userId: entry.userId,
+    username: typeof entry.username === 'string' ? entry.username : undefined,
+    rating: typeof entry.rating === 'number' && Number.isFinite(entry.rating) ? Math.max(0, Math.round(entry.rating)) : 0,
+    rankId: typeof entry.rankId === 'string' ? entry.rankId : 'unranked',
+    rankLabel: typeof entry.rankLabel === 'string' ? entry.rankLabel : 'Unranked',
+    placement: typeof entry.placement === 'number' && Number.isInteger(entry.placement) ? Math.max(1, entry.placement) : 1
+  };
+}
+
+function normalizePugUserBadge(badge: Partial<PugUserBadge>) {
+  if (typeof badge.userId !== 'string' || typeof badge.seasonId !== 'string' || typeof badge.rankId !== 'string') return undefined;
+  return {
+    id: typeof badge.id === 'string' && badge.id ? badge.id : `${badge.userId}-${badge.seasonId}-${badge.rankId}`,
+    userId: badge.userId,
+    seasonId: badge.seasonId,
+    seasonLabel: typeof badge.seasonLabel === 'string' ? badge.seasonLabel : badge.seasonId.toUpperCase(),
+    rankId: badge.rankId,
+    rankLabel: typeof badge.rankLabel === 'string' ? badge.rankLabel : 'Unranked',
+    label: typeof badge.label === 'string' ? badge.label : 'Season Badge',
+    abbreviation: typeof badge.abbreviation === 'string' ? badge.abbreviation : undefined,
+    iconDataUrl: isImageDataUrl(badge.iconDataUrl) ? badge.iconDataUrl : undefined,
+    awardedAt: typeof badge.awardedAt === 'string' ? badge.awardedAt : new Date().toISOString()
+  };
+}
+
+function normalizePugUserBadgeSelection(selection: Partial<PugUserBadgeSelection>) {
+  if (typeof selection.userId !== 'string') return undefined;
+  return {
+    userId: selection.userId,
+    badgeIds: Array.isArray(selection.badgeIds) ? selection.badgeIds.filter((id): id is string => typeof id === 'string').slice(0, 6) : [],
+    updatedAt: typeof selection.updatedAt === 'string' ? selection.updatedAt : new Date().toISOString()
+  };
+}
+
+function defaultPugSeason(): PugSeason {
+  return { id: 's1', label: 'S1', status: 'active', startsAt: new Date().toISOString(), badgeRewards: [] };
+}
+
+function ensurePugSeasonState(data: StoreShape) {
+  data.settings.pugs = normalizePugSettings(data.settings.pugs);
+  const activeSeason = getActivePugSeason(data);
+  const settings = normalizePugEloSettings(data.settings.pugs.elo);
+  for (const rating of data.pugEloRatings) {
+    rating.seasonId = rating.seasonId ?? activeSeason.id;
+    rating.peakRating = Math.max(rating.peakRating ?? rating.rating ?? settings.startingRating, rating.rating ?? settings.startingRating);
+  }
+}
+
+function getActivePugSeason(data: StoreShape): PugSeason {
+  data.settings.pugs = normalizePugSettings(data.settings.pugs);
+  return data.settings.pugs.seasons?.find((season) => season.status === 'active') ?? data.settings.pugs.seasons![0];
+}
+
+function finalizeActivePugSeason(data: StoreShape, endedAt: string, nextSeasonLabel?: string) {
+  const activeSeason = getActivePugSeason(data);
+  if (!activeSeason) throw new Error('No active PUG season found.');
+  const rankSettings = normalizePugRankSettings(data.settings.pugs?.ranks);
+  const eloSettings = normalizePugEloSettings(data.settings.pugs?.elo);
+  const sortedRatings = [...data.pugEloRatings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
+  const masterUserIds = new Set(sortedRatings.slice(0, 3).map((rating) => rating.userId));
+  const rewards = completeSeasonBadgeRewards(activeSeason, rankSettings);
+
+  data.pugSeasonLeaderboards = data.pugSeasonLeaderboards.filter((entry) => entry.seasonId !== activeSeason.id);
+  data.pugSeasonLeaderboards.push(...sortedRatings.slice(0, 10).map((rating, index) => {
+    const rank = resolveSeasonRank(rating.rating, rankSettings, masterUserIds.has(rating.userId));
+    return { seasonId: activeSeason.id, seasonLabel: activeSeason.label, userId: rating.userId, username: rating.username, rating: rating.rating, rankId: rank.id, rankLabel: rank.label, placement: index + 1 };
+  }));
+
+  data.pugUserBadges = data.pugUserBadges.filter((badge) => badge.seasonId !== activeSeason.id);
+  for (const rating of sortedRatings) {
+    const finalIsMaster = masterUserIds.has(rating.userId);
+    const badgeRank = finalIsMaster ? resolveSeasonRank(rating.rating, rankSettings, true) : resolveSeasonRank(rating.peakRating ?? rating.rating, rankSettings, false);
+    const reward = rewards.find((item) => item.rankId === badgeRank.id) ?? defaultBadgeReward(activeSeason, badgeRank);
+    data.pugUserBadges.push({
+      id: `${rating.userId}-${activeSeason.id}-${badgeRank.id}`,
+      userId: rating.userId,
+      seasonId: activeSeason.id,
+      seasonLabel: activeSeason.label,
+      rankId: badgeRank.id,
+      rankLabel: badgeRank.label,
+      label: reward.label,
+      abbreviation: reward.abbreviation,
+      iconDataUrl: reward.iconDataUrl,
+      awardedAt: endedAt
+    });
+  }
+
+  activeSeason.status = 'completed';
+  activeSeason.endedAt = endedAt;
+  activeSeason.badgeRewards = rewards;
+  const nextIndex = Math.max(1, ...data.settings.pugs!.seasons!.map((season) => Number(season.id.match(/s(\d+)/)?.[1] ?? 0))) + 1;
+  const nextSeason: PugSeason = { id: `s${nextIndex}`, label: nextSeasonLabel?.trim().slice(0, 32) || `S${nextIndex}`, status: 'active', startsAt: endedAt, badgeRewards: completeSeasonBadgeRewards({ ...activeSeason, id: `s${nextIndex}`, label: nextSeasonLabel?.trim().slice(0, 32) || `S${nextIndex}`, badgeRewards: [] }, rankSettings) };
+  data.settings.pugs!.seasons!.push(nextSeason);
+  data.pugEloRatings = data.pugEloRatings.map((rating) => ({ ...rating, rating: eloSettings.startingRating, peakRating: eloSettings.startingRating, seasonId: nextSeason.id, updatedAt: endedAt }));
+}
+
+function completeSeasonBadgeRewards(season: PugSeason, rankSettings: PugRankSettings): PugSeasonBadgeReward[] {
+  const existing = new Map(season.badgeRewards.map((reward) => [reward.rankId, reward]));
+  const rankRewards = rankSettings.ranks.map((rank) => existing.get(rank.id) ?? defaultBadgeReward(season, rank));
+  const masterRank = { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', iconDataUrl: rankSettings.masterIconDataUrl };
+  return [...rankRewards, existing.get(masterRank.id) ?? defaultBadgeReward(season, masterRank)];
+}
+
+function defaultBadgeReward(season: Pick<PugSeason, 'label'>, rank: Pick<PugRankDefinition, 'id' | 'label' | 'abbreviation' | 'iconDataUrl'>): PugSeasonBadgeReward {
+  return { rankId: rank.id, label: `${season.label} ${rank.label}`, abbreviation: rank.abbreviation, iconDataUrl: rank.iconDataUrl };
+}
+
+function resolveSeasonRank(rating: number, settings: PugRankSettings, isMaster: boolean) {
+  if (isMaster) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating, iconDataUrl: settings.masterIconDataUrl };
+  const ranks = settings.ranks.filter((rank) => rank.id !== 'master-infernal');
+  return [...ranks].reverse().find((rank) => rating >= rank.minRating && (rank.maxRating === undefined || rating <= rank.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
 }
