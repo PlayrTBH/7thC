@@ -22,13 +22,13 @@ import {
 import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { BotActivityType, BotStatus, DeveloperSettings, PugMatchLog, PugQueueSize, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; createdAt: string; updatedAt: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -57,6 +57,18 @@ export class TeamBot {
 
   constructor(private readonly store: JsonStore) {
     this.client.on(Events.InteractionCreate, async (interaction) => {
+      if (interaction.isChatInputCommand()) {
+        if (interaction.commandName === 'elo') {
+          try {
+            await this.handleEloCommand(interaction);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Unable to look up your ELO.';
+            if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message }).catch(() => undefined);
+            else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => undefined);
+          }
+        }
+        return;
+      }
       if (!interaction.isButton()) return;
       if (interaction.customId.startsWith('pug:')) {
         try {
@@ -108,6 +120,7 @@ export class TeamBot {
     });
     await this.getGuildInviteUrl();
     await this.ensureTeamRolesDisplayed();
+    await this.registerPugCommands();
     await this.applyDeveloperSettings(await this.store.getDeveloperSettings());
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
   }
@@ -115,6 +128,21 @@ export class TeamBot {
   async getGuild() {
     const guild = await this.client.guilds.fetch(config.DISCORD_GUILD_ID);
     return guild.fetch();
+  }
+
+  private async registerPugCommands() {
+    const guild = await this.getGuild();
+    const definition = { name: 'elo', description: 'Show your persistent PUG ELO rating.' };
+    const commands = await guild.commands.fetch().catch(() => null);
+    const existing = commands?.find((command) => command.name === 'elo');
+    if (existing) await existing.edit(definition).catch((error) => console.warn('Unable to update /elo command:', error));
+    else await guild.commands.create(definition).catch((error) => console.warn('Unable to register /elo command:', error));
+  }
+
+  private async handleEloCommand(interaction: import('discord.js').ChatInputCommandInteraction) {
+    const rating = await this.store.getPugEloRating(interaction.user.id);
+    await this.store.setPugEloRating(interaction.user.id, rating.rating, interaction.user.username);
+    await interaction.reply({ content: `Your PUG ELO is **${formatElo(rating.rating)}**.`, flags: MessageFlags.Ephemeral });
   }
 
 
@@ -634,9 +662,12 @@ export class TeamBot {
     const guild = await this.getGuild();
     const lobby = await this.ensurePugLobbyChannel(guild);
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    const eloResult = await this.applyPugEloResult(match, result);
+    match.eloChanges = eloResult.changes;
+    match.teamEloTotals = eloResult.teamTotals;
     if (text?.type === ChannelType.GuildText) {
       await this.refreshPugResultVoteMessage(match);
-      await text.send(`PUG match ended. Result: ${result}. Cleaning up channels now.`).catch(() => undefined);
+      await text.send(`PUG match ended. Result: ${result}. ${formatPugEloSummary(eloResult.changes)} Cleaning up channels now.`).catch(() => undefined);
     }
 
     await Promise.all(match.playerIds.map(async (userId) => {
@@ -649,8 +680,24 @@ export class TeamBot {
     }
     const endedAt = new Date().toISOString();
     match.updatedAt = endedAt;
-    await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'completed', result, endedAt }));
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'completed', result, endedAt, eloChanges: match.eloChanges, teamEloTotals: match.teamEloTotals }));
     this.pugMatches.delete(match.id);
+  }
+
+
+  private async applyPugEloResult(match: PugMatch, result: string) {
+    if (!match.teams?.length) throw new Error('PUG teams were not available for ELO calculation.');
+    const settings = await this.store.getPugEloSettings();
+    const ratings = new Map<string, PugEloRating>();
+    await Promise.all(match.playerIds.map(async (userId) => {
+      ratings.set(userId, await this.store.getPugEloRating(userId));
+    }));
+
+    const placements = parsePugResultPlacements(result, match.teams.length);
+    const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
+    const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings);
+    await this.store.applyPugEloChanges(changes);
+    return { changes, teamTotals };
   }
 
   async getPugAdminState() {
@@ -689,6 +736,8 @@ export class TeamBot {
     match.map = undefined;
     match.voteMode = undefined;
     match.voteMessageId = undefined;
+    match.eloChanges = undefined;
+    match.teamEloTotals = undefined;
     match.votes.clear();
     match.updatedAt = new Date().toISOString();
 
@@ -735,6 +784,8 @@ export class TeamBot {
     match.map = undefined;
     match.voteMode = undefined;
     match.voteMessageId = undefined;
+    match.eloChanges = undefined;
+    match.teamEloTotals = undefined;
     match.votes.clear();
     const captainSet = new Set(uniqueCaptainIds);
     match.captainDraft = {
@@ -1301,6 +1352,74 @@ export class TeamBot {
   }
 }
 
+
+
+function parsePugResultPlacements(result: string, teamCount: number) {
+  const placements = Array.from({ length: teamCount }, () => teamCount);
+  const indexes = [...result.matchAll(/Team\s+(\d+)/gi)].map((match) => Number(match[1]) - 1).filter((index) => Number.isInteger(index) && index >= 0 && index < teamCount);
+  if (indexes[0] !== undefined) placements[indexes[0]] = 1;
+  if (teamCount > 2 && indexes[1] !== undefined && indexes[1] !== indexes[0]) placements[indexes[1]] = 2;
+  for (let index = 0; index < teamCount; index += 1) {
+    if (placements[index] === teamCount) placements[index] = teamCount === 2 ? 2 : 3;
+  }
+  return placements;
+}
+
+function calculatePugEloChanges(
+  teams: string[][],
+  placements: number[],
+  ratings: Map<string, PugEloRating>,
+  playerUsernames: Map<string, string>,
+  settings: PugEloSettings
+): PugEloChange[] {
+  const teamTotals = teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
+  return teams.flatMap((team, teamIndex) => {
+    const teamAverage = teamTotals[teamIndex] / Math.max(1, team.length);
+    const opponents = teams.flatMap((otherTeam, otherIndex) => otherIndex === teamIndex ? [] : otherTeam);
+    const opponentAverage = opponents.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0) / Math.max(1, opponents.length);
+    const placement = placements[teamIndex] ?? teams.length;
+    return team.map((userId) => {
+      const before = ratings.get(userId)?.rating ?? settings.startingRating;
+      const possibleGain = calculatePugEloGain(before, teamAverage, opponentAverage, settings);
+      const delta = placement === 1
+        ? possibleGain
+        : placement === 2 && teams.length > 2
+          ? Math.round(possibleGain / 2)
+          : -calculatePugEloLoss(before, teamAverage, opponentAverage, possibleGain, settings);
+      return {
+        userId,
+        username: playerUsernames.get(userId) ?? ratings.get(userId)?.username,
+        teamIndex,
+        placement,
+        before,
+        after: Math.max(0, before + delta),
+        delta
+      };
+    });
+  });
+}
+
+function calculatePugEloGain(playerRating: number, teamAverage: number, opponentAverage: number, settings: PugEloSettings) {
+  const teamFactor = Math.exp(((opponentAverage - teamAverage) / settings.startingRating) * settings.strength);
+  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
+  return Math.max(1, Math.min(2000, Math.round(settings.baseChange * teamFactor * playerFactor)));
+}
+
+function calculatePugEloLoss(playerRating: number, teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
+  const teamLossFactor = Math.exp(((teamAverage - opponentAverage) / settings.startingRating) * settings.strength);
+  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
+  const uncappedLoss = Math.max(1, Math.round(settings.baseChange * teamLossFactor * playerFactor));
+  return Math.min(possibleGain * 2, uncappedLoss);
+}
+
+function formatPugEloSummary(changes: PugEloChange[]) {
+  if (!changes.length) return 'No ELO changes were applied.';
+  return `ELO changes: ${changes.map((change) => `${change.username ?? change.userId} ${change.delta >= 0 ? '+' : ''}${change.delta}`).join(', ')}.`;
+}
+
+function formatElo(rating: number) {
+  return Math.round(rating).toLocaleString('en-US');
+}
 
 function getPugTeamCount(size: PugQueueSize) {
   return size === 6 ? 2 : 4;
