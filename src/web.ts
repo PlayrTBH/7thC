@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSettings } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -116,7 +116,9 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const [inviteUrl, member, administratorAccess] = await Promise.all([
         bot.getGuildInviteUrl(),
         bot.getGuildMember(user.id),
-        bot.getAdministratorAccess(user.id)
+        bot.getAdministratorAccess(user.id),
+        store.getPugSeasons(),
+        store.getPugRankSettings()
       ]);
       if (member) {
         res.redirect('/leaderboard');
@@ -135,8 +137,22 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/settings', requireAuth, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
-      const administratorAccess = await bot.getAdministratorAccess(user.id);
-      res.send(layout('Account settings', settingsPage(user), { user, isAdmin: administratorAccess.isAdmin, active: 'settings' }));
+      const [administratorAccess, badges, selectedBadgeIds] = await Promise.all([
+        bot.getAdministratorAccess(user.id),
+        store.getPugUserBadges(user.id),
+        store.getPugUserBadgeSelection(user.id)
+      ]);
+      res.send(layout('Account settings', settingsPage(user, badges, selectedBadgeIds), { user, isAdmin: administratorAccess.isAdmin, active: 'settings' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+
+  app.post('/settings/badges', requireAuth, async (req, res, next) => {
+    try {
+      await store.setPugUserBadgeSelection(req.session.discordUser!.id, formArray(req.body.badgeIds));
+      res.redirect('/settings#badges');
     } catch (error) {
       next(error);
     }
@@ -150,7 +166,9 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getEvents(),
         store.getEventRegistrationCounts(),
         store.getTeamForUser(user.id),
-        bot.getAdministratorAccess(user.id)
+        bot.getAdministratorAccess(user.id),
+        store.getPugSeasons(),
+        store.getPugRankSettings()
       ]);
       const userRegisteredEventIds = new Set(
         currentTeam
@@ -275,14 +293,16 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/leaderboard', requireAuth, async (req, res, next) => {
     try {
-      const [leaderboard, ownRating, administratorAccess, rankSettings, allRatings, history, eloSettings] = await Promise.all([
+      const [leaderboard, ownRating, administratorAccess, rankSettings, allRatings, history, eloSettings, activeSeason, seasonLeaderboards] = await Promise.all([
         store.getPugEloLeaderboard(10),
         store.getPugEloRating(req.session.discordUser!.id),
         bot.getAdministratorAccess(req.session.discordUser!.id),
         store.getPugRankSettings(),
         store.getPugEloRatings(),
         store.getPugMatchLogs(),
-        store.getPugEloSettings()
+        store.getPugEloSettings(),
+        store.getActivePugSeason(),
+        store.getPugSeasonLeaderboards()
       ]);
       const topMasterUserIds = new Set(allRatings.slice(0, 3).map((rating) => rating.userId));
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
@@ -294,7 +314,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '', rank: resolvePugRank(rating, rankSettings, topMasterUserIds) };
       });
       const playerSearch = buildLeaderboardPlayerSearchState(history, allRatings, eloSettings, leaderboard.map((rating) => rating.userId), String(req.query.q ?? ''));
-      res.send(layout('7th Circle Leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds), playerSearch), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      res.send(layout('7th Circle Leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds), playerSearch, activeSeason, seasonLeaderboards), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -399,7 +419,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
           .map((map) => map.trim())
           .filter(Boolean),
         elo: existing?.elo,
-        ranks: existing?.ranks
+        ranks: existing?.ranks,
+        seasons: existing?.seasons
       };
       await store.updatePugSettings(pugs);
       res.redirect('/administrator#pugs');
@@ -477,7 +498,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const elo = parsePugEloSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, ranks: existing?.ranks });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, ranks: existing?.ranks, seasons: existing?.seasons });
       res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
@@ -526,7 +547,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const ranks = parsePugRankSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, ranks });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, ranks, seasons: existing?.seasons });
       res.redirect('/administrator/ranks');
     } catch (error) {
       next(error);
@@ -536,18 +557,20 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/leaderboard/players/:userId', requireAuth, async (req, res, next) => {
     try {
       const userId = parseRequiredDiscordId(req.params.userId);
-      const [history, ratings, eloSettings, rankSettings, profiles, administratorAccess] = await Promise.all([
+      const [history, ratings, eloSettings, rankSettings, profiles, administratorAccess, badges, selectedBadgeIds] = await Promise.all([
         store.getPugMatchLogs(),
         store.getPugEloRatings(),
         store.getPugEloSettings(),
         store.getPugRankSettings(),
         bot.getGuildMemberProfiles([userId]),
-        bot.getAdministratorAccess(req.session.discordUser!.id)
+        bot.getAdministratorAccess(req.session.discordUser!.id),
+        store.getPugUserBadges(userId),
+        store.getPugUserBadgeSelection(userId)
       ]);
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
       const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, new Set(ratings.slice(0, 3).map((rating) => rating.userId)));
       const profile = profiles[0];
-      res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -557,14 +580,38 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/developer', requireAuth, requireDeveloper, async (req, res, next) => {
     try {
       const user = req.session.discordUser!;
-      const [stats, teams, settings, administratorAccess] = await Promise.all([
+      const [stats, teams, settings, administratorAccess, seasons, rankSettings] = await Promise.all([
         bot.getDeveloperStats(),
         store.getTeams(),
         store.getDeveloperSettings(),
-        bot.getAdministratorAccess(user.id)
+        bot.getAdministratorAccess(user.id),
+        store.getPugSeasons(),
+        store.getPugRankSettings()
       ]);
       const logs = getRecentLogs(250);
-      res.send(layout('Developer panel', developerPage(stats, teams.length, settings, logs), { user, isAdmin: administratorAccess.isAdmin, isDeveloper: true, active: 'developer' }));
+      res.send(layout('Developer panel', developerPage(stats, teams.length, settings, logs, seasons, rankSettings), { user, isAdmin: administratorAccess.isAdmin, isDeveloper: true, active: 'developer' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/developer/seasons/config', requireAuth, requireDeveloper, async (req, res, next) => {
+    try {
+      const seasonId = String(req.body.seasonId ?? '').trim();
+      const label = String(req.body.label ?? '').trim().slice(0, 32) || seasonId.toUpperCase();
+      const endsAt = parseOptionalDateTime(req.body.endsAt);
+      const badgeRewards = parsePugSeasonBadgeRewards(req.body);
+      await store.updatePugSeason(seasonId, { label, endsAt, badgeRewards });
+      res.redirect('/developer#seasons');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/developer/seasons/end', requireAuth, requireDeveloper, async (req, res, next) => {
+    try {
+      await store.endActivePugSeason(String(req.body.nextSeasonLabel ?? '').trim() || undefined);
+      res.redirect('/developer#seasons');
     } catch (error) {
       next(error);
     }
@@ -952,7 +999,7 @@ function joinDiscordPage(inviteUrl: string) {
     </section>`;
 }
 
-function settingsPage(user: DiscordUser) {
+function settingsPage(user: DiscordUser, badges: PugUserBadge[], selectedBadgeIds: string[]) {
   return `<section class="card profile-card">
     <img class="profile-avatar" src="${escapeHtml(discordAvatarUrl(user, 160))}" alt="" />
     <div>
@@ -962,6 +1009,11 @@ function settingsPage(user: DiscordUser) {
       <p>Use this page to confirm which Discord account is connected to 7th Circle.</p>
       <p><a class="button danger" href="/logout">Log out</a></p>
     </div>
+  </section>
+  <section class="card" id="badges">
+    <h2>Profile badges</h2>
+    <p><small>Select up to 6 season badges to show on your public player profile.</small></p>
+    ${badgeSelectionForm(badges, selectedBadgeIds)}
   </section>`;
 }
 
@@ -1532,12 +1584,14 @@ function parseDiscordIds(value: string) {
 
 type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string; rank: PugPlayerRank };
 
-function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank, playerSearch: LeaderboardPlayerSearchState) {
+function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank, playerSearch: LeaderboardPlayerSearchState, activeSeason: PugSeason, seasonLeaderboards: PugSeasonLeaderboardEntry[]) {
   return `<section class="card">
     <h2>Top 10 7th Circle players</h2>
+    <p><small>Active season: ${escapeHtml(activeSeason.label)}${activeSeason.endsAt ? ` · scheduled end ${formatDateTime(activeSeason.endsAt)}` : ' · no scheduled end date'}</small></p>
     ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
     ${leaderboardPlayerSearchPanel(playerSearch)}
   </section>
+  ${previousSeasonLeaderboardsSection(seasonLeaderboards)}
   <section class="card">
     <h2>Your PUG ELO</h2>
     <div class="stat-grid"><div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div><div class="stat-card"><small>Current rank</small><strong>${rankBadge(ownRank)}</strong></div></div>
@@ -1579,7 +1633,7 @@ function leaderboardEntry(rating: LeaderboardRating) {
   </li>`;
 }
 
-function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { displayName?: string; username?: string; avatarUrl?: string }) {
+function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile: { displayName?: string; username?: string; avatarUrl?: string } | undefined, badges: PugUserBadge[], selectedBadgeIds: string[]) {
   const displayName = profile?.displayName ?? stats.player.username ?? stats.player.userId;
   const profileClasses = ['card', 'leaderboard-profile-section', `profile-${rankClassId(stats.rank.id)}`];
   if (stats.rank.isMaster) profileClasses.push('profile-master');
@@ -1602,6 +1656,7 @@ function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { display
       <div class="stat-card"><small>Win/loss</small><strong>${stats.totals.wins}/${stats.totals.losses}</strong></div>
       <div class="stat-card"><small>Winrate</small><strong>${formatPercent(stats.totals.winRate)}</strong></div>
     </div>
+    ${displayedBadgesPanel(badges, selectedBadgeIds)}
     ${pugPlayerStatsTables(stats)}
   </section>`;
 }
@@ -1616,6 +1671,47 @@ function pugPlayerStatsTables(stats: PugPlayerStats) {
     ? `<div class="pug-player-stats-table pug-player-stats-table-with-seconds"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${cashoutModes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>`
     : '';
   return `<div class="pug-player-stats-tables">${finalRoundTable}${cashoutTable}</div>`;
+}
+
+
+function badgeSelectionForm(badges: PugUserBadge[], selectedBadgeIds: string[]) {
+  if (!badges.length) return '<p>No season badges have been earned yet. Badges are awarded when a PUG season ends.</p>';
+  const selected = new Set(selectedBadgeIds);
+  return `<form method="post" action="/settings/badges" class="badge-selection-form">
+    <div class="badge-grid">${badges.map((badge) => `<label class="badge-option">
+      <input type="checkbox" name="badgeIds" value="${escapeHtml(badge.id)}"${selected.has(badge.id) ? ' checked' : ''} />
+      ${seasonBadge(badge)}
+      <small>${escapeHtml(badge.rankLabel)} · awarded ${formatDateTime(badge.awardedAt)}</small>
+    </label>`).join('')}</div>
+    <button type="submit">Save shown badges</button>
+  </form>`;
+}
+
+function displayedBadgesPanel(badges: PugUserBadge[], selectedBadgeIds: string[]) {
+  const selected = selectedBadgeIds.length ? selectedBadgeIds : badges.slice(0, 6).map((badge) => badge.id);
+  const selectedSet = new Set(selected);
+  const shown = badges.filter((badge) => selectedSet.has(badge.id)).slice(0, 6);
+  if (!shown.length) return '<div class="profile-badges"><h3>Badges</h3><p><small>No badges are shown on this profile yet.</small></p></div>';
+  return `<div class="profile-badges"><h3>Badges</h3><div class="badge-grid badge-grid-compact">${shown.map(seasonBadge).join('')}</div></div>`;
+}
+
+function seasonBadge(badge: PugUserBadge) {
+  const icon = badge.iconDataUrl ? `<img class="rank-icon" src="${escapeHtml(badge.iconDataUrl)}" alt="" />` : '<span class="rank-icon rank-icon-empty"></span>';
+  return `<span class="season-badge rank-${rankClassId(badge.rankId)}">${icon}<span><strong>${escapeHtml(badge.label)}</strong><small>${escapeHtml(badge.seasonLabel)} · ${escapeHtml(badge.abbreviation ?? badge.rankLabel)}</small></span></span>`;
+}
+
+function previousSeasonLeaderboardsSection(entries: PugSeasonLeaderboardEntry[]) {
+  const bySeason = new Map<string, PugSeasonLeaderboardEntry[]>();
+  for (const entry of entries) {
+    if (!bySeason.has(entry.seasonId)) bySeason.set(entry.seasonId, []);
+    bySeason.get(entry.seasonId)!.push(entry);
+  }
+  const seasons = [...bySeason.entries()].slice(0, 5);
+  if (!seasons.length) return '';
+  return `<section class="card"><h2>Prior season top 10</h2><div class="season-leaderboards">${seasons.map(([, seasonEntries]) => {
+    const sorted = [...seasonEntries].sort((a, b) => a.placement - b.placement).slice(0, 10);
+    return `<div class="season-leaderboard"><h3>${escapeHtml(sorted[0]?.seasonLabel ?? 'Season')}</h3><ol class="leaderboard-list compact-leaderboard">${sorted.map((entry) => `<li class="leaderboard-entry"><span>#${entry.placement} ${escapeHtml(entry.username ?? entry.userId)}</span><span>${escapeHtml(entry.rankLabel)}</span><span>${formatElo(entry.rating)} ELO</span></li>`).join('')}</ol></div>`;
+  }).join('')}</div></section>`;
 }
 
 function rankBadge(rank: PugPlayerRank) {
@@ -1975,7 +2071,9 @@ function developerPage(
   stats: Awaited<ReturnType<TeamBotApi['getDeveloperStats']>>,
   teamCount: number,
   settings: { botStatus?: BotStatus; activityName?: string; activityType?: BotActivityType },
-  logs: CapturedLog[]
+  logs: CapturedLog[],
+  seasons: PugSeason[],
+  rankSettings: PugRankSettings
 ) {
   return `<p><a href="/events">← Back to events</a></p>
     <section class="card">
@@ -2004,6 +2102,8 @@ function developerPage(
       </div>
       <p><small>Server ID <code>${escapeHtml(stats.guild.id)}</code> · Owner ID <code>${escapeHtml(stats.guild.ownerId)}</code> · Bot <code>${escapeHtml(stats.bot.tag)}</code> (<code>${escapeHtml(stats.bot.id)}</code>)</small></p>
     </section>
+
+    ${developerSeasonsPanel(seasons, rankSettings)}
 
     <section class="card danger-zone">
       <h2>Restart bot connection</h2>
@@ -2045,6 +2145,91 @@ function developerPage(
       </div>
       <div class="log-viewer">${logs.length ? logs.map(logRow).join('') : '<p>No logs captured yet.</p>'}</div>
     </section>`;
+}
+
+
+function developerSeasonsPanel(seasons: PugSeason[], rankSettings: PugRankSettings) {
+  const active = seasons.find((season) => season.status === 'active') ?? seasons[seasons.length - 1];
+  if (!active) return '';
+  const rewards = completeWebSeasonRewards(active, rankSettings);
+  return `<section class="card" id="seasons">
+    <h2>PUG seasons</h2>
+    <p><small>Only the configured developer can change seasons. Seasons do not end unless you end them here; the optional end date is a planning label for staff.</small></p>
+    <div class="stat-grid">
+      <div class="stat-card"><small>Active season</small><strong>${escapeHtml(active.label)}</strong></div>
+      <div class="stat-card"><small>Started</small><strong>${formatDateTime(active.startsAt)}</strong></div>
+      <div class="stat-card"><small>Scheduled end</small><strong>${active.endsAt ? formatDateTime(active.endsAt) : 'No end date'}</strong></div>
+    </div>
+    <form method="post" action="/developer/seasons/config" class="rank-admin-form">
+      <input type="hidden" name="seasonId" value="${escapeHtml(active.id)}" />
+      <div class="rank-editor-row">
+        <label>Season label <input name="label" maxlength="32" value="${escapeHtml(active.label)}" required /></label>
+        <label>End date <input name="endsAt" type="datetime-local" value="${escapeHtml(toDateTimeLocal(active.endsAt))}" /></label>
+      </div>
+      <h3>Badge rewards</h3>
+      <p><small>Labels and icons are awarded at season end by season and rank. Master Infernal is awarded only to players who finish in Master Infernal.</small></p>
+      <div class="rank-admin-list">${rewards.map((reward) => seasonRewardEditorRow(reward)).join('')}</div>
+      <button type="submit">Save season configuration</button>
+    </form>
+    <form method="post" action="/developer/seasons/end" class="inline-form danger-zone" onsubmit="return confirm('End the active season, award badges, snapshot top 10, reset ELO, and start the next season?');">
+      <label>Next season label <input name="nextSeasonLabel" placeholder="S${nextSeasonNumber(seasons)}" /></label>
+      <button class="danger" type="submit">End season and start next</button>
+    </form>
+    ${seasons.filter((season) => season.status === 'completed').length ? `<h3>Completed seasons</h3><ul>${seasons.filter((season) => season.status === 'completed').map((season) => `<li>${escapeHtml(season.label)} ended ${season.endedAt ? formatDateTime(season.endedAt) : 'unknown'}</li>`).join('')}</ul>` : ''}
+  </section>`;
+}
+
+function seasonRewardEditorRow(reward: PugSeasonBadgeReward) {
+  return `<div class="rank-editor-row" data-rank-icon-field>
+    <input type="hidden" name="rewardRankId" value="${escapeHtml(reward.rankId)}" />
+    <label>Rank <input value="${escapeHtml(reward.rankId)}" disabled /></label>
+    <label>Badge label <input name="rewardLabel" maxlength="64" value="${escapeHtml(reward.label)}" required /></label>
+    <label>Abbrev. <input name="rewardAbbreviation" maxlength="12" value="${escapeHtml(reward.abbreviation ?? '')}" /></label>
+    <div class="rank-icon-editor">
+      <input type="hidden" name="rewardIconDataUrl" value="${escapeHtml(reward.iconDataUrl ?? '')}" data-rank-icon-data />
+      <span class="rank-icon-preview${reward.iconDataUrl ? '' : ' is-empty'}" style="${reward.iconDataUrl ? `background-image: url('${escapeCssUrl(reward.iconDataUrl)}')` : ''}" data-rank-icon-preview>${reward.iconDataUrl ? '' : 'No icon'}</span>
+      <label class="button secondary">Upload icon <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-rank-icon-input hidden /></label>
+      <button type="button" class="secondary" data-rank-icon-clear${reward.iconDataUrl ? '' : ' disabled'}>Clear</button>
+    </div>
+  </div>`;
+}
+
+function completeWebSeasonRewards(season: PugSeason, rankSettings: PugRankSettings): PugSeasonBadgeReward[] {
+  const existing = new Map(season.badgeRewards.map((reward) => [reward.rankId, reward]));
+  const normalRewards = rankSettings.ranks.map((rank) => existing.get(rank.id) ?? { rankId: rank.id, label: `${season.label} ${rank.label}`, abbreviation: rank.abbreviation, iconDataUrl: rank.iconDataUrl });
+  return [...normalRewards, existing.get('master-infernal') ?? { rankId: 'master-infernal', label: `${season.label} Master Infernal`, abbreviation: 'M1', iconDataUrl: rankSettings.masterIconDataUrl }];
+}
+
+function nextSeasonNumber(seasons: PugSeason[]) {
+  return Math.max(1, ...seasons.map((season) => Number(season.id.match(/s(\d+)/)?.[1] ?? 0))) + 1;
+}
+
+function toDateTimeLocal(value?: string) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString().slice(0, 16);
+}
+
+function parseOptionalDateTime(value: unknown) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return undefined;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) throw new Error('Season end date is invalid.');
+  return date.toISOString();
+}
+
+function parsePugSeasonBadgeRewards(body: Record<string, unknown>): PugSeasonBadgeReward[] {
+  const rankIds = formArray(body.rewardRankId);
+  const labels = formArray(body.rewardLabel);
+  const abbreviations = formArray(body.rewardAbbreviation);
+  const icons = formArray(body.rewardIconDataUrl);
+  return rankIds.map((rankId, index) => ({
+    rankId: rankId.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-'),
+    label: (labels[index]?.trim() || rankId).slice(0, 64),
+    abbreviation: abbreviations[index]?.trim().slice(0, 12) || undefined,
+    iconDataUrl: parseOptionalRankIcon(icons[index])
+  })).filter((reward) => reward.rankId && reward.label);
 }
 
 function statCard(label: string, value: string) {
@@ -2547,6 +2732,16 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .rank-icon { width: 1.6rem; height: 1.6rem; border-radius: .4rem; object-fit: cover; background: #0f1116; border: 1px solid var(--line); flex: 0 0 auto; }
     .rank-icon-empty { display: inline-block; }
     .rank-admin-form, .rank-admin-list { display: grid; gap: 1rem; }
+
+    .badge-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .75rem; }
+    .badge-grid-compact { grid-template-columns: repeat(auto-fit, minmax(11rem, max-content)); }
+    .badge-option { display: grid; gap: .45rem; border: 1px solid var(--line); border-radius: 1rem; padding: .8rem; background: rgba(255,255,255,.025); }
+    .season-badge { display: inline-flex; align-items: center; gap: .55rem; border: 1px solid var(--line); border-radius: 999px; padding: .35rem .7rem; background: #12141a; }
+    .season-badge > span:last-child { display: grid; line-height: 1.1; }
+    .season-badge small { color: var(--muted); }
+    .profile-badges { margin: 1rem 0; display: grid; gap: .75rem; }
+    .season-leaderboards { display: grid; gap: 1rem; }
+    .compact-leaderboard .leaderboard-entry { grid-template-columns: minmax(10rem, 1fr) auto auto; }
     .rank-editor-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .75rem; align-items: end; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; }
     .master-rank-editor { grid-template-columns: minmax(14rem, 1fr) auto; }
     .rank-icon-editor { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }

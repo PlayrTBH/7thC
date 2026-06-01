@@ -101,6 +101,7 @@ export type PugSettings = {
   queueMessageId?: string;
   elo?: PugEloSettings;
   ranks?: PugRankSettings;
+  seasons?: PugSeason[];
 };
 
 export type PugTeamMode = 'random' | 'captains';
@@ -111,6 +112,57 @@ export type PugEloRating = {
   userId: string;
   username?: string;
   rating: number;
+  peakRating?: number;
+  seasonId?: string;
+  updatedAt: string;
+};
+
+export type PugSeasonStatus = 'active' | 'completed';
+
+export type PugSeasonBadgeReward = {
+  rankId: string;
+  label: string;
+  abbreviation?: string;
+  iconDataUrl?: string;
+};
+
+export type PugSeason = {
+  id: string;
+  label: string;
+  status: PugSeasonStatus;
+  startsAt: string;
+  endsAt?: string;
+  endedAt?: string;
+  badgeRewards: PugSeasonBadgeReward[];
+};
+
+export type PugSeasonLeaderboardEntry = {
+  seasonId: string;
+  seasonLabel: string;
+  userId: string;
+  username?: string;
+  rating: number;
+  rankId: string;
+  rankLabel: string;
+  placement: number;
+};
+
+export type PugUserBadge = {
+  id: string;
+  userId: string;
+  seasonId: string;
+  seasonLabel: string;
+  rankId: string;
+  rankLabel: string;
+  label: string;
+  abbreviation?: string;
+  iconDataUrl?: string;
+  awardedAt: string;
+};
+
+export type PugUserBadgeSelection = {
+  userId: string;
+  badgeIds: string[];
   updatedAt: string;
 };
 
@@ -159,5 +211,8 @@ export type StoreShape = {
   eventRegistrations: EventRegistration[];
   pugMatchLogs: PugMatchLog[];
   pugEloRatings: PugEloRating[];
+  pugSeasonLeaderboards: PugSeasonLeaderboardEntry[];
+  pugUserBadges: PugUserBadge[];
+  pugUserBadgeSelections: PugUserBadgeSelection[];
   settings: AdministratorSettings;
 };
