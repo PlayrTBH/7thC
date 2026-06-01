@@ -62,6 +62,7 @@ export class TeamBot {
   private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
   private pugQueueMessageRefresh?: NodeJS.Timeout;
   private pugQueueMessageRefreshInFlight?: Promise<void>;
+  private pugQueueMessageRefreshAgain = false;
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
   private restartOperation?: Promise<void>;
 
@@ -81,14 +82,19 @@ export class TeamBot {
       }
       if (!interaction.isButton()) return;
       if (interaction.customId.startsWith('pug:')) {
+        const isQueueMembershipAction = interaction.customId.startsWith('pug:join:') || interaction.customId.startsWith('pug:leave:');
         try {
           if (!interaction.deferred && !interaction.replied) {
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            if (isQueueMembershipAction) await interaction.deferUpdate();
+            else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
           }
           await this.handlePugInteraction(interaction);
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unable to process this PUG action.';
-          await this.respondToPugInteraction(interaction, message).catch((responseError) => {
+          const response = isQueueMembershipAction && (interaction.deferred || interaction.replied)
+            ? interaction.followUp({ content: message, flags: MessageFlags.Ephemeral })
+            : this.respondToPugInteraction(interaction, message);
+          await response.catch((responseError) => {
             console.warn('Unable to send PUG interaction response:', responseError);
           });
         }
@@ -344,34 +350,56 @@ export class TeamBot {
     return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
   }
 
-  private schedulePugQueueMessageRefresh(delayMs = 250) {
-    if (this.pugQueueMessageRefresh) return;
+  private schedulePugQueueMessageRefresh(delayMs = 0) {
+    if (this.pugQueueMessageRefresh) {
+      if (delayMs > 0) return;
+      clearTimeout(this.pugQueueMessageRefresh);
+      this.pugQueueMessageRefresh = undefined;
+    }
+
+    if (delayMs <= 0) {
+      this.refreshPugQueueMessage().catch((error) => console.warn('Unable to refresh PUG queue message:', error));
+      return;
+    }
+
     this.pugQueueMessageRefresh = setTimeout(() => {
       this.pugQueueMessageRefresh = undefined;
       this.refreshPugQueueMessage().catch((error) => console.warn('Unable to refresh PUG queue message:', error));
     }, delayMs);
   }
 
-  private async refreshPugQueueMessage() {
+  private async refreshPugQueueMessage(message?: import('discord.js').Message) {
     if (this.pugQueueMessageRefreshInFlight) {
+      this.pugQueueMessageRefreshAgain = true;
       await this.pugQueueMessageRefreshInFlight;
       return;
     }
 
-    this.pugQueueMessageRefreshInFlight = (async () => {
-      const settings = await this.store.getAdministratorSettings();
-      const pugs = settings.pugs;
-      if (!pugs?.queueChannelId || !pugs.queueMessageId) return;
-      const guild = await this.getGuild();
-      const channel = guild.channels.cache.get(pugs.queueChannelId) ?? (await guild.channels.fetch(pugs.queueChannelId).catch(() => null));
-      if (!channel || channel.type !== ChannelType.GuildText) return;
-      const message = channel.messages.cache.get(pugs.queueMessageId) ?? (await channel.messages.fetch(pugs.queueMessageId).catch(() => null));
-      await message?.edit(this.buildPugQueueMessage()).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
-    })().finally(() => {
+    try {
+      do {
+        this.pugQueueMessageRefreshAgain = false;
+        this.pugQueueMessageRefreshInFlight = message ? this.editProvidedPugQueueMessage(message) : this.editPugQueueMessage();
+        await this.pugQueueMessageRefreshInFlight;
+        message = undefined;
+      } while (this.pugQueueMessageRefreshAgain);
+    } finally {
       this.pugQueueMessageRefreshInFlight = undefined;
-    });
+    }
+  }
 
-    await this.pugQueueMessageRefreshInFlight;
+  private async editProvidedPugQueueMessage(message: import('discord.js').Message) {
+    await message.edit(this.buildPugQueueMessage()).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
+  }
+
+  private async editPugQueueMessage() {
+    const settings = await this.store.getAdministratorSettings();
+    const pugs = settings.pugs;
+    if (!pugs?.queueChannelId || !pugs.queueMessageId) return;
+    const guild = await this.getGuild();
+    const channel = guild.channels.cache.get(pugs.queueChannelId) ?? (await guild.channels.fetch(pugs.queueChannelId).catch(() => null));
+    if (!channel || channel.type !== ChannelType.GuildText) return;
+    const message = channel.messages.cache.get(pugs.queueMessageId) ?? (await channel.messages.fetch(pugs.queueMessageId).catch(() => null));
+    await message?.edit(this.buildPugQueueMessage()).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
   }
 
   private async withPugQueueLock<T>(operation: () => Promise<T>) {
@@ -438,30 +466,20 @@ export class TeamBot {
       this.pugQueues.set(size, queue);
       for (const queueSize of pugQueueSizes) this.updatePugQueueCountdown(queueSize);
 
-      const countdown = this.pugQueueCountdowns.get(size);
-      const matchCount = Math.floor(queue.length / size);
-      await this.respondToPugInteraction(
-        interaction,
-        countdown
-          ? `You joined ${pugQueueLabel(size)} (${queue.length}/${size}). ${matchCount} match${matchCount === 1 ? '' : 'es'} will be ELO-balanced when the countdown ends in ${Math.max(0, Math.ceil((countdown.endsAt - Date.now()) / 1000))} seconds.`
-          : `You joined ${pugQueueLabel(size)} (${queue.length}/${size}).`
-      );
     });
 
-    this.schedulePugQueueMessageRefresh();
+    await this.refreshPugQueueMessage(interaction.message);
   }
 
   private async leavePugQueue(interaction: import('discord.js').ButtonInteraction, size: PugQueueSize) {
     await this.withPugQueueLock(async () => {
       const queue = this.pugQueues.get(size) ?? [];
-      const before = queue.length;
       const filtered = queue.filter((player) => player.userId !== interaction.user.id);
       if (filtered.length) this.pugQueues.set(size, filtered);
       else this.pugQueues.delete(size);
       this.updatePugQueueCountdown(size);
-      await this.respondToPugInteraction(interaction, before === filtered.length ? 'You were not in that PUG queue.' : `You left ${pugQueueLabel(size)}.`);
     });
-    this.schedulePugQueueMessageRefresh();
+    await this.refreshPugQueueMessage(interaction.message);
   }
 
   private updatePugQueueCountdown(size: PugQueueSize) {
