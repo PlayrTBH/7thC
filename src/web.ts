@@ -1531,7 +1531,6 @@ type LeaderboardRating = PugEloRating & { displayName: string; username?: string
 function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank) {
   return `<section class="card">
     <h2>Top 10 PUG ELO players</h2>
-    <p><small>Players start at 20,000 ELO by default. Winning as an underdog pays more, winning as a favorite pays less, and the maximum win gain is capped at 2,000 ELO.</small></p>
     ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating, index) => leaderboardEntry(rating, index)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
   </section>
   <section class="card">
@@ -1580,7 +1579,14 @@ function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { display
 
 function rankBadge(rank: PugPlayerRank) {
   const icon = rank.iconDataUrl ? `<img class="rank-icon" src="${escapeHtml(rank.iconDataUrl)}" alt="" />` : '<span class="rank-icon rank-icon-empty"></span>';
-  return `<span class="rank-badge${rank.isMaster ? ' master-rank' : ''}">${icon}<span>${escapeHtml(rank.label)}${rank.abbreviation ? ` <small>${escapeHtml(rank.abbreviation)}</small>` : ''}</span></span>`;
+  const label = rank.isMaster ? (rank.abbreviation || rank.label) : rank.label;
+  const classes = ['rank-badge', `rank-${rankClassId(rank.id)}`];
+  if (rank.isMaster) classes.push('master-rank');
+  return `<span class="${classes.map(escapeHtml).join(' ')}">${icon}<span>${escapeHtml(label)}</span></span>`;
+}
+
+function rankClassId(id: string) {
+  return id.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
 }
 
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugPlayerRank {
@@ -2460,12 +2466,20 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .leaderboard-player { min-width: 0; color: var(--text); text-decoration: none; flex: 1 1 auto; }
     .leaderboard-player span { display: grid; min-width: 0; }
     .leaderboard-player strong, .leaderboard-player small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .leaderboard-entry.leaderboard-master { border-color: rgba(251, 146, 60, .55); background: radial-gradient(circle at 14% 50%, rgba(251, 146, 60, .24), transparent 18rem), linear-gradient(135deg, rgba(124, 45, 18, .32), #12141a 55%); box-shadow: 0 0 24px rgba(251, 146, 60, .18); }
-    .leaderboard-master .leaderboard-player strong { color: #c2410c; text-shadow: 0 0 12px rgba(251, 146, 60, .9), 0 0 24px rgba(239, 68, 68, .55); }
-    .leaderboard-master .leaderboard-player strong::before, .leaderboard-master .leaderboard-player strong::after { content: '🔥'; margin: 0 .2rem; filter: drop-shadow(0 0 8px rgba(251, 146, 60, .8)); }
+    .leaderboard-entry.leaderboard-master { position: relative; border-color: rgba(251, 146, 60, .55); background: radial-gradient(ellipse at 18% 50%, rgba(251, 146, 60, .22), rgba(239, 68, 68, .08) 38%, transparent 72%), linear-gradient(135deg, rgba(124, 45, 18, .32), #12141a 60%); box-shadow: 0 0 18px rgba(251, 146, 60, .14), inset 0 0 28px rgba(251, 146, 60, .08); }
+    .leaderboard-entry.leaderboard-master::after { content: ''; position: absolute; inset: -.8rem auto -.8rem 2.2rem; width: min(18rem, 58%); pointer-events: none; background: radial-gradient(ellipse, rgba(251, 146, 60, .18), transparent 70%); filter: blur(12px); }
+    .leaderboard-master .leaderboard-player, .leaderboard-master .leaderboard-rank, .leaderboard-master > span:not(.leaderboard-rank) { position: relative; z-index: 1; }
+    .leaderboard-master .leaderboard-player span, .leaderboard-master .leaderboard-player strong { overflow: visible; }
+    .leaderboard-master .leaderboard-player strong { color: #c2410c; text-shadow: 0 0 10px rgba(251, 146, 60, .72), 0 0 22px rgba(239, 68, 68, .42); }
+    .leaderboard-master .leaderboard-player strong::before, .leaderboard-master .leaderboard-player strong::after { content: '🔥'; margin: 0 .2rem; filter: drop-shadow(0 0 6px rgba(251, 146, 60, .7)); }
     .leaderboard-rank { flex: 0 0 auto; }
     .rank-badge { display: inline-flex; align-items: center; gap: .4rem; color: #f5d0fe; font-weight: 900; white-space: nowrap; }
-    .rank-badge small { color: inherit; opacity: .8; font-weight: 800; }
+    .rank-badge.rank-bronze { color: #cd7f32; }
+    .rank-badge.rank-silver { color: #c0c0c0; }
+    .rank-badge.rank-gold { color: #facc15; }
+    .rank-badge.rank-platinum { color: #67e8f9; }
+    .rank-badge.rank-diamond { color: #60a5fa; }
+    .rank-badge.rank-infernal { color: #f97316; text-shadow: 0 0 10px rgba(249, 115, 22, .35); }
     .rank-badge.master-rank { color: #c2410c; text-shadow: 0 0 12px rgba(251, 146, 60, .72); }
     .rank-icon { width: 1.6rem; height: 1.6rem; border-radius: .4rem; object-fit: cover; background: #0f1116; border: 1px solid var(--line); flex: 0 0 auto; }
     .rank-icon-empty { display: inline-block; }
