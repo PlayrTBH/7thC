@@ -79,6 +79,8 @@ export type PugEloSettings = {
   startingRating: number;
   baseChange: number;
   strength: number;
+  finalRoundMultiplier: number;
+  cashoutMultiplier: number;
 };
 
 export type PugRankDefinition = {

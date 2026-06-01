@@ -411,6 +411,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.post('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
+      const existingElo = await store.getPugEloSettings();
       const pugs: PugSettings = {
         queueChannelId: String(req.body.queueChannelId ?? '').trim() || undefined,
         queueMessageId: existing?.queueMessageId,
@@ -418,7 +419,11 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
           .split(/\r?\n|,/)
           .map((map) => map.trim())
           .filter(Boolean),
-        elo: existing?.elo,
+        elo: {
+          ...existingElo,
+          finalRoundMultiplier: parseDecimalInRange(req.body.finalRoundMultiplier, 'Final Round ELO value', 0, 5),
+          cashoutMultiplier: parseDecimalInRange(req.body.cashoutMultiplier, 'Cashout ELO value', 0, 5)
+        },
         ranks: existing?.ranks,
         seasons: existing?.seasons
       };
@@ -1404,6 +1409,15 @@ function administratorPugSettingsForm(settings?: PugSettings) {
       <label>Map pool
         <textarea name="mapPool" rows="8" placeholder="One map per line">${escapeHtml((settings?.mapPool ?? []).join('\n'))}</textarea>
       </label>
+      <div class="inline-form">
+        <label>Final Round ELO value
+          <input name="finalRoundMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings?.elo?.finalRoundMultiplier ?? 1)}" />
+        </label>
+        <label>Cashout ELO value
+          <input name="cashoutMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings?.elo?.cashoutMultiplier ?? 1.25)}" />
+        </label>
+      </div>
+      <p><small>These multipliers scale every ELO gain and loss by mode. Use <code>1</code> for normal value; Cashout defaults to <code>1.25</code> so those games are 25% more valuable.</small></p>
       <button type="submit">Save PUG settings</button>
     </form>
     <form method="post" action="/administrator/pugs/publish" onsubmit="return confirm('Publish or refresh the PUG queue message in the configured channel?');">
@@ -1513,9 +1527,9 @@ function buildAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], se
           userId,
           username: match.playerUsernames[userId] ?? rating.username,
           rating: rating.rating,
-          first,
-          second: match.teams.length > 2 ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(first / 2)) : undefined,
-          loss: -calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings)
+          first: applyAdminPugEloValueMultiplier(first, match.size, settings),
+          second: match.teams.length > 2 ? applyAdminPugEloValueMultiplier(Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(first / 2)), match.size, settings) : undefined,
+          loss: -applyAdminPugEloValueMultiplier(calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings), match.size, settings)
         };
       })
     };
@@ -1524,6 +1538,11 @@ function buildAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], se
 
 function getAdminPugRating(userId: string, ratings: Map<string, PugEloRating>, settings: PugEloSettings) {
   return ratings.get(userId) ?? { userId, rating: settings.startingRating, updatedAt: '' };
+}
+
+function applyAdminPugEloValueMultiplier(delta: number, size: PugMatchLog['size'], settings: PugEloSettings) {
+  const multiplier = size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
+  return Math.round(delta * multiplier);
 }
 
 const MINIMUM_PUG_ELO_CHANGE = 200;
@@ -1737,11 +1756,13 @@ function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, setting
 function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, playerSearch: PugPlayerSearchState) {
   return `<div class="subsection">
     <h3>ELO formula settings</h3>
-    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Wins and losses have a 200 ELO floor; wins cap at 2,000 ELO, and losses scale by each player's ELO versus opponent average up to twice the win reward.</small></p>
+    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Mode values then scale every gain/loss, letting admins make Final Round or Cashout worth more or less. Cashout defaults to 1.25 (25% more valuable).</small></p>
     <form method="post" action="/administrator/pugs/elo/settings" class="inline-form">
       <label>Starting ELO <input name="startingRating" type="number" min="1" value="${settings.startingRating}" /></label>
       <label>Fair-win base <input name="baseChange" type="number" min="1" value="${settings.baseChange}" /></label>
       <label>Strength <input name="strength" type="number" min="0.1" max="5" step="0.1" value="${settings.strength}" /></label>
+      <label>Final Round value <input name="finalRoundMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings.finalRoundMultiplier)}" /></label>
+      <label>Cashout value <input name="cashoutMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings.cashoutMultiplier)}" /></label>
       <button type="submit">Save ELO settings</button>
     </form>
   </div>
@@ -2049,8 +2070,14 @@ function parsePugEloSettings(body: Record<string, unknown>): PugEloSettings {
   return {
     startingRating: parsePositiveInteger(body.startingRating, 'Starting ELO', 1),
     baseChange: parsePositiveInteger(body.baseChange, 'Base ELO gain', 1),
-    strength: parseDecimalInRange(body.strength, 'ELO strength', 0.1, 5)
+    strength: parseDecimalInRange(body.strength, 'ELO strength', 0.1, 5),
+    finalRoundMultiplier: parseDecimalInRange(body.finalRoundMultiplier, 'Final Round ELO value', 0, 5),
+    cashoutMultiplier: parseDecimalInRange(body.cashoutMultiplier, 'Cashout ELO value', 0, 5)
   };
+}
+
+function formatMultiplierInput(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 function parseDecimalInRange(value: unknown, label: string, minimum: number, maximum: number) {
