@@ -256,6 +256,36 @@ export class JsonStore {
     });
   }
 
+  async rollbackPugMatch(matchId: string) {
+    await this.update((data) => {
+      const match = data.pugMatchLogs.find((item) => item.id === matchId);
+      if (!match) throw new Error('PUG match log not found.');
+      if (match.status === 'rolledback') throw new Error('PUG match has already been rolled back.');
+      if (match.status !== 'completed') throw new Error('Only completed PUG matches can be rolled back.');
+      if (!match.eloChanges?.length) throw new Error('PUG match does not have ELO changes to roll back.');
+
+      const now = new Date().toISOString();
+      const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+      for (const change of match.eloChanges) {
+        const existing = data.pugEloRatings.find((rating) => rating.userId === change.userId);
+        const currentRating = existing?.rating ?? change.after ?? settings.startingRating;
+        const rolledBackRating = Math.max(0, Math.round(currentRating - change.delta));
+        if (existing) {
+          existing.rating = rolledBackRating;
+          if (change.username) existing.username = change.username;
+          existing.updatedAt = now;
+        } else {
+          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: rolledBackRating, updatedAt: now });
+        }
+      }
+
+      match.status = 'rolledback';
+      match.result = match.result ? `${match.result} (rolled back)` : 'Rolled back by administrator';
+      match.updatedAt = now;
+      return data;
+    });
+  }
+
   async getAdministratorSettings() {
     const data = await this.read();
     return data.settings;
@@ -566,7 +596,7 @@ function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
     result: typeof match.result === 'string' ? match.result : undefined,
     teamEloTotals: Array.isArray(match.teamEloTotals) ? match.teamEloTotals.filter((rating): rating is number => typeof rating === 'number' && Number.isFinite(rating)).map(Math.round) : undefined,
     eloChanges: Array.isArray(match.eloChanges) ? match.eloChanges.map(normalizePugEloChange).filter(Boolean) as PugEloChange[] : undefined,
-    status: match.status === 'completed' || match.status === 'reset' || match.status === 'deleted' ? match.status : 'ongoing',
+    status: match.status === 'completed' || match.status === 'reset' || match.status === 'deleted' || match.status === 'rolledback' ? match.status : 'ongoing',
     createdAt: typeof match.createdAt === 'string' ? match.createdAt : now,
     updatedAt: typeof match.updatedAt === 'string' ? match.updatedAt : now,
     endedAt: typeof match.endedAt === 'string' ? match.endedAt : undefined

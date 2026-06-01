@@ -44,6 +44,7 @@ const botMethods = [
   'publishPugQueueMessage',
   'getPugAdminState',
   'deletePugMatch',
+  'rollbackPugMatch',
   'resetPugMatch',
   'forcePugTeams',
   'forcePugCaptains'

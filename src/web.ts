@@ -428,6 +428,15 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     }
   });
 
+  app.post('/administrator/pugs/:matchId/rollback', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await bot.rollbackPugMatch(req.params.matchId);
+      res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post('/administrator/pugs/:matchId/reset', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       await bot.resetPugMatch(req.params.matchId);
@@ -1351,9 +1360,15 @@ function pugActiveMatchCard(match: AdminPugMatchLog) {
 }
 
 function pugHistoryCard(match: PugMatchLog) {
+  const rollbackForm = match.status === 'completed' && Boolean(match.eloChanges?.length)
+    ? `<form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/rollback" onsubmit="return confirm('Roll back this PUG match? This negates its ELO and removes it from player win/loss stats.');"><button type="submit">Rollback match</button></form>`
+    : '';
   return `<div class="pug-admin-match">
     ${pugMatchSummary(match)}
-    <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/delete" onsubmit="return confirm('Delete this PUG match log?');"><button class="danger" type="submit">Delete log</button></form>
+    <div class="admin-team-actions">
+      ${rollbackForm}
+      <form method="post" action="/administrator/pugs/${encodeURIComponent(match.id)}/delete" onsubmit="return confirm('Delete this PUG match log?');"><button class="danger" type="submit">Delete log</button></form>
+    </div>
   </div>`;
 }
 
@@ -1504,7 +1519,7 @@ function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, pl
   </div>
   <div class="subsection">
     <h3>Player search</h3>
-    <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card.</small></p>
+    <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card. Wins and losses are based only on whether completed match ELO went up or down.</small></p>
     ${pugPlayerSearchPanel(playerSearch, settings)}
     <form method="post" action="/administrator/pugs/elo/reset-all" onsubmit="return confirm('Reset every tracked player to the current starting ELO?');">
       <button class="danger" type="submit">Reset all player ELO</button>
@@ -1571,12 +1586,10 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
   for (const match of history) {
     if (match.status !== 'completed') continue;
     const change = match.eloChanges?.find((item) => item.userId === userId);
-    const placement = change?.placement ?? getPugPlayerPlacementFromResult(match, userId);
-    if (!placement) continue;
+    if (!change || change.delta === 0) continue;
     const mode = match.size === 6 || match.size === 12 ? match.size : 'unknown';
     const stats = buckets.get(mode) ?? emptyPugPlayerModeStats(mode, mode === 'unknown' ? 'Mode not recorded' : pugQueueLabel(mode));
-    if (placement === 1) stats.wins += 1;
-    else if (placement === 2 && match.teams.length > 2) stats.seconds += 1;
+    if (change.delta > 0) stats.wins += 1;
     else stats.losses += 1;
     stats.total += 1;
   }

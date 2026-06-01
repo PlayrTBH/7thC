@@ -123,7 +123,7 @@ export type PugMatchLog = {
   result?: string;
   teamEloTotals?: number[];
   eloChanges?: PugEloChange[];
-  status: 'ongoing' | 'completed' | 'reset' | 'deleted';
+  status: 'ongoing' | 'completed' | 'reset' | 'deleted' | 'rolledback';
   createdAt: string;
   updatedAt: string;
   endedAt?: string;
