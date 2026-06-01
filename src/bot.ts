@@ -20,7 +20,7 @@ import {
   type PresenceStatusData
 } from 'discord.js';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
-import { config } from './config.js';
+import { config, DEVELOPER_DISCORD_USER_ID } from './config.js';
 import type { JsonStore } from './store.js';
 import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankDefinition, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
@@ -631,7 +631,7 @@ export class TeamBot {
 
   private async buildPugPlayerRanks(guild: Guild, playerIds: string[]) {
     const [ratings, rankSettings, rankRoles, rankEmojis] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings(), this.ensurePugRankRoles(guild), this.ensurePugRankEmojis(guild)]);
-    const topMasterUserIds = new Set(ratings.slice(0, 3).map((rating) => rating.userId));
+    const topMasterUserIds = getTopMasterUserIds(ratings);
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const labels = new Map<string, string>();
     const roleIds = new Map<string, string>();
@@ -1796,7 +1796,7 @@ export class TeamBot {
     const guild = await this.getGuild();
     const rankRoles = await this.ensurePugRankRoles(guild);
     const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
-    const topMasterUserIds = new Set(ratings.slice(0, 3).map((rating) => rating.userId));
+    const topMasterUserIds = getTopMasterUserIds(ratings);
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const assignments = new Map<string, string>();
     for (const userId of new Set(userIds)) {
@@ -2129,8 +2129,17 @@ function getPugPlayerUsername(match: PugMatch, playerId: string) {
   return match.playerUsernames.get(playerId) ?? 'Unknown player';
 }
 
+
+function isDeveloperAccount(userId: string) {
+  return userId === DEVELOPER_DISCORD_USER_ID;
+}
+
+function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[]) {
+  return new Set(ratings.filter((rating) => !isDeveloperAccount(rating.userId)).slice(0, 3).map((rating) => rating.userId));
+}
+
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugRankDefinition {
-  if (topMasterUserIds.has(rating.userId)) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl };
+  if (!isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl };
   const ranks = settings.ranks.length ? settings.ranks : [];
   return [...ranks].reverse().find((item) => rating.rating >= item.minRating && (item.maxRating === undefined || rating.rating <= item.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
 }
