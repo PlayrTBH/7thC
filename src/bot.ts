@@ -22,13 +22,13 @@ import {
 import { randomInt, randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -477,8 +477,9 @@ export class TeamBot {
 
     const fetchedPlayers = await Promise.all(playerIds.map(async (playerId) => guild.members.cache.get(playerId) ?? guild.members.fetch(playerId).catch(() => null)));
     const playerUsernames = new Map(playerIds.map((playerId, index) => [playerId, fetchedPlayers[index]?.user.username ?? players[index].username]));
+    const playerRankLabels = await this.buildPugPlayerRankLabels(playerIds);
     const now = new Date().toISOString();
-    const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map(), createdAt: now, updatedAt: now };
+    const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, playerRankLabels, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map(), createdAt: now, updatedAt: now };
     this.pugMatches.set(matchId, match);
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
 
@@ -500,6 +501,18 @@ export class TeamBot {
     await this.waitForPugPlayersInQueue(guild, match);
     const modeMessage = await text.send({ content: `${playerIds.map((id) => `<@${id}>`).join(' ')} everyone is in the queue voice channel. Vote on how teams should be created. A majority vote decides the team selection mode.`, embeds: [buildPugModeVoteEmbed(match)], components: [modeRow], allowedMentions: { users: playerIds } });
     match.modeVoteMessageId = modeMessage.id;
+  }
+
+  private async buildPugPlayerRankLabels(playerIds: string[]) {
+    const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
+    const topMasterUserIds = new Set(ratings.slice(0, 3).map((rating) => rating.userId));
+    const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
+    const labels = new Map<string, string>();
+    await Promise.all(playerIds.map(async (userId) => {
+      const rating = ratingsByUserId.get(userId) ?? await this.store.getPugEloRating(userId);
+      labels.set(userId, resolvePugRankLabel(rating, rankSettings, topMasterUserIds));
+    }));
+    return labels;
   }
 
   private async waitForPugPlayersInQueue(guild: Guild, match: PugMatch) {
@@ -1583,11 +1596,19 @@ function buildPugCaptainDraftRows(match: PugMatch) {
 }
 
 function formatPugPlayerLabel(match: PugMatch, playerId: string) {
-  return getPugPlayerUsername(match, playerId);
+  const rankLabel = match.playerRankLabels.get(playerId);
+  return `${getPugPlayerUsername(match, playerId)}${rankLabel ? ` [${rankLabel}]` : ''}`;
 }
 
 function getPugPlayerUsername(match: PugMatch, playerId: string) {
   return match.playerUsernames.get(playerId) ?? 'Unknown player';
+}
+
+function resolvePugRankLabel(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>) {
+  if (topMasterUserIds.has(rating.userId)) return 'M1';
+  const ranks = settings.ranks.length ? settings.ranks : [];
+  const rank = [...ranks].reverse().find((item) => rating.rating >= item.minRating && (item.maxRating === undefined || rating.rating <= item.maxRating)) ?? ranks[0];
+  return rank?.label ?? 'Unranked';
 }
 
 function truncateButtonLabel(label: string) {
