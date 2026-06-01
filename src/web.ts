@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugMatchLog, PugSettings } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugSettings } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -263,6 +263,19 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     }
   });
 
+  app.get('/leaderboard', requireAuth, async (req, res, next) => {
+    try {
+      const [leaderboard, ownRating, administratorAccess] = await Promise.all([
+        store.getPugEloLeaderboard(10),
+        store.getPugEloRating(req.session.discordUser!.id),
+        bot.getAdministratorAccess(req.session.discordUser!.id)
+      ]);
+      res.send(layout('PUG ELO leaderboard', leaderboardPage(leaderboard, ownRating), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/event-management', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const events = await store.getEvents();
@@ -360,7 +373,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         mapPool: String(req.body.mapPool ?? '')
           .split(/\r?\n|,/)
           .map((map) => map.trim())
-          .filter(Boolean)
+          .filter(Boolean),
+        elo: existing?.elo
       };
       await store.updatePugSettings(pugs);
       res.redirect('/administrator#pugs');
@@ -380,8 +394,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
-      const state = await bot.getPugAdminState();
-      res.send(layout('PUG administration', administratorPugsPage(state.activeMatches, state.history), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+      const [state, ratings, eloSettings] = await Promise.all([bot.getPugAdminState(), store.getPugEloRatings(), store.getPugEloSettings()]);
+      res.send(layout('PUG administration', administratorPugsPage(state.activeMatches, state.history, ratings, eloSettings), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -418,6 +432,45 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       await bot.forcePugCaptains(req.params.matchId, parseDiscordIds(String(req.body.captainIds ?? '')));
       res.redirect('/administrator/pugs');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/elo/settings', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const existing = (await store.getAdministratorSettings()).pugs;
+      const elo = parsePugEloSettings(req.body);
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo });
+      res.redirect('/administrator/pugs#elo');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/elo/player', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const userId = parseRequiredDiscordId(String(req.body.userId ?? ''));
+      await store.setPugEloRating(userId, parsePositiveInteger(req.body.rating, 'ELO rating', 0), String(req.body.username ?? '').trim() || undefined);
+      res.redirect('/administrator/pugs#elo');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/elo/player/reset', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      await store.resetPugEloRating(parseRequiredDiscordId(String(req.body.userId ?? '')));
+      res.redirect('/administrator/pugs#elo');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/pugs/elo/reset-all', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
+    try {
+      await store.resetAllPugEloRatings();
+      res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
     }
@@ -649,7 +702,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 }
 
 type AdministratorAccess = { isOwner: boolean; isAdmin: boolean };
-type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; currentTeam?: Team; active?: 'events' | 'teams' | 'event-management' | 'administrator' | 'settings' | 'developer' };
+type LayoutOptions = { user?: DiscordUser; isAdmin?: boolean; isDeveloper?: boolean; currentTeam?: Team; active?: 'events' | 'teams' | 'leaderboard' | 'event-management' | 'administrator' | 'settings' | 'developer' };
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#020202"/>
@@ -1232,11 +1285,15 @@ function administratorPugSettingsForm(settings?: PugSettings) {
 }
 
 
-function administratorPugsPage(activeMatches: PugMatchLog[], history: PugMatchLog[]) {
+function administratorPugsPage(activeMatches: PugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings) {
   return `<p><a href="/administrator">← Back to administrator</a></p>
     <section class="card">
       <h2>Ongoing PUG matches</h2>
       ${activeMatches.length ? `<div class="management-list">${activeMatches.map(pugActiveMatchCard).join('')}</div>` : '<p>No PUG matches are currently running.</p>'}
+    </section>
+    <section class="card" id="elo">
+      <h2>PUG ELO administration</h2>
+      ${pugEloAdminPanel(ratings, eloSettings)}
     </section>
     <section class="card">
       <h2>Full PUG match history</h2>
@@ -1292,7 +1349,7 @@ function pugMatchSummary(match: PugMatchLog) {
   <div class="pug-admin-grid">
     <div><h3>Players</h3>${pugPlayerList(match, match.playerIds)}</div>
     <div><h3>Teams</h3>${match.teams.length ? match.teams.map((team, index) => `<p><strong>Team ${index + 1}</strong><br />${pugPlayerList(match, team)}</p>`).join('') : '<p><small>Teams have not been created yet.</small></p>'}</div>
-    <div><h3>Results</h3><p>${match.result ? escapeHtml(match.result) : 'No result yet.'}</p>${pugVoteSummary(match)}</div>
+    <div><h3>Results</h3><p>${match.result ? escapeHtml(match.result) : 'No result yet.'}</p>${pugVoteSummary(match)}${pugEloChangeSummary(match)}</div>
   </div>`;
 }
 
@@ -1323,6 +1380,83 @@ function parsePugTeams(value: string) {
 
 function parseDiscordIds(value: string) {
   return [...value.matchAll(/\d{5,}/g)].map((match) => match[0]);
+}
+
+function leaderboardPage(leaderboard: PugEloRating[], ownRating: PugEloRating) {
+  return `<section class="card">
+    <h2>Top 10 PUG ELO players</h2>
+    <p><small>Players start at 20,000 ELO by default. Winning as an underdog pays more, winning as a favorite pays less, and the maximum win gain is capped at 2,000 ELO.</small></p>
+    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => `<li><strong>${escapeHtml(rating.username ?? rating.userId)}</strong><span>${formatElo(rating.rating)} ELO</span></li>`).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+  </section>
+  <section class="card">
+    <h2>Your PUG ELO</h2>
+    <div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div>
+    <p><small>You can also use the Discord <code>/elo</code> command to see this rating privately.</small></p>
+  </section>`;
+}
+
+function pugEloAdminPanel(ratings: PugEloRating[], settings: PugEloSettings) {
+  return `<div class="subsection">
+    <h3>ELO formula settings</h3>
+    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. The win cap is always 2,000 ELO, and losses are capped at twice the match's possible gain.</small></p>
+    <form method="post" action="/administrator/pugs/elo/settings" class="inline-form">
+      <label>Starting ELO <input name="startingRating" type="number" min="1" value="${settings.startingRating}" /></label>
+      <label>Fair-win base <input name="baseChange" type="number" min="1" value="${settings.baseChange}" /></label>
+      <label>Strength <input name="strength" type="number" min="0.1" max="5" step="0.1" value="${settings.strength}" /></label>
+      <button type="submit">Save ELO settings</button>
+    </form>
+  </div>
+  <div class="subsection">
+    <h3>Adjust player ELO</h3>
+    <form method="post" action="/administrator/pugs/elo/player" class="inline-form">
+      <label>User ID <input name="userId" required placeholder="Discord user ID" /></label>
+      <label>Username <input name="username" placeholder="Optional display name" /></label>
+      <label>ELO <input name="rating" type="number" min="0" required value="${settings.startingRating}" /></label>
+      <button type="submit">Set player ELO</button>
+    </form>
+    <form method="post" action="/administrator/pugs/elo/player/reset" class="inline-form">
+      <label>Reset user ID <input name="userId" required placeholder="Discord user ID" /></label>
+      <button type="submit">Reset player</button>
+    </form>
+    <form method="post" action="/administrator/pugs/elo/reset-all" onsubmit="return confirm('Reset every tracked player to the current starting ELO?');">
+      <button class="danger" type="submit">Reset all player ELO</button>
+    </form>
+  </div>
+  <div class="subsection">
+    <h3>Tracked players</h3>
+    ${ratings.length ? `<div class="pug-history">${ratings.map((rating) => `<div class="admin-team-row"><div><strong>${escapeHtml(rating.username ?? rating.userId)}</strong><br /><small><code>${escapeHtml(rating.userId)}</code> · updated ${formatDateTime(rating.updatedAt)}</small></div><div><strong>${formatElo(rating.rating)}</strong> ELO</div></div>`).join('')}</div>` : '<p>No players have persistent ELO records yet.</p>'}
+  </div>`;
+}
+
+function pugEloChangeSummary(match: PugMatchLog) {
+  if (!match.eloChanges?.length) return '';
+  const teamTotals = match.teamEloTotals?.length ? `<p><small>Starting team ELO totals: ${match.teamEloTotals.map((total, index) => `Team ${index + 1}: ${formatElo(total)}`).join(' · ')}</small></p>` : '';
+  return `${teamTotals}<p><small>ELO changes:</small></p><ul>${match.eloChanges.map((change) => `<li>${escapeHtml(change.username ?? match.playerUsernames[change.userId] ?? change.userId)}: ${change.delta >= 0 ? '+' : ''}${formatElo(change.delta)} (${formatElo(change.before)} → ${formatElo(change.after)})</li>`).join('')}</ul>`;
+}
+
+function formatElo(value: number) {
+  return Math.round(value).toLocaleString('en-US');
+}
+
+
+function parseRequiredDiscordId(value: string) {
+  const [id] = parseDiscordIds(value);
+  if (!id) throw new Error('A Discord user ID is required.');
+  return id;
+}
+
+function parsePugEloSettings(body: Record<string, unknown>): PugEloSettings {
+  return {
+    startingRating: parsePositiveInteger(body.startingRating, 'Starting ELO', 1),
+    baseChange: parsePositiveInteger(body.baseChange, 'Base ELO gain', 1),
+    strength: parseDecimalInRange(body.strength, 'ELO strength', 0.1, 5)
+  };
+}
+
+function parseDecimalInRange(value: unknown, label: string, minimum: number, maximum: number) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < minimum || number > maximum) throw new Error(`${label} must be between ${minimum} and ${maximum}.`);
+  return number;
 }
 
 function pugQueueLabel(size: number) {
@@ -1985,6 +2119,7 @@ function navigation(options: LayoutOptions) {
       <div class="nav-groups">
         <nav class="nav-links" aria-label="Primary navigation">
           ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
+          ${options.user ? `<a href="/leaderboard"${activeClass('leaderboard')}>Leaderboard</a>` : ''}
           ${options.user && currentTeam ? `<a href="/team"${activeClass('teams')}>Team</a>` : ''}
           ${options.user && !currentTeam ? `<a href="/teams/new"${activeClass('teams')}>Create Team</a>` : ''}
         </nav>

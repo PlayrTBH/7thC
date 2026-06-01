@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugMatchLog, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -10,6 +10,7 @@ const initialStore: StoreShape = {
   events: [],
   eventRegistrations: [],
   pugMatchLogs: [],
+  pugEloRatings: [],
   settings: {}
 };
 
@@ -170,6 +171,87 @@ export class JsonStore {
       const before = data.pugMatchLogs.length;
       data.pugMatchLogs = data.pugMatchLogs.filter((match) => match.id !== matchId);
       if (data.pugMatchLogs.length === before) throw new Error('PUG match log not found.');
+      return data;
+    });
+  }
+
+
+  async getPugEloSettings() {
+    const data = await this.read();
+    return normalizePugEloSettings(data.settings.pugs?.elo);
+  }
+
+  async getPugEloLeaderboard(limit = 10) {
+    const data = await this.read();
+    return [...data.pugEloRatings]
+      .sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId))
+      .slice(0, limit);
+  }
+
+  async getPugEloRatings() {
+    const data = await this.read();
+    return [...data.pugEloRatings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
+  }
+
+  async getPugEloRating(userId: string) {
+    const data = await this.read();
+    const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+    return data.pugEloRatings.find((rating) => rating.userId === userId) ?? { userId, rating: settings.startingRating, updatedAt: new Date().toISOString() };
+  }
+
+  async setPugEloRating(userId: string, rating: number, username?: string) {
+    await this.update((data) => {
+      const now = new Date().toISOString();
+      const safeRating = Math.max(0, Math.round(rating));
+      const existing = data.pugEloRatings.find((item) => item.userId === userId);
+      if (existing) {
+        existing.rating = safeRating;
+        if (username) existing.username = username;
+        existing.updatedAt = now;
+      } else {
+        data.pugEloRatings.push({ userId, username, rating: safeRating, updatedAt: now });
+      }
+      return data;
+    });
+  }
+
+  async resetPugEloRating(userId: string) {
+    await this.update((data) => {
+      const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+      const now = new Date().toISOString();
+      const existing = data.pugEloRatings.find((item) => item.userId === userId);
+      if (existing) {
+        existing.rating = settings.startingRating;
+        existing.updatedAt = now;
+      } else {
+        data.pugEloRatings.push({ userId, rating: settings.startingRating, updatedAt: now });
+      }
+      return data;
+    });
+  }
+
+  async resetAllPugEloRatings() {
+    await this.update((data) => {
+      const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+      const now = new Date().toISOString();
+      data.pugEloRatings = data.pugEloRatings.map((rating) => ({ ...rating, rating: settings.startingRating, updatedAt: now }));
+      return data;
+    });
+  }
+
+  async applyPugEloChanges(changes: PugEloChange[]) {
+    await this.update((data) => {
+      const now = new Date().toISOString();
+      for (const change of changes) {
+        const existing = data.pugEloRatings.find((rating) => rating.userId === change.userId);
+        if (existing) {
+          existing.rating = change.after;
+          if (change.username) existing.username = change.username;
+          existing.updatedAt = now;
+        } else {
+          data.pugEloRatings.push({ userId: change.userId, username: change.username, rating: change.after, updatedAt: now });
+        }
+      }
       return data;
     });
   }
@@ -427,6 +509,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     events: data.events ?? [],
     eventRegistrations: data.eventRegistrations ?? [],
     pugMatchLogs: Array.isArray(data.pugMatchLogs) ? data.pugMatchLogs.map(normalizePugMatchLog) : [],
+    pugEloRatings: Array.isArray(data.pugEloRatings) ? data.pugEloRatings.map(normalizePugEloRating).filter(Boolean) as PugEloRating[] : [],
     settings: { ...data.settings, pugs: normalizePugSettings(data.settings?.pugs) }
   };
 
@@ -481,6 +564,8 @@ function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
     voteMode: match.voteMode === 'winner' || match.voteMode === 'placements' ? match.voteMode : undefined,
     votes: match.votes && typeof match.votes === 'object' && !Array.isArray(match.votes) ? Object.fromEntries(Object.entries(match.votes).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {},
     result: typeof match.result === 'string' ? match.result : undefined,
+    teamEloTotals: Array.isArray(match.teamEloTotals) ? match.teamEloTotals.filter((rating): rating is number => typeof rating === 'number' && Number.isFinite(rating)).map(Math.round) : undefined,
+    eloChanges: Array.isArray(match.eloChanges) ? match.eloChanges.map(normalizePugEloChange).filter(Boolean) as PugEloChange[] : undefined,
     status: match.status === 'completed' || match.status === 'reset' || match.status === 'deleted' ? match.status : 'ongoing',
     createdAt: typeof match.createdAt === 'string' ? match.createdAt : now,
     updatedAt: typeof match.updatedAt === 'string' ? match.updatedAt : now,
@@ -494,8 +579,43 @@ function cryptoRandomFallback() {
 
 function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSettings {
   return {
-    queueChannelId: settings?.queueChannelId,
-    queueMessageId: settings?.queueMessageId,
-    mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : []
+    queueChannelId: typeof settings?.queueChannelId === 'string' ? settings.queueChannelId : undefined,
+    mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : [],
+    queueMessageId: typeof settings?.queueMessageId === 'string' ? settings.queueMessageId : undefined,
+    elo: normalizePugEloSettings(settings?.elo)
+  };
+}
+
+function normalizePugEloSettings(settings: Partial<PugEloSettings> | undefined): PugEloSettings {
+  const startingRating = typeof settings?.startingRating === 'number' && Number.isFinite(settings.startingRating) ? settings.startingRating : 20000;
+  const baseChange = typeof settings?.baseChange === 'number' && Number.isFinite(settings.baseChange) ? settings.baseChange : 1000;
+  const strength = typeof settings?.strength === 'number' && Number.isFinite(settings.strength) ? settings.strength : 1;
+  return {
+    startingRating: Math.max(1, Math.round(startingRating)),
+    baseChange: Math.max(1, Math.round(baseChange)),
+    strength: Math.min(5, Math.max(0.1, strength))
+  };
+}
+
+function normalizePugEloRating(rating: Partial<PugEloRating>) {
+  if (typeof rating.userId !== 'string') return undefined;
+  return {
+    userId: rating.userId,
+    username: typeof rating.username === 'string' ? rating.username : undefined,
+    rating: typeof rating.rating === 'number' && Number.isFinite(rating.rating) ? Math.max(0, Math.round(rating.rating)) : 20000,
+    updatedAt: typeof rating.updatedAt === 'string' ? rating.updatedAt : new Date().toISOString()
+  };
+}
+
+function normalizePugEloChange(change: Partial<PugEloChange>) {
+  if (typeof change.userId !== 'string') return undefined;
+  return {
+    userId: change.userId,
+    username: typeof change.username === 'string' ? change.username : undefined,
+    teamIndex: typeof change.teamIndex === 'number' && Number.isInteger(change.teamIndex) ? change.teamIndex : 0,
+    placement: typeof change.placement === 'number' && Number.isInteger(change.placement) ? change.placement : 0,
+    before: typeof change.before === 'number' && Number.isFinite(change.before) ? Math.round(change.before) : 20000,
+    after: typeof change.after === 'number' && Number.isFinite(change.after) ? Math.round(change.after) : 20000,
+    delta: typeof change.delta === 'number' && Number.isFinite(change.delta) ? Math.round(change.delta) : 0
   };
 }

@@ -75,15 +75,39 @@ export type DeveloperSettings = {
   activityType?: BotActivityType;
 };
 
+export type PugEloSettings = {
+  startingRating: number;
+  baseChange: number;
+  strength: number;
+};
+
 export type PugSettings = {
   queueChannelId?: string;
   mapPool: string[];
   queueMessageId?: string;
+  elo?: PugEloSettings;
 };
 
 export type PugTeamMode = 'random' | 'captains';
 export type PugVoteMode = 'winner' | 'placements';
 export type PugQueueSize = 6 | 12;
+
+export type PugEloRating = {
+  userId: string;
+  username?: string;
+  rating: number;
+  updatedAt: string;
+};
+
+export type PugEloChange = {
+  userId: string;
+  username?: string;
+  teamIndex: number;
+  placement: number;
+  before: number;
+  after: number;
+  delta: number;
+};
 
 export type PugMatchLog = {
   id: string;
@@ -97,6 +121,8 @@ export type PugMatchLog = {
   voteMode?: PugVoteMode;
   votes: Record<string, string>;
   result?: string;
+  teamEloTotals?: number[];
+  eloChanges?: PugEloChange[];
   status: 'ongoing' | 'completed' | 'reset' | 'deleted';
   createdAt: string;
   updatedAt: string;
@@ -117,5 +143,6 @@ export type StoreShape = {
   events: Event[];
   eventRegistrations: EventRegistration[];
   pugMatchLogs: PugMatchLog[];
+  pugEloRatings: PugEloRating[];
   settings: AdministratorSettings;
 };
