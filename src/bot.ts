@@ -26,7 +26,9 @@ import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEl
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
+const PUG_QUEUE_COUNTDOWN_MS = 60 * 1000;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
+type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
 type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
@@ -51,6 +53,7 @@ export class TeamBot {
   });
 
   private readonly pugQueues = new Map<PugQueueSize, PugQueuedPlayer[]>();
+  private readonly pugQueueCountdowns = new Map<PugQueueSize, PugQueueCountdown>();
   private readonly pugMatches = new Map<string, PugMatch>();
   private pugQueueOperation: Promise<void> = Promise.resolve();
   private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
@@ -311,14 +314,18 @@ export class TeamBot {
   private buildPugQueueMessage() {
     const embed = new EmbedBuilder()
       .setTitle('PUG Queue')
-      .setDescription('Join a pickup-game queue. If you are already in a voice channel when the queue fills, the bot will move you into the match queue channel automatically.')
+      .setDescription('Join a pickup-game queue. Once a queue reaches the game-mode size, a 60 second countdown starts. New players can still join during the countdown, and completed lobbies are grouped by similar ELO before matches start.')
       .setColor(0xc90820)
       .addFields(
         pugQueueSizes.map((size) => {
           const queued = this.pugQueues.get(size) ?? [];
+          const countdown = this.pugQueueCountdowns.get(size);
+          const countdownLabel = countdown
+            ? `\nStarting ${Math.floor(queued.length / size)} match${Math.floor(queued.length / size) === 1 ? '' : 'es'} in ${Math.max(0, Math.ceil((countdown.endsAt - Date.now()) / 1000))}s. Extra players can still join.`
+            : '';
           return {
             name: pugQueueLabel(size),
-            value: queued.length ? `${queued.length}/${size}: ${queued.map((player) => `<@${player.userId}>`).join(', ')}` : `0/${size} players queued`,
+            value: queued.length ? `${queued.length}/${size}: ${queued.map((player) => `<@${player.userId}>`).join(', ')}${countdownLabel}` : `0/${size} players queued`,
             inline: false
           };
         })
@@ -412,7 +419,7 @@ export class TeamBot {
       : guild.members.cache.get(interaction.user.id) ?? (await guild.members.fetch(interaction.user.id).catch(() => null));
     if (!member || member.user.bot) throw new Error('Only server members can join the PUG queue.');
 
-    const matchesToStart = await this.withPugQueueLock(async () => {
+    await this.withPugQueueLock(async () => {
       for (const [queueSize, players] of this.pugQueues) {
         const existingIndex = players.findIndex((player) => player.userId === member.id);
         if (existingIndex >= 0) players.splice(existingIndex, 1);
@@ -422,26 +429,17 @@ export class TeamBot {
       const queue = this.pugQueues.get(size) ?? [];
       queue.push({ userId: member.id, username: member.user.username, voiceChannelId: member.voice.channelId ?? undefined });
       this.pugQueues.set(size, queue);
+      for (const queueSize of pugQueueSizes) this.updatePugQueueCountdown(queueSize);
 
-      const readyMatches: PugQueuedPlayer[][] = [];
-      while (queue.length >= size) {
-        readyMatches.push(queue.splice(0, size));
-      }
-
-      if (queue.length) this.pugQueues.set(size, queue);
-      else this.pugQueues.delete(size);
-
-      await this.respondToPugInteraction(interaction, readyMatches.length ? `${pugQueueLabel(size)} is full. Creating ${readyMatches.length === 1 ? 'the match' : `${readyMatches.length} matches`} now.` : `You joined ${pugQueueLabel(size)} (${queue.length}/${size}).`);
-      return readyMatches;
+      const countdown = this.pugQueueCountdowns.get(size);
+      const matchCount = Math.floor(queue.length / size);
+      await this.respondToPugInteraction(
+        interaction,
+        countdown
+          ? `You joined ${pugQueueLabel(size)} (${queue.length}/${size}). ${matchCount} match${matchCount === 1 ? '' : 'es'} will be ELO-balanced when the countdown ends in ${Math.max(0, Math.ceil((countdown.endsAt - Date.now()) / 1000))} seconds.`
+          : `You joined ${pugQueueLabel(size)} (${queue.length}/${size}).`
+      );
     });
-
-    if (matchesToStart.length) {
-      this.schedulePugQueueMessageRefresh(0);
-      for (const players of matchesToStart) {
-        this.startPugMatch(guild, size, players).catch((error) => console.warn(`Unable to start ${pugQueueLabel(size)} PUG match:`, error));
-      }
-      return;
-    }
 
     this.schedulePugQueueMessageRefresh();
   }
@@ -453,9 +451,77 @@ export class TeamBot {
       const filtered = queue.filter((player) => player.userId !== interaction.user.id);
       if (filtered.length) this.pugQueues.set(size, filtered);
       else this.pugQueues.delete(size);
+      this.updatePugQueueCountdown(size);
       await this.respondToPugInteraction(interaction, before === filtered.length ? 'You were not in that PUG queue.' : `You left ${pugQueueLabel(size)}.`);
     });
     this.schedulePugQueueMessageRefresh();
+  }
+
+  private updatePugQueueCountdown(size: PugQueueSize) {
+    const queue = this.pugQueues.get(size) ?? [];
+    const countdown = this.pugQueueCountdowns.get(size);
+    if (queue.length >= size) {
+      if (countdown) return;
+      const endsAt = Date.now() + PUG_QUEUE_COUNTDOWN_MS;
+      const timer = setTimeout(() => {
+        this.finishPugQueueCountdown(size).catch((error) => console.warn(`Unable to finish ${pugQueueLabel(size)} PUG queue countdown:`, error));
+      }, PUG_QUEUE_COUNTDOWN_MS);
+      this.pugQueueCountdowns.set(size, { endsAt, timer });
+      this.schedulePugQueueMessageRefresh(0);
+      this.schedulePugQueueMessageRefresh(PUG_QUEUE_COUNTDOWN_MS);
+      return;
+    }
+
+    if (!countdown) return;
+    clearTimeout(countdown.timer);
+    this.pugQueueCountdowns.delete(size);
+    this.schedulePugQueueMessageRefresh(0);
+  }
+
+  private async finishPugQueueCountdown(size: PugQueueSize) {
+    const guild = await this.getGuild();
+    const matchesToStart = await this.withPugQueueLock(async () => {
+      const countdown = this.pugQueueCountdowns.get(size);
+      if (countdown) {
+        clearTimeout(countdown.timer);
+        this.pugQueueCountdowns.delete(size);
+      }
+
+      const queue = this.pugQueues.get(size) ?? [];
+      const matchCount = Math.floor(queue.length / size);
+      if (matchCount <= 0) {
+        this.updatePugQueueCountdown(size);
+        return [] as PugQueuedPlayer[][];
+      }
+
+      const playersForMatches = queue.splice(0, matchCount * size);
+      if (queue.length) this.pugQueues.set(size, queue);
+      else this.pugQueues.delete(size);
+      const balancedMatches = await this.createEloBalancedPugMatches(playersForMatches, size, matchCount);
+      this.updatePugQueueCountdown(size);
+      return balancedMatches;
+    });
+
+    this.schedulePugQueueMessageRefresh(0);
+    for (const players of matchesToStart) {
+      this.startPugMatch(guild, size, players).catch((error) => console.warn(`Unable to start ${pugQueueLabel(size)} PUG match:`, error));
+    }
+  }
+
+  private async createEloBalancedPugMatches(players: PugQueuedPlayer[], size: PugQueueSize, matchCount: number) {
+    const settings = await this.store.getPugEloSettings();
+    const ratings = await this.store.getPugEloRatings();
+    const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating.rating]));
+    const sortedPlayers = [...players].sort((a, b) => {
+      const ratingDifference = (ratingsByUserId.get(b.userId) ?? settings.startingRating) - (ratingsByUserId.get(a.userId) ?? settings.startingRating);
+      return ratingDifference || a.username.localeCompare(b.username) || a.userId.localeCompare(b.userId);
+    });
+
+    const matches: PugQueuedPlayer[][] = [];
+    for (let index = 0; index < matchCount; index += 1) {
+      matches.push(sortedPlayers.slice(index * size, (index + 1) * size));
+    }
+    return matches;
   }
 
   private async startPugMatch(guild: Guild, size: PugQueueSize, players: PugQueuedPlayer[]) {
