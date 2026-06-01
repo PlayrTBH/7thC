@@ -1602,8 +1602,20 @@ function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { display
       <div class="stat-card"><small>Win/loss</small><strong>${stats.totals.wins}/${stats.totals.losses}</strong></div>
       <div class="stat-card"><small>Winrate</small><strong>${formatPercent(stats.totals.winRate)}</strong></div>
     </div>
-    <div class="pug-player-stats-table"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${stats.modes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>
+    ${pugPlayerStatsTables(stats)}
   </section>`;
+}
+
+function pugPlayerStatsTables(stats: PugPlayerStats) {
+  const finalRoundModes = stats.modes.filter((mode) => mode.mode === 6);
+  const cashoutModes = stats.modes.filter((mode) => mode.mode === 12);
+  const finalRoundTable = finalRoundModes.length
+    ? `<div class="pug-player-stats-table pug-player-stats-table-no-seconds"><span>Mode</span><span>Wins</span><span>Losses</span><span>Winrate</span>${finalRoundModes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>`
+    : '';
+  const cashoutTable = cashoutModes.length
+    ? `<div class="pug-player-stats-table pug-player-stats-table-with-seconds"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${cashoutModes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>`
+    : '';
+  return `<div class="pug-player-stats-tables">${finalRoundTable}${cashoutTable}</div>`;
 }
 
 function rankBadge(rank: PugPlayerRank) {
@@ -1710,8 +1722,7 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
   };
   const buckets = new Map<PugMatchLog['size'] | 'unknown', PugPlayerModeStats>([
     [6, emptyPugPlayerModeStats(6, pugQueueLabel(6))],
-    [12, emptyPugPlayerModeStats(12, pugQueueLabel(12))],
-    ['unknown', emptyPugPlayerModeStats('unknown', 'Mode not recorded')]
+    [12, emptyPugPlayerModeStats(12, pugQueueLabel(12))]
   ]);
 
   for (const match of history) {
@@ -1719,7 +1730,8 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
     const change = match.eloChanges?.find((item) => item.userId === userId);
     if (!change) continue;
     const mode = match.size === 6 || match.size === 12 ? match.size : 'unknown';
-    const stats = buckets.get(mode) ?? emptyPugPlayerModeStats(mode, mode === 'unknown' ? 'Mode not recorded' : pugQueueLabel(mode));
+    const stats = buckets.get(mode);
+    if (!stats) continue;
     if (isCashoutSecondPlace(match, change.placement)) stats.seconds += 1;
     else if (change.placement === 1 || change.delta > 0) stats.wins += 1;
     else stats.losses += 1;
@@ -1818,7 +1830,7 @@ function pugSelectedPlayerCard(stats: PugPlayerStats, settings: PugEloSettings) 
       <div class="stat-card"><small>Losses</small><strong>${stats.totals.losses}</strong></div>
       <div class="stat-card"><small>Winrate</small><strong>${formatPercent(stats.totals.winRate)}</strong></div>
     </div>
-    <div class="pug-player-stats-table"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${stats.modes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>
+    ${pugPlayerStatsTables(stats)}
     <div class="admin-team-actions">
       <form method="post" action="/administrator/pugs/elo/player" class="inline-form">
         <input type="hidden" name="userId" value="${escapeHtml(player.userId)}" />
@@ -2567,13 +2579,16 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .pug-elo-preview { margin-top: 1rem; display: grid; gap: .75rem; }
     .pug-elo-preview-team { border-top: 1px solid var(--line); padding-top: .75rem; }
     .pug-elo-preview-table { display: grid; grid-template-columns: minmax(7rem, 1fr) repeat(4, auto); gap: .35rem .7rem; align-items: center; margin-top: .5rem; font-size: .84rem; }
-    .pug-elo-preview-table > span:nth-child(-n+5), .pug-player-stats-table > span:nth-child(-n+5) { color: var(--muted); font-weight: 700; }
+    .pug-elo-preview-table > span:nth-child(-n+5), .pug-player-stats-table-with-seconds > span:nth-child(-n+5), .pug-player-stats-table-no-seconds > span:nth-child(-n+4) { color: var(--muted); font-weight: 700; }
     .pug-player-search { display: grid; gap: 1rem; }
     .pug-player-search-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .5rem; }
     .pug-player-result { display: grid; gap: .2rem; border: 1px solid var(--line); border-radius: .85rem; padding: .7rem .8rem; background: #12141a; color: var(--text); text-decoration: none; }
     .pug-player-result:hover, .pug-player-result.selected { border-color: rgba(239,35,60,.72); background: linear-gradient(135deg, rgba(239,35,60,.16), rgba(18,20,26,.96)); }
     .pug-selected-player { display: grid; gap: 1rem; border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; background: rgba(255,255,255,.025); }
-    .pug-player-stats-table { display: grid; grid-template-columns: minmax(9rem, 1fr) repeat(4, auto); gap: .45rem .8rem; align-items: center; }
+    .pug-player-stats-tables { display: grid; gap: .75rem; }
+    .pug-player-stats-table { display: grid; gap: .45rem .8rem; align-items: center; }
+    .pug-player-stats-table-with-seconds { grid-template-columns: minmax(9rem, 1fr) repeat(4, auto); }
+    .pug-player-stats-table-no-seconds { grid-template-columns: minmax(9rem, 1fr) repeat(3, auto); }
     .elo-gain { color: #86efac; }
     .elo-loss { color: #fca5a5; }
     .pug-player { display: block; margin: .2rem 0; }
