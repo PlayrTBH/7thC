@@ -34,6 +34,8 @@ const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
+type PugRankTransition = { before: PugRankDefinition; after: PugRankDefinition };
+type PugEloResult = { changes: PugEloChange[]; teamTotals: number[]; rankTransitions: Map<string, PugRankTransition> };
 type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; playerRankRoleIds: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
@@ -61,6 +63,8 @@ export class TeamBot {
   private readonly pugMatches = new Map<string, PugMatch>();
   private pugQueueOperation: Promise<void> = Promise.resolve();
   private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
+  private pugMapPickOperation: Promise<void> = Promise.resolve();
+  private lastPickedPugMap?: string;
   private pugQueueMessageRefresh?: NodeJS.Timeout;
   private pugQueueCountdownRefresh?: NodeJS.Timeout;
   private pugQueueMessageRefreshInFlight?: Promise<void>;
@@ -900,7 +904,7 @@ export class TeamBot {
   }
 
   private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string) {
-    const map = await this.pickPugMap();
+    const map = await this.pickPugMap(match.map);
     match.teams = teams.map((team) => [...team]);
     match.map = map;
     match.updatedAt = new Date().toISOString();
@@ -930,11 +934,32 @@ export class TeamBot {
     ));
   }
 
-  private async pickPugMap() {
-    const settings = await this.store.getAdministratorSettings();
-    const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
-    if (!maps.length) return undefined;
-    return maps[randomIndex(maps.length)];
+  private async pickPugMap(currentMap?: string) {
+    const previousPick = this.pugMapPickOperation;
+    let releasePickLock!: () => void;
+    this.pugMapPickOperation = new Promise((resolve) => {
+      releasePickLock = resolve;
+    });
+
+    await previousPick;
+    try {
+      const settings = await this.store.getAdministratorSettings();
+      const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
+      if (!maps.length) return undefined;
+
+      const previousMap = this.lastPickedPugMap ?? await this.getMostRecentPugMap() ?? currentMap;
+      const eligibleMaps = previousMap && maps.some((map) => map !== previousMap) ? maps.filter((map) => map !== previousMap) : maps;
+      const map = eligibleMaps[randomIndex(eligibleMaps.length)];
+      this.lastPickedPugMap = map;
+      return map;
+    } finally {
+      releasePickLock();
+    }
+  }
+
+  private async getMostRecentPugMap() {
+    const logs = await this.store.getPugMatchLogs();
+    return logs.find((log) => log.map)?.map;
   }
 
   private async sendPugVotePrompt(text: import('discord.js').TextChannel, match: PugMatch, teamCount: number) {
@@ -1114,6 +1139,7 @@ export class TeamBot {
       await this.refreshPugResultVoteMessage(match);
       await text.send(`PUG match ended. Result: ${result}. ${formatPugEloSummary(eloResult.changes)} Cleaning up channels now.`).catch(() => undefined);
     }
+    await this.sendPugEloResultDms(guild, match, result, eloResult);
 
     await this.movePugVoiceChannelMembersToLobby(guild, match, 'PUG match ended');
 
@@ -1127,23 +1153,61 @@ export class TeamBot {
   }
 
 
-  private async applyPugEloResult(match: PugMatch, result: string) {
+  private async applyPugEloResult(match: PugMatch, result: string): Promise<PugEloResult> {
     if (match.eloChanges) {
-      return { changes: match.eloChanges, teamTotals: match.teamEloTotals ?? [] };
+      return { changes: match.eloChanges, teamTotals: match.teamEloTotals ?? [], rankTransitions: await this.buildPugRankTransitions(match.eloChanges) };
     }
     if (!match.teams?.length) throw new Error('PUG teams were not available for ELO calculation.');
-    const settings = await this.store.getPugEloSettings();
-    const ratings = new Map<string, PugEloRating>();
-    await Promise.all(match.playerIds.map(async (userId) => {
-      ratings.set(userId, await this.store.getPugEloRating(userId));
-    }));
+    const [settings, allRatings] = await Promise.all([this.store.getPugEloSettings(), this.store.getPugEloRatings()]);
+    const ratings = new Map(allRatings.map((rating) => [rating.userId, rating]));
+    for (const userId of match.playerIds) {
+      if (!ratings.has(userId)) ratings.set(userId, { userId, username: match.playerUsernames.get(userId), rating: settings.startingRating, updatedAt: new Date().toISOString() });
+    }
 
     const placements = parsePugResultPlacements(result, match.teams.length);
     const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
     const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings, match.size);
+    const rankTransitions = await this.buildPugRankTransitions(changes, [...ratings.values()]);
     await this.store.applyPugEloChanges(changes);
     await this.syncPugRankRolesForUsers(match.playerIds).catch((error) => console.warn('Unable to sync PUG rank roles after ELO changes:', error));
-    return { changes, teamTotals };
+    return { changes, teamTotals, rankTransitions };
+  }
+
+  private async buildPugRankTransitions(changes: PugEloChange[], baseRatings?: PugEloRating[]) {
+    const [ratings, rankSettings] = await Promise.all([baseRatings ? Promise.resolve(baseRatings) : this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
+    const beforeRatings = new Map(ratings.map((rating) => [rating.userId, { ...rating }]));
+    const afterRatings = new Map(ratings.map((rating) => [rating.userId, { ...rating }]));
+    for (const change of changes) {
+      const username = change.username ?? beforeRatings.get(change.userId)?.username ?? afterRatings.get(change.userId)?.username;
+      beforeRatings.set(change.userId, { ...beforeRatings.get(change.userId), userId: change.userId, username, rating: change.before, updatedAt: beforeRatings.get(change.userId)?.updatedAt ?? new Date().toISOString() });
+      afterRatings.set(change.userId, { ...afterRatings.get(change.userId), userId: change.userId, username, rating: change.after, updatedAt: afterRatings.get(change.userId)?.updatedAt ?? new Date().toISOString() });
+    }
+
+    const beforeTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...beforeRatings.values()]));
+    const afterTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...afterRatings.values()]));
+    const transitions = new Map<string, PugRankTransition>();
+    for (const change of changes) {
+      transitions.set(change.userId, {
+        before: resolvePugRank(beforeRatings.get(change.userId)!, rankSettings, beforeTopMasterUserIds),
+        after: resolvePugRank(afterRatings.get(change.userId)!, rankSettings, afterTopMasterUserIds)
+      });
+    }
+    return transitions;
+  }
+
+  private async sendPugEloResultDms(guild: Guild, match: PugMatch, result: string, eloResult: PugEloResult) {
+    await Promise.all(eloResult.changes.map(async (change) => {
+      const member = guild.members.cache.get(change.userId) ?? await guild.members.fetch(change.userId).catch(() => null);
+      if (!member) return;
+      const rankTransition = eloResult.rankTransitions.get(change.userId);
+      const content = [
+        `Your PUG match in **${guild.name}** has ended.`,
+        `Result: ${result}${match.map ? ` on ${match.map}` : ''}.`,
+        `You ${change.delta >= 0 ? 'gained' : 'lost'} **${formatElo(Math.abs(change.delta))} ELO** (${formatElo(change.before)} → ${formatElo(change.after)}).`,
+        formatPugRankTransition(rankTransition)
+      ].filter(Boolean).join('\n');
+      await member.send({ content }).catch((error) => console.warn(`Unable to DM PUG ELO result to ${change.userId}:`, error));
+    }));
   }
 
   async getPugAdminState() {
@@ -2066,6 +2130,22 @@ function formatPugEloSummary(changes: PugEloChange[]) {
 
 function formatElo(rating: number) {
   return Math.round(rating).toLocaleString('en-US');
+}
+
+
+function formatPugRankTransition(transition?: PugRankTransition) {
+  if (!transition) return undefined;
+  if (transition.before.id === transition.after.id) return `Rank: **${transition.after.label}** (no rank change).`;
+  const direction = getPugRankSortValue(transition.after) > getPugRankSortValue(transition.before) ? 'ranked up' : 'ranked down';
+  return `Rank: **${transition.before.label}** → **${transition.after.label}** (${direction}).`;
+}
+
+function getPugRankSortValue(rank: Pick<PugRankDefinition, 'id' | 'minRating'>) {
+  return rank.id === 'master-infernal' ? Number.MAX_SAFE_INTEGER : rank.minRating;
+}
+
+function sortPugRatingsForRankResolution(ratings: PugEloRating[]) {
+  return [...ratings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
 }
 
 function getPugTeamCount(size: PugQueueSize) {
