@@ -22,6 +22,10 @@ const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 type AdminPugEloPreviewPlayer = { userId: string; username?: string; rating: number; first: number; second?: number; loss: number };
 type AdminPugEloPreviewTeam = { teamIndex: number; total: number; average: number; players: AdminPugEloPreviewPlayer[] };
 type AdminPugMatchLog = PugMatchLog & { eloPreview?: AdminPugEloPreviewTeam[] };
+type PugPlayerSearchEntry = { userId: string; username?: string; rating: number; updatedAt?: string };
+type PugPlayerModeStats = { mode: PugMatchLog['size'] | 'unknown' | 'all'; label: string; wins: number; seconds: number; losses: number; total: number; winRate: number };
+type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats };
+type PugPlayerSearchState = { query: string; selectedPlayerId?: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[]; selected?: PugPlayerStats };
 
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
@@ -408,7 +412,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const [state, ratings, eloSettings] = await Promise.all([bot.getPugAdminState(), store.getPugEloRatings(), store.getPugEloSettings()]);
       const activeMatches = state.activeMatches.map((match) => addAdminPugEloPreview(match, ratings, eloSettings));
-      res.send(layout('PUG administration', administratorPugsPage(activeMatches, state.history, ratings, eloSettings), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+      const playerSearch = buildPugPlayerSearchState(state.history, ratings, eloSettings, String(req.query.q ?? ''), String(req.query.playerId ?? ''));
+      res.send(layout('PUG administration', administratorPugsPage(activeMatches, state.history, ratings, eloSettings, playerSearch), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -465,7 +470,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const userId = parseRequiredDiscordId(String(req.body.userId ?? ''));
       await store.setPugEloRating(userId, parsePositiveInteger(req.body.rating, 'ELO rating', 0), String(req.body.username ?? '').trim() || undefined);
-      res.redirect('/administrator/pugs#elo');
+      res.redirect(`/administrator/pugs?playerId=${encodeURIComponent(userId)}#elo`);
     } catch (error) {
       next(error);
     }
@@ -473,8 +478,9 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.post('/administrator/pugs/elo/player/reset', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
-      await store.resetPugEloRating(parseRequiredDiscordId(String(req.body.userId ?? '')));
-      res.redirect('/administrator/pugs#elo');
+      const userId = parseRequiredDiscordId(String(req.body.userId ?? ''));
+      await store.resetPugEloRating(userId);
+      res.redirect(`/administrator/pugs?playerId=${encodeURIComponent(userId)}#elo`);
     } catch (error) {
       next(error);
     }
@@ -1298,7 +1304,7 @@ function administratorPugSettingsForm(settings?: PugSettings) {
 }
 
 
-function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings) {
+function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings, playerSearch: PugPlayerSearchState) {
   return `<p><a href="/administrator">← Back to administrator</a></p>
     <section class="card">
       <h2>Ongoing PUG matches</h2>
@@ -1306,7 +1312,7 @@ function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMa
     </section>
     <section class="card" id="elo">
       <h2>PUG ELO administration</h2>
-      ${pugEloAdminPanel(ratings, eloSettings)}
+      ${pugEloAdminPanel(ratings, eloSettings, playerSearch)}
     </section>
     <section class="card">
       <h2>Full PUG match history</h2>
@@ -1485,7 +1491,7 @@ function leaderboardEntry(rating: LeaderboardRating) {
   </li>`;
 }
 
-function pugEloAdminPanel(ratings: PugEloRating[], settings: PugEloSettings) {
+function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, playerSearch: PugPlayerSearchState) {
   return `<div class="subsection">
     <h3>ELO formula settings</h3>
     <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Wins and losses have a 200 ELO floor; wins cap at 2,000 ELO, and losses scale by each player's ELO versus opponent average up to twice the win reward.</small></p>
@@ -1497,25 +1503,184 @@ function pugEloAdminPanel(ratings: PugEloRating[], settings: PugEloSettings) {
     </form>
   </div>
   <div class="subsection">
-    <h3>Adjust player ELO</h3>
-    <form method="post" action="/administrator/pugs/elo/player" class="inline-form">
-      <label>User ID <input name="userId" required placeholder="Discord user ID" /></label>
-      <label>Username <input name="username" placeholder="Optional display name" /></label>
-      <label>ELO <input name="rating" type="number" min="0" required value="${settings.startingRating}" /></label>
-      <button type="submit">Set player ELO</button>
-    </form>
-    <form method="post" action="/administrator/pugs/elo/player/reset" class="inline-form">
-      <label>Reset user ID <input name="userId" required placeholder="Discord user ID" /></label>
-      <button type="submit">Reset player</button>
-    </form>
+    <h3>Player search</h3>
+    <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card.</small></p>
+    ${pugPlayerSearchPanel(playerSearch, settings)}
     <form method="post" action="/administrator/pugs/elo/reset-all" onsubmit="return confirm('Reset every tracked player to the current starting ELO?');">
       <button class="danger" type="submit">Reset all player ELO</button>
     </form>
-  </div>
-  <div class="subsection">
-    <h3>Tracked players</h3>
-    ${ratings.length ? `<div class="pug-history">${ratings.map((rating) => `<div class="admin-team-row"><div><strong>${escapeHtml(rating.username ?? rating.userId)}</strong><br /><small><code>${escapeHtml(rating.userId)}</code> · updated ${formatDateTime(rating.updatedAt)}</small></div><div><strong>${formatElo(rating.rating)}</strong> ELO</div></div>`).join('')}</div>` : '<p>No players have persistent ELO records yet.</p>'}
   </div>`;
+}
+
+
+function buildPugPlayerSearchState(history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings, rawQuery: string, rawSelectedPlayerId: string): PugPlayerSearchState {
+  const query = rawQuery.trim();
+  const selectedPlayerId = parseDiscordIds(rawSelectedPlayerId)[0];
+  const players = buildPugPlayerSearchEntries(history, ratings, settings);
+  const normalizedQuery = query.toLowerCase();
+  const matches = normalizedQuery
+    ? players.filter((player) => player.userId.includes(normalizedQuery) || (player.username ?? '').toLowerCase().includes(normalizedQuery)).slice(0, 25)
+    : players.slice(0, 25);
+  const selected = selectedPlayerId ? buildPugPlayerStats(selectedPlayerId, players, history, ratings, settings) : undefined;
+  return { query, selectedPlayerId, players, matches, selected };
+}
+
+function buildPugPlayerSearchEntries(history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings): PugPlayerSearchEntry[] {
+  const players = new Map<string, PugPlayerSearchEntry>();
+  for (const rating of ratings) {
+    players.set(rating.userId, { userId: rating.userId, username: rating.username, rating: rating.rating, updatedAt: rating.updatedAt });
+  }
+  for (const match of history) {
+    for (const userId of match.playerIds) {
+      const existing = players.get(userId);
+      players.set(userId, {
+        userId,
+        username: existing?.username ?? match.playerUsernames[userId],
+        rating: existing?.rating ?? settings.startingRating,
+        updatedAt: existing?.updatedAt
+      });
+    }
+    for (const change of match.eloChanges ?? []) {
+      const existing = players.get(change.userId);
+      players.set(change.userId, {
+        userId: change.userId,
+        username: existing?.username ?? change.username ?? match.playerUsernames[change.userId],
+        rating: existing?.rating ?? change.after,
+        updatedAt: existing?.updatedAt ?? match.updatedAt
+      });
+    }
+  }
+  return [...players.values()].sort((a, b) => (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
+}
+
+function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings): PugPlayerStats {
+  const rating = ratings.find((item) => item.userId === userId);
+  const knownPlayer = players.find((player) => player.userId === userId);
+  const player: PugPlayerSearchEntry = {
+    userId,
+    username: rating?.username ?? knownPlayer?.username,
+    rating: rating?.rating ?? knownPlayer?.rating ?? settings.startingRating,
+    updatedAt: rating?.updatedAt ?? knownPlayer?.updatedAt
+  };
+  const buckets = new Map<PugMatchLog['size'] | 'unknown', PugPlayerModeStats>([
+    [6, emptyPugPlayerModeStats(6, pugQueueLabel(6))],
+    [12, emptyPugPlayerModeStats(12, pugQueueLabel(12))],
+    ['unknown', emptyPugPlayerModeStats('unknown', 'Mode not recorded')]
+  ]);
+
+  for (const match of history) {
+    if (match.status !== 'completed') continue;
+    const change = match.eloChanges?.find((item) => item.userId === userId);
+    const placement = change?.placement ?? getPugPlayerPlacementFromResult(match, userId);
+    if (!placement) continue;
+    const mode = match.size === 6 || match.size === 12 ? match.size : 'unknown';
+    const stats = buckets.get(mode) ?? emptyPugPlayerModeStats(mode, mode === 'unknown' ? 'Mode not recorded' : pugQueueLabel(mode));
+    if (placement === 1) stats.wins += 1;
+    else if (placement === 2 && match.teams.length > 2) stats.seconds += 1;
+    else stats.losses += 1;
+    stats.total += 1;
+  }
+
+  const modes = [...buckets.values()].map(finalizePugPlayerModeStats);
+  const totals = finalizePugPlayerModeStats({
+    mode: 'all',
+    label: 'All modes',
+    wins: modes.reduce((sum, mode) => sum + mode.wins, 0),
+    seconds: modes.reduce((sum, mode) => sum + mode.seconds, 0),
+    losses: modes.reduce((sum, mode) => sum + mode.losses, 0),
+    total: modes.reduce((sum, mode) => sum + mode.total, 0),
+    winRate: 0
+  });
+  return { player, modes, totals };
+}
+
+function emptyPugPlayerModeStats(mode: PugPlayerModeStats['mode'], label: string): PugPlayerModeStats {
+  return { mode, label, wins: 0, seconds: 0, losses: 0, total: 0, winRate: 0 };
+}
+
+function finalizePugPlayerModeStats(stats: PugPlayerModeStats): PugPlayerModeStats {
+  return { ...stats, winRate: stats.total ? (stats.wins / stats.total) * 100 : 0 };
+}
+
+function getPugPlayerPlacementFromResult(match: PugMatchLog, userId: string) {
+  const teamIndex = match.teams.findIndex((team) => team.includes(userId));
+  if (teamIndex < 0 || !match.result) return undefined;
+  const placements = parsePugResultPlacements(match.result, match.teams.length);
+  return placements[teamIndex];
+}
+
+function parsePugResultPlacements(result: string, teamCount: number) {
+  const placements = Array.from({ length: teamCount }, () => teamCount);
+  const indexes = [...result.matchAll(/Team\s+(\d+)/gi)].map((match) => Number(match[1]) - 1).filter((index) => Number.isInteger(index) && index >= 0 && index < teamCount);
+  if (indexes[0] !== undefined) placements[indexes[0]] = 1;
+  if (teamCount > 2 && indexes[1] !== undefined && indexes[1] !== indexes[0]) placements[indexes[1]] = 2;
+  for (let index = 0; index < teamCount; index += 1) {
+    if (placements[index] === teamCount) placements[index] = teamCount === 2 ? 2 : 3;
+  }
+  return placements;
+}
+
+function pugPlayerSearchPanel(search: PugPlayerSearchState, settings: PugEloSettings) {
+  const selected = search.selected;
+  return `<div class="pug-player-search">
+    <form method="get" action="/administrator/pugs" class="inline-form pug-player-search-form">
+      <label>Search players <input name="q" value="${escapeHtml(search.query)}" placeholder="Username or Discord user ID" list="pug-player-options" /></label>
+      <button type="submit">Search</button>
+      ${search.selectedPlayerId ? `<a class="button secondary" href="/administrator/pugs#elo">Clear selection</a>` : ''}
+      <datalist id="pug-player-options">${search.players.map((player) => `<option value="${escapeHtml(player.username ?? player.userId)}" label="${escapeHtml(player.userId)}"></option>`).join('')}</datalist>
+    </form>
+    ${pugPlayerSearchResults(search)}
+    ${selected ? pugSelectedPlayerCard(selected, settings) : '<p><small>Select a player from the search results to view stats and edit their ELO.</small></p>'}
+  </div>`;
+}
+
+function pugPlayerSearchResults(search: PugPlayerSearchState) {
+  if (!search.players.length) return '<p>No PUG players have been tracked yet.</p>';
+  if (!search.matches.length) return '<p>No players matched that search.</p>';
+  return `<div class="pug-player-search-results">${search.matches.map((player) => {
+    const params = new URLSearchParams();
+    if (search.query) params.set('q', search.query);
+    params.set('playerId', player.userId);
+    const selectedClass = search.selectedPlayerId === player.userId ? ' selected' : '';
+    return `<a class="pug-player-result${selectedClass}" href="/administrator/pugs?${params.toString()}#elo"><strong>${escapeHtml(player.username ?? player.userId)}</strong><small><code>${escapeHtml(player.userId)}</code> · ${formatElo(player.rating)} ELO</small></a>`;
+  }).join('')}</div>`;
+}
+
+function pugSelectedPlayerCard(stats: PugPlayerStats, settings: PugEloSettings) {
+  const player = stats.player;
+  return `<div class="pug-selected-player">
+    <div class="section-heading-row">
+      <div>
+        <h3>${escapeHtml(player.username ?? player.userId)}</h3>
+        <p><small><code>${escapeHtml(player.userId)}</code>${player.updatedAt ? ` · ELO updated ${formatDateTime(player.updatedAt)}` : ''}</small></p>
+      </div>
+      <div class="stat-card"><small>Current ELO</small><strong>${formatElo(player.rating)}</strong></div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><small>Total matches</small><strong>${stats.totals.total}</strong></div>
+      <div class="stat-card"><small>Wins</small><strong>${stats.totals.wins}</strong></div>
+      <div class="stat-card"><small>Seconds</small><strong>${stats.totals.seconds}</strong></div>
+      <div class="stat-card"><small>Losses</small><strong>${stats.totals.losses}</strong></div>
+      <div class="stat-card"><small>Winrate</small><strong>${formatPercent(stats.totals.winRate)}</strong></div>
+    </div>
+    <div class="pug-player-stats-table"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${stats.modes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>
+    <div class="admin-team-actions">
+      <form method="post" action="/administrator/pugs/elo/player" class="inline-form">
+        <input type="hidden" name="userId" value="${escapeHtml(player.userId)}" />
+        <input type="hidden" name="username" value="${escapeHtml(player.username ?? '')}" />
+        <label>Set ELO <input name="rating" type="number" min="0" required value="${player.rating}" /></label>
+        <button type="submit">Save ELO</button>
+      </form>
+      <form method="post" action="/administrator/pugs/elo/player/reset" class="inline-form">
+        <input type="hidden" name="userId" value="${escapeHtml(player.userId)}" />
+        <button type="submit">Reset to ${formatElo(settings.startingRating)}</button>
+      </form>
+    </div>
+  </div>`;
+}
+
+function formatPercent(value: number) {
+  return `${value.toFixed(1)}%`;
 }
 
 function pugEloChangeSummary(match: PugMatchLog) {
@@ -2131,7 +2296,13 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .pug-elo-preview { margin-top: 1rem; display: grid; gap: .75rem; }
     .pug-elo-preview-team { border-top: 1px solid var(--line); padding-top: .75rem; }
     .pug-elo-preview-table { display: grid; grid-template-columns: minmax(7rem, 1fr) repeat(4, auto); gap: .35rem .7rem; align-items: center; margin-top: .5rem; font-size: .84rem; }
-    .pug-elo-preview-table > span:nth-child(-n+5) { color: var(--muted); font-weight: 700; }
+    .pug-elo-preview-table > span:nth-child(-n+5), .pug-player-stats-table > span:nth-child(-n+5) { color: var(--muted); font-weight: 700; }
+    .pug-player-search { display: grid; gap: 1rem; }
+    .pug-player-search-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .5rem; }
+    .pug-player-result { display: grid; gap: .2rem; border: 1px solid var(--line); border-radius: .85rem; padding: .7rem .8rem; background: #12141a; color: var(--text); text-decoration: none; }
+    .pug-player-result:hover, .pug-player-result.selected { border-color: rgba(239,35,60,.72); background: linear-gradient(135deg, rgba(239,35,60,.16), rgba(18,20,26,.96)); }
+    .pug-selected-player { display: grid; gap: 1rem; border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; background: rgba(255,255,255,.025); }
+    .pug-player-stats-table { display: grid; grid-template-columns: minmax(9rem, 1fr) repeat(4, auto); gap: .45rem .8rem; align-items: center; }
     .elo-gain { color: #86efac; }
     .elo-loss { color: #fca5a5; }
     .pug-player { display: block; margin: .2rem 0; }
