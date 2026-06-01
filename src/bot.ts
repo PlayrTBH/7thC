@@ -19,7 +19,7 @@ import {
   ActivityType,
   type PresenceStatusData
 } from 'discord.js';
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
 import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
@@ -612,7 +612,7 @@ export class TeamBot {
     const settings = await this.store.getAdministratorSettings();
     const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
     if (!maps.length) return undefined;
-    return maps[Math.floor(Math.random() * maps.length)];
+    return maps[randomIndex(maps.length)];
   }
 
   private async sendPugVotePrompt(text: import('discord.js').TextChannel, match: PugMatch, teamCount: number) {
@@ -1612,10 +1612,16 @@ function createRandomTeams(playerIds: string[], size: PugQueueSize) {
   return teams;
 }
 
+
+function randomIndex(length: number) {
+  if (!Number.isSafeInteger(length) || length <= 0) throw new Error('Random index length must be a positive integer.');
+  return randomInt(length);
+}
+
 function shuffle(values: string[]) {
   const shuffled = [...values];
   for (let index = shuffled.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1));
+    const swapIndex = randomIndex(index + 1);
     [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
   }
   return shuffled;
