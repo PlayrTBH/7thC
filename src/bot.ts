@@ -612,7 +612,8 @@ export class TeamBot {
     const roleIds = new Map<string, string>();
     const assignments = new Map<string, string>();
     await Promise.all(playerIds.map(async (userId) => {
-      const rating = ratingsByUserId.get(userId) ?? await this.store.getPugEloRating(userId);
+      const rating = ratingsByUserId.get(userId);
+      if (!rating) return;
       const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
       const role = rankRoles.get(rank.id);
       labels.set(userId, formatPugRankDisplay(rank, role, rankEmojis.get(rank.id)));
@@ -1743,17 +1744,21 @@ export class TeamBot {
 
     const teamRoles = teamRoleIds.map((roleId) => roles.get(roleId)).filter((role): role is Role => Boolean(role));
     const highestTeamRolePosition = teamRoles.length ? Math.max(...teamRoles.map((role) => role.position)) : 0;
-    let desiredPosition = Math.min(Math.max(highestTeamRolePosition + 1, 1), highestManageablePosition);
-    for (const role of editableRankRoles.sort((a, b) => a.position - b.position)) {
-      if (role.hoist) await role.setHoist(false, 'PUG rank roles are not displayed separately by 7th Circle Team Hub');
-      if (role.position < desiredPosition) {
-        await role.setPosition(desiredPosition, { reason: 'PUG rank roles are placed above team roles when Discord role hierarchy allows it' });
-      }
-      desiredPosition = Math.min(desiredPosition + 1, highestManageablePosition);
+    const lowestDesiredPosition = Math.max(1, highestTeamRolePosition + 1);
+    const highestFittingStartPosition = Math.max(1, highestManageablePosition - editableRankRoles.length + 1);
+    const startPosition = Math.min(lowestDesiredPosition, highestFittingStartPosition);
+
+    await Promise.all(editableRankRoles.map((role) => role.hoist
+      ? role.setHoist(false, 'PUG rank roles are not displayed separately by 7th Circle Team Hub')
+      : Promise.resolve(role)));
+
+    const rolePositions = editableRankRoles.map((role, index) => ({ role, position: startPosition + index }));
+    if (rolePositions.some(({ role, position }) => role.position !== position)) {
+      await guild.roles.setPositions(rolePositions);
     }
   }
 
-  private async syncPugRankRolesForUsers(userIds: string[]) {
+  private async syncPugRankRolesForUsers(userIds: string[], pruneUnassignedMembers = false) {
     const guild = await this.getGuild();
     const rankRoles = await this.ensurePugRankRoles(guild);
     const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
@@ -1761,27 +1766,43 @@ export class TeamBot {
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const assignments = new Map<string, string>();
     for (const userId of new Set(userIds)) {
-      const rating = ratingsByUserId.get(userId) ?? await this.store.getPugEloRating(userId);
+      const rating = ratingsByUserId.get(userId);
+      if (!rating) continue;
       const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
       const role = rankRoles.get(rank.id);
       if (role) assignments.set(userId, role.id);
     }
-    await this.applyPugRankRoles(guild, assignments, [...rankRoles.values()].map((role) => role.id));
+    await this.applyPugRankRoles(guild, assignments, [...rankRoles.values()].map((role) => role.id), pruneUnassignedMembers);
   }
 
   private async syncPugRankRolesForRatedMembers(guild: Guild) {
     const ratings = await this.store.getPugEloRatings();
-    await this.syncPugRankRolesForUsers(ratings.map((rating) => rating.userId));
+    await this.syncPugRankRolesForUsers(ratings.map((rating) => rating.userId), true);
   }
 
-  private async applyPugRankRoles(guild: Guild, assignments: Map<string, string>, knownRankRoleIds?: string[]) {
+  private async applyPugRankRoles(guild: Guild, assignments: Map<string, string>, knownRankRoleIds?: string[], pruneUnassignedMembers = false) {
     const rankRoleIds = knownRankRoleIds ?? [...(await this.ensurePugRankRoles(guild)).values()].map((role) => role.id);
-    await Promise.all([...assignments.entries()].map(async ([userId, selectedRoleId]) => {
-      const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+    const membersByUserId = new Map<string, GuildMember>();
+    if (pruneUnassignedMembers) {
+      const members = await guild.members.fetch().catch((error) => {
+        console.warn('Unable to fetch guild members while pruning PUG rank roles:', error);
+        return null;
+      });
+      members?.forEach((member) => {
+        if (assignments.has(member.id) || rankRoleIds.some((roleId) => member.roles.cache.has(roleId))) {
+          membersByUserId.set(member.id, member);
+        }
+      });
+    }
+
+    const targetUserIds = new Set(pruneUnassignedMembers ? [...membersByUserId.keys(), ...assignments.keys()] : assignments.keys());
+    await Promise.all([...targetUserIds].map(async (userId) => {
+      const selectedRoleId = assignments.get(userId);
+      const member = membersByUserId.get(userId) ?? guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
       if (!member) return;
       const staleRoleIds = rankRoleIds.filter((roleId) => roleId !== selectedRoleId && member.roles.cache.has(roleId));
       if (staleRoleIds.length) await member.roles.remove(staleRoleIds, 'PUG rank role changed').catch((error) => console.warn(`Unable to remove stale PUG rank roles from ${userId}:`, error));
-      if (!member.roles.cache.has(selectedRoleId)) await member.roles.add(selectedRoleId, 'PUG rank role changed').catch((error) => console.warn(`Unable to add PUG rank role to ${userId}:`, error));
+      if (selectedRoleId && !member.roles.cache.has(selectedRoleId)) await member.roles.add(selectedRoleId, 'PUG rank role changed').catch((error) => console.warn(`Unable to add PUG rank role to ${userId}:`, error));
     }));
   }
 

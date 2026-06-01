@@ -2796,6 +2796,8 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .rank-badge.rank-diamond { color: #60a5fa; }
     .rank-badge.rank-infernal { color: #f97316; text-shadow: 0 0 10px rgba(249, 115, 22, .35); }
     .rank-badge.master-rank { color: #c2410c; text-shadow: 0 0 12px rgba(251, 146, 60, .72); }
+    .leaderboard-profile-section .rank-badge .rank-icon { width: 1.25em; height: 1.25em; border: 0; border-radius: 0; background: transparent; object-fit: contain; filter: drop-shadow(0 0 7px rgba(0,0,0,.32)); }
+    .leaderboard-profile-section .rank-badge .rank-icon-empty { width: 1.1em; height: 1.1em; border: 1px solid var(--line); border-radius: .3rem; background: #0f1116; }
     @keyframes leaderboard-outline-glow { 0%, 100% { box-shadow: 0 0 16px rgba(239, 68, 68, .2), 0 0 28px rgba(249, 115, 22, .16), 0 0 38px rgba(250, 204, 21, .1), inset 0 0 22px rgba(249, 115, 22, .05); } 50% { box-shadow: 0 0 24px rgba(239, 68, 68, .36), 0 0 42px rgba(249, 115, 22, .32), 0 0 58px rgba(250, 204, 21, .22), inset 0 0 34px rgba(250, 204, 21, .1); } }
     @keyframes leaderboard-outline-flow { 0% { background-position: 0 0, 0% 50%; } 100% { background-position: 0 0, 300% 50%; } }
     @keyframes leaderboard-yellow-shimmer { 0% { background-position: 140% 50%; filter: drop-shadow(0 0 2px rgba(250, 204, 21, .35)); } 50% { filter: drop-shadow(0 0 8px rgba(250, 204, 21, .72)); } 100% { background-position: -100% 50%; filter: drop-shadow(0 0 2px rgba(250, 204, 21, .35)); } }
