@@ -1613,7 +1613,7 @@ function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, pl
   </div>
   <div class="subsection">
     <h3>Player search</h3>
-    <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card. Wins and losses are based only on whether completed match ELO went up or down.</small></p>
+    <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card. First-place and second-place finishes are based on completed match placements. Cashout seconds are listed separately and count toward winrate.</small></p>
     ${pugPlayerSearchPanel(playerSearch, settings)}
     <form method="post" action="/administrator/pugs/elo/reset-all" onsubmit="return confirm('Reset every tracked player to the current starting ELO?');">
       <button class="danger" type="submit">Reset all player ELO</button>
@@ -1683,8 +1683,8 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
     if (!change) continue;
     const mode = match.size === 6 || match.size === 12 ? match.size : 'unknown';
     const stats = buckets.get(mode) ?? emptyPugPlayerModeStats(mode, mode === 'unknown' ? 'Mode not recorded' : pugQueueLabel(mode));
-    if (change.placement === 1 || change.delta > 0) stats.wins += 1;
-    else if (change.placement === 2 && match.teams.length > 2) stats.seconds += 1;
+    if (isCashoutSecondPlace(match, change.placement)) stats.seconds += 1;
+    else if (change.placement === 1 || change.delta > 0) stats.wins += 1;
     else stats.losses += 1;
     stats.total += 1;
   }
@@ -1708,7 +1708,16 @@ function emptyPugPlayerModeStats(mode: PugPlayerModeStats['mode'], label: string
 }
 
 function finalizePugPlayerModeStats(stats: PugPlayerModeStats): PugPlayerModeStats {
-  return { ...stats, winRate: stats.total ? (stats.wins / stats.total) * 100 : 0 };
+  const winningFinishes = stats.wins + stats.seconds;
+  return { ...stats, winRate: stats.total ? (winningFinishes / stats.total) * 100 : 0 };
+}
+
+function isCashoutSecondPlace(match: PugMatchLog, placement: number) {
+  return placement === 2 && getPugTeamCount(match.size) > 2;
+}
+
+function getPugTeamCount(size: number) {
+  return size === 12 ? 4 : 2;
 }
 
 function getPugPlayerPlacementFromResult(match: PugMatchLog, userId: string) {
@@ -1906,7 +1915,7 @@ function parseDecimalInRange(value: unknown, label: string, minimum: number, max
 }
 
 function pugQueueLabel(size: number) {
-  return size === 12 ? '12-player PUG' : '6-player PUG';
+  return size === 12 ? 'Cashout' : 'Final Round';
 }
 
 function modeLabel(mode: string) {
