@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankSettings, PugSettings, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -179,6 +179,11 @@ export class JsonStore {
   async getPugEloSettings() {
     const data = await this.read();
     return normalizePugEloSettings(data.settings.pugs?.elo);
+  }
+
+  async getPugRankSettings() {
+    const data = await this.read();
+    return normalizePugRankSettings(data.settings.pugs?.ranks);
   }
 
   async getPugEloLeaderboard(limit = 10) {
@@ -612,8 +617,48 @@ function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSe
     queueChannelId: typeof settings?.queueChannelId === 'string' ? settings.queueChannelId : undefined,
     mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : [],
     queueMessageId: typeof settings?.queueMessageId === 'string' ? settings.queueMessageId : undefined,
-    elo: normalizePugEloSettings(settings?.elo)
+    elo: normalizePugEloSettings(settings?.elo),
+    ranks: normalizePugRankSettings(settings?.ranks)
   };
+}
+
+
+const defaultPugRanks: PugRankSettings = {
+  ranks: [
+    { id: 'bronze', label: 'Bronze', abbreviation: 'B', minRating: 0, maxRating: 14999 },
+    { id: 'silver', label: 'Silver', abbreviation: 'S', minRating: 15000, maxRating: 19999 },
+    { id: 'gold', label: 'Gold', abbreviation: 'G', minRating: 20000, maxRating: 24999 },
+    { id: 'platinum', label: 'Platinum', abbreviation: 'P', minRating: 25000, maxRating: 29999 },
+    { id: 'diamond', label: 'Diamond', abbreviation: 'D', minRating: 30000, maxRating: 34999 },
+    { id: 'infernal', label: 'Infernal', abbreviation: 'I', minRating: 35000 }
+  ]
+};
+
+function normalizePugRankSettings(settings: Partial<PugRankSettings> | undefined): PugRankSettings {
+  const ranks = Array.isArray(settings?.ranks) ? settings.ranks.map(normalizePugRankDefinition).filter(Boolean) as PugRankSettings['ranks'] : [];
+  const safeRanks = (ranks.length ? ranks : defaultPugRanks.ranks).sort((a, b) => a.minRating - b.minRating || a.label.localeCompare(b.label));
+  return {
+    ranks: safeRanks,
+    masterIconDataUrl: isImageDataUrl(settings?.masterIconDataUrl) ? settings.masterIconDataUrl : undefined
+  };
+}
+
+function normalizePugRankDefinition(rank: Partial<PugRankSettings['ranks'][number]>) {
+  if (typeof rank.id !== 'string' || !rank.id.trim()) return undefined;
+  const minRating = typeof rank.minRating === 'number' && Number.isFinite(rank.minRating) ? Math.max(0, Math.round(rank.minRating)) : 0;
+  const maxRating = typeof rank.maxRating === 'number' && Number.isFinite(rank.maxRating) ? Math.max(minRating, Math.round(rank.maxRating)) : undefined;
+  return {
+    id: rank.id.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 48) || 'rank',
+    label: typeof rank.label === 'string' && rank.label.trim() ? rank.label.trim().slice(0, 48) : 'Rank',
+    abbreviation: typeof rank.abbreviation === 'string' && rank.abbreviation.trim() ? rank.abbreviation.trim().slice(0, 8) : '',
+    minRating,
+    maxRating,
+    iconDataUrl: isImageDataUrl(rank.iconDataUrl) ? rank.iconDataUrl : undefined
+  };
+}
+
+function isImageDataUrl(value: unknown): value is string {
+  return typeof value === 'string' && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(value) && value.length <= 1_000_000;
 }
 
 function normalizePugEloSettings(settings: Partial<PugEloSettings> | undefined): PugEloSettings {
