@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugAbandonLog, PugAbandonSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
+import { DEVELOPER_DISCORD_USER_ID } from './config.js';
 
 const initialStore: StoreShape = {
   teams: [],
@@ -247,7 +248,9 @@ export class JsonStore {
 
   async getPugSeasonLeaderboards() {
     const data = await this.read();
-    return [...data.pugSeasonLeaderboards].sort((a, b) => b.seasonLabel.localeCompare(a.seasonLabel) || a.placement - b.placement);
+    return data.pugSeasonLeaderboards
+      .filter((entry) => !isDeveloperAccount(entry.userId))
+      .sort((a, b) => b.seasonLabel.localeCompare(a.seasonLabel) || a.placement - b.placement);
   }
 
   async getPugUserBadges(userId: string) {
@@ -294,6 +297,7 @@ export class JsonStore {
   async getPugEloLeaderboard(limit = 10) {
     const data = await this.read();
     return [...data.pugEloRatings]
+      .filter((rating) => !isDeveloperAccount(rating.userId))
       .sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId))
       .slice(0, limit);
   }
@@ -930,6 +934,11 @@ function defaultPugSeason(): PugSeason {
   return { id: 's1', label: 'S1', status: 'active', startsAt: new Date().toISOString(), badgeRewards: [] };
 }
 
+
+function isDeveloperAccount(userId: string) {
+  return userId === DEVELOPER_DISCORD_USER_ID;
+}
+
 function ensurePugSeasonState(data: StoreShape) {
   data.settings.pugs = normalizePugSettings(data.settings.pugs);
   const activeSeason = getActivePugSeason(data);
@@ -951,11 +960,12 @@ function finalizeActivePugSeason(data: StoreShape, endedAt: string, nextSeasonLa
   const rankSettings = normalizePugRankSettings(data.settings.pugs?.ranks);
   const eloSettings = normalizePugEloSettings(data.settings.pugs?.elo);
   const sortedRatings = [...data.pugEloRatings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
-  const masterUserIds = new Set(sortedRatings.slice(0, 3).map((rating) => rating.userId));
+  const publicSortedRatings = sortedRatings.filter((rating) => !isDeveloperAccount(rating.userId));
+  const masterUserIds = new Set(publicSortedRatings.slice(0, 3).map((rating) => rating.userId));
   const rewards = completeSeasonBadgeRewards(activeSeason, rankSettings);
 
   data.pugSeasonLeaderboards = data.pugSeasonLeaderboards.filter((entry) => entry.seasonId !== activeSeason.id);
-  data.pugSeasonLeaderboards.push(...sortedRatings.slice(0, 10).map((rating, index) => {
+  data.pugSeasonLeaderboards.push(...publicSortedRatings.slice(0, 10).map((rating, index) => {
     const rank = resolveSeasonRank(rating.rating, rankSettings, masterUserIds.has(rating.userId));
     return { seasonId: activeSeason.id, seasonLabel: activeSeason.label, userId: rating.userId, username: rating.username, rating: rating.rating, rankId: rank.id, rankLabel: rank.label, placement: index + 1 };
   }));

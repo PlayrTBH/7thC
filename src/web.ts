@@ -304,7 +304,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getActivePugSeason(),
         store.getPugSeasonLeaderboards()
       ]);
-      const topMasterUserIds = new Set(allRatings.slice(0, 3).map((rating) => rating.userId));
+      const topMasterUserIds = getTopMasterUserIds(allRatings);
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
       const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
       const decoratedLeaderboard = leaderboard.map((rating) => {
@@ -581,7 +581,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getPugUserBadgeSelection(userId)
       ]);
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
-      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, new Set(ratings.slice(0, 3).map((rating) => rating.userId)));
+      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings));
       const profile = profiles[0];
       res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
@@ -1783,8 +1783,17 @@ function rankClassId(id: string) {
   return id.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
 }
 
+
+function isDeveloperAccount(userId: string) {
+  return userId === DEVELOPER_DISCORD_USER_ID;
+}
+
+function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[]) {
+  return new Set(ratings.filter((rating) => !isDeveloperAccount(rating.userId)).slice(0, 3).map((rating) => rating.userId));
+}
+
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugPlayerRank {
-  if (topMasterUserIds.has(rating.userId)) {
+  if (!isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) {
     return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating.rating, iconDataUrl: settings.masterIconDataUrl, isMaster: true };
   }
   const ranks = settings.ranks.length ? settings.ranks : [];
