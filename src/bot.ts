@@ -52,6 +52,7 @@ export class TeamBot {
 
   private readonly pugQueues = new Map<PugQueueSize, PugQueuedPlayer[]>();
   private readonly pugMatches = new Map<string, PugMatch>();
+  private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
   private restartOperation?: Promise<void>;
 
@@ -675,6 +676,22 @@ export class TeamBot {
   }
 
   private async endPugMatch(match: PugMatch, result: string) {
+    const existing = this.pugMatchEndLocks.get(match.id);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const operation = this.finishPugMatch(match, result).finally(() => {
+      this.pugMatchEndLocks.delete(match.id);
+    });
+    this.pugMatchEndLocks.set(match.id, operation);
+    await operation;
+  }
+
+  private async finishPugMatch(match: PugMatch, result: string) {
+    if (!this.pugMatches.has(match.id)) return;
+
     const guild = await this.getGuild();
     const lobby = await this.ensurePugLobbyChannel(guild);
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
@@ -702,6 +719,9 @@ export class TeamBot {
 
 
   private async applyPugEloResult(match: PugMatch, result: string) {
+    if (match.eloChanges) {
+      return { changes: match.eloChanges, teamTotals: match.teamEloTotals ?? [] };
+    }
     if (!match.teams?.length) throw new Error('PUG teams were not available for ELO calculation.');
     const settings = await this.store.getPugEloSettings();
     const ratings = new Map<string, PugEloRating>();
