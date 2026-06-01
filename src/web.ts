@@ -1374,7 +1374,7 @@ function pugVoteSummary(match: PugMatchLog) {
 function formatPugVote(match: PugMatchLog, vote: string) {
   if (match.voteMode !== 'placements') return `Team ${Number(vote) + 1}`;
   const [first, second] = vote.split(',');
-  return `1st: ${first ? `Team ${Number(first) + 1}` : '—'}, 2nd: ${second ? `Team ${Number(second) + 1}` : '—'}`;
+  return `Winner: ${first ? `Team ${Number(first) + 1}` : '—'}, Second: ${second ? `Team ${Number(second) + 1}` : '—'}`;
 }
 
 function formatPugTeamsForInput(match: PugMatchLog) {
