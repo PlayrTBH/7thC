@@ -27,6 +27,7 @@ type PugPlayerModeStats = { mode: PugMatchLog['size'] | 'unknown' | 'all'; label
 type PugPlayerRank = PugRankDefinition & { isMaster?: boolean };
 type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats; rank: PugPlayerRank };
 type PugPlayerSearchState = { query: string; selectedPlayerId?: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[]; selected?: PugPlayerStats };
+type LeaderboardPlayerSearchState = { query: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[] };
 
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
@@ -71,7 +72,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         return;
       }
 
-      res.redirect('/events');
+      res.redirect('/leaderboard');
     } catch (error) {
       next(error);
     }
@@ -102,7 +103,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const member = await bot.getGuildMember(user.id);
       req.session.discordUser = user;
       delete req.session.oauthState;
-      res.redirect(member ? '/events' : '/join-discord');
+      res.redirect(member ? '/leaderboard' : '/join-discord');
     } catch (error) {
       next(error);
     }
@@ -118,7 +119,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         bot.getAdministratorAccess(user.id)
       ]);
       if (member) {
-        res.redirect('/events');
+        res.redirect('/leaderboard');
         return;
       }
       res.status(403).send(layout('Join the Discord', joinDiscordPage(inviteUrl), { user, isAdmin: administratorAccess.isAdmin }));
@@ -274,13 +275,15 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/leaderboard', requireAuth, async (req, res, next) => {
     try {
-      const [leaderboard, ownRating, administratorAccess, rankSettings] = await Promise.all([
+      const [leaderboard, ownRating, administratorAccess, rankSettings, allRatings, history, eloSettings] = await Promise.all([
         store.getPugEloLeaderboard(10),
         store.getPugEloRating(req.session.discordUser!.id),
         bot.getAdministratorAccess(req.session.discordUser!.id),
-        store.getPugRankSettings()
+        store.getPugRankSettings(),
+        store.getPugEloRatings(),
+        store.getPugMatchLogs(),
+        store.getPugEloSettings()
       ]);
-      const allRatings = await store.getPugEloRatings();
       const topMasterUserIds = new Set(allRatings.slice(0, 3).map((rating) => rating.userId));
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
       const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
@@ -290,7 +293,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         const username = profile?.username ?? (rating.username && rating.username !== displayName ? rating.username : undefined);
         return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '', rank: resolvePugRank(rating, rankSettings, topMasterUserIds) };
       });
-      res.send(layout('7th Circle Leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds)), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      const playerSearch = buildLeaderboardPlayerSearchState(history, allRatings, eloSettings, leaderboard.map((rating) => rating.userId), String(req.query.q ?? ''));
+      res.send(layout('7th Circle Leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds), playerSearch), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -1528,16 +1532,38 @@ function parseDiscordIds(value: string) {
 
 type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string; rank: PugPlayerRank };
 
-function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank) {
+function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank, playerSearch: LeaderboardPlayerSearchState) {
   return `<section class="card">
     <h2>Top 10 7th Circle players</h2>
     ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+    ${leaderboardPlayerSearchPanel(playerSearch)}
   </section>
   <section class="card">
     <h2>Your PUG ELO</h2>
     <div class="stat-grid"><div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div><div class="stat-card"><small>Current rank</small><strong>${rankBadge(ownRank)}</strong></div></div>
     <p><small>You can also use the Discord <code>/elo</code> command to see this rating privately.</small></p>
   </section>`;
+}
+
+function leaderboardPlayerSearchPanel(search: LeaderboardPlayerSearchState) {
+  return `<div class="leaderboard-player-search">
+    <h3>Find another player</h3>
+    <p><small>Search for PUG players who are not currently in the top 10.</small></p>
+    <form method="get" action="/leaderboard" class="inline-form leaderboard-player-search-form">
+      <label>Search players <input name="q" value="${escapeHtml(search.query)}" placeholder="Username or Discord user ID" list="leaderboard-player-options" /></label>
+      <button type="submit">Search</button>
+      ${search.query ? '<a class="button secondary" href="/leaderboard">Clear</a>' : ''}
+      <datalist id="leaderboard-player-options">${search.players.map((player) => `<option value="${escapeHtml(player.username ?? player.userId)}" label="${escapeHtml(player.userId)}"></option>`).join('')}</datalist>
+    </form>
+    ${leaderboardPlayerSearchResults(search)}
+  </div>`;
+}
+
+function leaderboardPlayerSearchResults(search: LeaderboardPlayerSearchState) {
+  if (!search.query) return '<p><small>Enter a name or Discord user ID to look up players outside the top 10.</small></p>';
+  if (!search.players.length) return '<p><small>No players outside the top 10 have been tracked yet.</small></p>';
+  if (!search.matches.length) return '<p><small>No non-top-10 players matched that search.</small></p>';
+  return `<div class="pug-player-search-results">${search.matches.map((player) => `<a class="pug-player-result" href="/leaderboard/players/${encodeURIComponent(player.userId)}"><strong>${escapeHtml(player.username ?? player.userId)}</strong><small><code>${escapeHtml(player.userId)}</code> · ${formatElo(player.rating)} ELO</small></a>`).join('')}</div>`;
 }
 
 function leaderboardEntry(rating: LeaderboardRating) {
@@ -1621,6 +1647,17 @@ function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, pl
   </div>`;
 }
 
+
+function buildLeaderboardPlayerSearchState(history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings, topLeaderboardUserIds: string[], rawQuery: string): LeaderboardPlayerSearchState {
+  const query = rawQuery.trim();
+  const topLeaderboardUserIdSet = new Set(topLeaderboardUserIds);
+  const players = buildPugPlayerSearchEntries(history, ratings, settings).filter((player) => !topLeaderboardUserIdSet.has(player.userId));
+  const normalizedQuery = query.toLowerCase();
+  const matches = normalizedQuery
+    ? players.filter((player) => player.userId.includes(normalizedQuery) || (player.username ?? '').toLowerCase().includes(normalizedQuery)).slice(0, 25)
+    : [];
+  return { query, players, matches };
+}
 
 function buildPugPlayerSearchState(history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings, rawQuery: string, rawSelectedPlayerId: string): PugPlayerSearchState {
   const query = rawQuery.trim();
@@ -2510,6 +2547,8 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .leaderboard-profile-section.profile-master { border-color: rgba(239, 68, 68, .86); background: radial-gradient(ellipse at 20% 14%, rgba(251, 146, 60, .3), rgba(239, 68, 68, .1) 42%, transparent 74%), #12141a; box-shadow: 0 0 22px rgba(251, 146, 60, .2), 0 0 30px rgba(239, 68, 68, .24), inset 0 0 38px rgba(251, 146, 60, .1); }
     .leaderboard-profile-section.profile-master h2 { color: #fb923c; text-shadow: 0 0 12px rgba(251, 146, 60, .72), 0 0 24px rgba(239, 68, 68, .44); }
     .leaderboard-profile-card { margin-bottom: 1rem; }
+    .leaderboard-player-search { display: grid; gap: .75rem; margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--line); }
+    .leaderboard-player-search h3, .leaderboard-player-search p { margin: 0; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
     .section-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
@@ -2661,12 +2700,12 @@ function navigation(options: LayoutOptions) {
     : '<a class="button" href="/auth/discord">Log in</a>';
 
   return `<header class="topbar">
-    <a class="brand" href="${options.user ? '/events' : '/'}"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle</span></a>
+    <a class="brand" href="${options.user ? '/leaderboard' : '/'}"><img class="brand-mark" src="/favicon.svg" alt="" /><span>7th Circle</span></a>
     <div class="nav-shell">
       <div class="nav-groups">
         <nav class="nav-links" aria-label="Primary navigation">
-          ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
           ${options.user ? `<a href="/leaderboard"${activeClass('leaderboard')}>Leaderboard</a>` : ''}
+          ${options.user ? `<a href="/events"${activeClass('events')}>Events</a>` : ''}
           ${options.user && currentTeam ? `<a href="/team"${activeClass('teams')}>Team</a>` : ''}
           ${options.user && !currentTeam ? `<a href="/teams/new"${activeClass('teams')}>Create Team</a>` : ''}
         </nav>
