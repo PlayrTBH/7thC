@@ -615,7 +615,7 @@ export class TeamBot {
   }
 
   private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string) {
-    const map = await this.pickPugMap();
+    const map = await this.pickPugMap(match.size);
     match.teams = teams.map((team) => [...team]);
     match.map = map;
     match.updatedAt = new Date().toISOString();
@@ -645,7 +645,9 @@ export class TeamBot {
     ));
   }
 
-  private async pickPugMap() {
+  private async pickPugMap(size: PugQueueSize) {
+    if (size === 6) return 'Random';
+
     const settings = await this.store.getAdministratorSettings();
     const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
     if (!maps.length) return undefined;
@@ -730,7 +732,6 @@ export class TeamBot {
     if (!this.pugMatches.has(match.id)) return;
 
     const guild = await this.getGuild();
-    const lobby = await this.ensurePugLobbyChannel(guild);
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     const eloResult = await this.applyPugEloResult(match, result);
     match.eloChanges = eloResult.changes;
@@ -740,10 +741,7 @@ export class TeamBot {
       await text.send(`PUG match ended. Result: ${result}. ${formatPugEloSummary(eloResult.changes)} Cleaning up channels now.`).catch(() => undefined);
     }
 
-    await Promise.all(match.playerIds.map(async (userId) => {
-      const member = await guild.members.fetch(userId).catch(() => null);
-      if (member?.voice.channelId) await member.voice.setChannel(lobby, 'PUG match ended').catch(() => undefined);
-    }));
+    await this.movePugVoiceChannelMembersToLobby(guild, match, 'PUG match ended');
 
     for (const channelId of [...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
       await guild.channels.delete(channelId, 'PUG match ended').catch(() => undefined);
@@ -903,10 +901,21 @@ export class TeamBot {
 
   private async cleanupPugMatchChannels(match: PugMatch, reason: string) {
     const guild = await this.getGuild();
+    await this.movePugVoiceChannelMembersToLobby(guild, match, reason);
     await this.deletePugTeamVoiceChannels(guild, match, reason);
     for (const channelId of [match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
       await guild.channels.delete(channelId, reason).catch(() => undefined);
     }
+  }
+
+  private async movePugVoiceChannelMembersToLobby(guild: Guild, match: PugMatch, reason: string) {
+    const lobby = await this.ensurePugLobbyChannel(guild);
+    const voiceChannelIds = [match.queueVoiceChannelId, ...match.teamVoiceChannelIds];
+    await Promise.all(voiceChannelIds.map(async (channelId) => {
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (!channel || channel.type !== ChannelType.GuildVoice) return;
+      await Promise.all(channel.members.map((member) => member.voice.setChannel(lobby, reason).catch(() => undefined)));
+    }));
   }
 
   private async deletePugTeamVoiceChannels(guild: Guild, match: PugMatch, reason: string) {
