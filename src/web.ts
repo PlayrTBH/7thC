@@ -270,7 +270,15 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getPugEloRating(req.session.discordUser!.id),
         bot.getAdministratorAccess(req.session.discordUser!.id)
       ]);
-      res.send(layout('PUG ELO leaderboard', leaderboardPage(leaderboard, ownRating), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
+      const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
+      const decoratedLeaderboard = leaderboard.map((rating) => {
+        const profile = profilesByUserId.get(rating.userId);
+        const displayName = profile?.displayName ?? rating.username ?? 'Unknown Discord user';
+        const username = profile?.username ?? (rating.username && rating.username !== displayName ? rating.username : undefined);
+        return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '' };
+      });
+      res.send(layout('PUG ELO leaderboard', leaderboardPage(decoratedLeaderboard, ownRating), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -1382,17 +1390,29 @@ function parseDiscordIds(value: string) {
   return [...value.matchAll(/\d{5,}/g)].map((match) => match[0]);
 }
 
-function leaderboardPage(leaderboard: PugEloRating[], ownRating: PugEloRating) {
+type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string };
+
+function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating) {
   return `<section class="card">
     <h2>Top 10 PUG ELO players</h2>
     <p><small>Players start at 20,000 ELO by default. Winning as an underdog pays more, winning as a favorite pays less, and the maximum win gain is capped at 2,000 ELO.</small></p>
-    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => `<li><strong>${escapeHtml(rating.username ?? rating.userId)}</strong><span>${formatElo(rating.rating)} ELO</span></li>`).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
   </section>
   <section class="card">
     <h2>Your PUG ELO</h2>
     <div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div>
     <p><small>You can also use the Discord <code>/elo</code> command to see this rating privately.</small></p>
   </section>`;
+}
+
+function leaderboardEntry(rating: LeaderboardRating) {
+  return `<li>
+    <div class="leaderboard-player">
+      ${rating.avatarUrl ? `<img src="${escapeHtml(rating.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
+      <span><strong>${escapeHtml(rating.displayName)}</strong>${rating.username ? `<small>@${escapeHtml(rating.username)}</small>` : ''}</span>
+    </div>
+    <span>${formatElo(rating.rating)} ELO</span>
+  </li>`;
 }
 
 function pugEloAdminPanel(ratings: PugEloRating[], settings: PugEloSettings) {
@@ -2016,6 +2036,13 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .checkbox-user { display: grid; gap: .18rem; min-width: 0; }
     .checkbox-user strong, .checkbox-user small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
+    .leaderboard-list { counter-reset: leaderboard-rank; display: grid; gap: .65rem; padding-left: 0; list-style: none; }
+    .leaderboard-list li, .leaderboard-player { display: flex; align-items: center; gap: .75rem; }
+    .leaderboard-list li { counter-increment: leaderboard-rank; justify-content: space-between; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; padding: .75rem .85rem; }
+    .leaderboard-list li::before { content: counter(leaderboard-rank); display: grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 999px; background: var(--red-soft); color: var(--red-strong); font-weight: 900; flex: 0 0 auto; }
+    .leaderboard-player { min-width: 0; }
+    .leaderboard-player span { display: grid; min-width: 0; }
+    .leaderboard-player strong, .leaderboard-player small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
     .section-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
@@ -2034,7 +2061,7 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .pug-player { display: block; margin: .2rem 0; }
     .pug-history { display: grid; gap: 1rem; }
     .member-info { flex: 1 1 12rem; }
-    .member img, .managed-member img, .avatar-placeholder { width: 38px; height: 38px; border-radius: 999px; background: #2b2f38; object-fit: cover; }
+    .member img, .managed-member img, .leaderboard-player img, .avatar-placeholder { width: 38px; height: 38px; border-radius: 999px; background: #2b2f38; object-fit: cover; flex: 0 0 auto; }
     .profile-card { display: flex; align-items: center; gap: 1.25rem; }
     .profile-avatar { width: 96px; height: 96px; border-radius: 1.25rem; border: 2px solid rgba(239,35,60,.7); object-fit: cover; }
     .inline-form { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }

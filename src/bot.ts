@@ -170,6 +170,22 @@ export class TeamBot {
     return { id: member.id, displayName: member.displayName, username: member.user.username };
   }
 
+  async getGuildMemberProfiles(userIds: string[]) {
+    const guild = await this.getGuild();
+    const uniqueUserIds = [...new Set(userIds)];
+    return Promise.all(
+      uniqueUserIds.map(async (userId) => {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        return {
+          userId,
+          displayName: member?.displayName,
+          username: member?.user.username,
+          avatarUrl: member?.displayAvatarURL({ size: 64 }) ?? ''
+        };
+      })
+    );
+  }
+
   async getAdministratorAccess(userId: string) {
     const guild = await this.getGuild();
     if (guild.ownerId === userId) return { isOwner: true, isAdmin: true };
@@ -1664,6 +1680,7 @@ export type TeamBotApi = Pick<
   TeamBot,
   | 'getGuildInviteUrl'
   | 'getGuildMember'
+  | 'getGuildMemberProfiles'
   | 'getAdministratorAccess'
   | 'getTeamMemberDetails'
   | 'getGuildRoles'

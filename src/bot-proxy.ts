@@ -23,6 +23,7 @@ type PendingRequest = {
 const botMethods = [
   'getGuildInviteUrl',
   'getGuildMember',
+  'getGuildMemberProfiles',
   'getAdministratorAccess',
   'getTeamMemberDetails',
   'getGuildRoles',
