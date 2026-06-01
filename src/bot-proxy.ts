@@ -30,6 +30,7 @@ const botMethods = [
   'getDeveloperStats',
   'restart',
   'updateDeveloperSettings',
+  'syncPugRankRoles',
   'searchInvitableMembers',
   'createTeam',
   'getTeamInviteDetails',

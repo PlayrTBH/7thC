@@ -518,6 +518,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const userId = parseRequiredDiscordId(String(req.body.userId ?? ''));
       await store.setPugEloRating(userId, parsePositiveInteger(req.body.rating, 'ELO rating', 0), String(req.body.username ?? '').trim() || undefined);
+      await bot.syncPugRankRoles();
       res.redirect(`/administrator/pugs?playerId=${encodeURIComponent(userId)}#elo`);
     } catch (error) {
       next(error);
@@ -528,6 +529,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const userId = parseRequiredDiscordId(String(req.body.userId ?? ''));
       await store.resetPugEloRating(userId);
+      await bot.syncPugRankRoles();
       res.redirect(`/administrator/pugs?playerId=${encodeURIComponent(userId)}#elo`);
     } catch (error) {
       next(error);
@@ -537,6 +539,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.post('/administrator/pugs/elo/reset-all', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
     try {
       await store.resetAllPugEloRatings();
+      await bot.syncPugRankRoles();
       res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
@@ -557,6 +560,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const existing = (await store.getAdministratorSettings()).pugs;
       const ranks = parsePugRankSettings(req.body);
       await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, ranks, seasons: existing?.seasons });
+      await bot.syncPugRankRoles();
       res.redirect('/administrator/ranks');
     } catch (error) {
       next(error);
@@ -1676,9 +1680,14 @@ function leaderboardEntry(rating: LeaderboardRating) {
       ${rating.avatarUrl ? `<img src="${escapeHtml(rating.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
       <span><strong>${escapeHtml(rating.displayName)}</strong>${rating.username ? `<small>@${escapeHtml(rating.username)}</small>` : ''}</span>
     </a>
-    <span class="leaderboard-rank">${rankBadge(rating.rank)}</span>
+    <span class="leaderboard-rank">${leaderboardRankBadge(rating.rank)}</span>
     <span>${formatElo(rating.rating)} ELO</span>
   </li>`;
+}
+
+function leaderboardRankBadge(rank: PugPlayerRank) {
+  if (!rank.iconDataUrl) return rankBadge(rank);
+  return `<span class="rank-badge leaderboard-emblem-only rank-${rankClassId(rank.id)}${rank.isMaster ? ' master-rank' : ''}" title="${escapeHtml(rank.label)}"><img class="rank-icon" src="${escapeHtml(rank.iconDataUrl)}" alt="${escapeHtml(rank.label)}" /></span>`;
 }
 
 function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile: { displayName?: string; username?: string; avatarUrl?: string } | undefined, badges: PugUserBadge[], selectedBadgeIds: string[]) {
@@ -2776,7 +2785,9 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .leaderboard-master .leaderboard-player span, .leaderboard-master .leaderboard-player strong { overflow: visible; }
     .leaderboard-master .leaderboard-player strong { display: inline-block; color: #fb923c; background: linear-gradient(105deg, #ea580c 0%, #fb923c 18%, #fed7aa 32%, #f97316 48%, #c2410c 64%, #fdba74 78%, #ea580c 100%); background-size: 240% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; text-shadow: 0 0 10px rgba(251, 146, 60, .72), 0 0 22px rgba(239, 68, 68, .42); animation: leaderboard-orange-shimmer 2.4s linear infinite; }
     .leaderboard-master .leaderboard-player strong::before, .leaderboard-master .leaderboard-player strong::after { content: '🔥'; margin: 0 .2rem; filter: drop-shadow(0 0 6px rgba(251, 146, 60, .7)); -webkit-text-fill-color: initial; }
-    .leaderboard-rank { flex: 0 0 auto; }
+    .leaderboard-rank { flex: 0 0 4rem; display: grid; place-items: center; align-self: stretch; }
+    .leaderboard-emblem-only { display: grid; place-items: center; width: 100%; height: 100%; }
+    .leaderboard-rank .rank-icon { width: min(3.4rem, 100%); height: calc(100% - .35rem); min-height: 3rem; max-height: 3.8rem; border: 0; border-radius: 0; background: transparent; object-fit: contain; filter: drop-shadow(0 0 8px rgba(0,0,0,.35)); }
     .rank-badge { display: inline-flex; align-items: center; gap: .4rem; color: #f5d0fe; font-weight: 900; white-space: nowrap; }
     .rank-badge.rank-bronze { color: #cd7f32; }
     .rank-badge.rank-silver { color: #c0c0c0; }

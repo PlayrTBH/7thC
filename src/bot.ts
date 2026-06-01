@@ -19,10 +19,10 @@ import {
   ActivityType,
   type PresenceStatusData
 } from 'discord.js';
-import { randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankDefinition, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
@@ -33,7 +33,7 @@ const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; playerRankRoleIds: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -160,6 +160,7 @@ export class TeamBot {
   private async handleEloCommand(interaction: import('discord.js').ChatInputCommandInteraction) {
     const rating = await this.store.getPugEloRating(interaction.user.id);
     await this.store.setPugEloRating(interaction.user.id, rating.rating, interaction.user.username);
+    await this.syncPugRankRolesForUsers([interaction.user.id]).catch((error) => console.warn('Unable to sync PUG rank role after /elo:', error));
     await interaction.reply({ content: `Your PUG ELO is **${formatElo(rating.rating)}**.`, flags: MessageFlags.Ephemeral });
   }
 
@@ -263,6 +264,13 @@ export class TeamBot {
   async updateDeveloperSettings(settings: DeveloperSettings) {
     await this.store.updateDeveloperSettings(settings);
     await this.applyDeveloperSettings(settings);
+  }
+
+  async syncPugRankRoles() {
+    const guild = await this.getGuild();
+    await Promise.all([this.ensurePugRankRoles(guild), this.ensurePugRankEmojis(guild)]);
+    await this.ensureTeamRolesDisplayed();
+    await this.syncPugRankRolesForRatedMembers(guild);
   }
 
   async restart() {
@@ -568,9 +576,10 @@ export class TeamBot {
 
     const fetchedPlayers = await Promise.all(playerIds.map(async (playerId) => guild.members.cache.get(playerId) ?? guild.members.fetch(playerId).catch(() => null)));
     const playerUsernames = new Map(playerIds.map((playerId, index) => [playerId, fetchedPlayers[index]?.user.username ?? players[index].username]));
-    const playerRankLabels = await this.buildPugPlayerRankLabels(playerIds);
+    const playerRanks = await this.buildPugPlayerRanks(guild, playerIds);
     const now = new Date().toISOString();
-    const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, playerRankLabels, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map(), createdAt: now, updatedAt: now };
+    const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, playerRankLabels: playerRanks.labels, playerRankRoleIds: playerRanks.roleIds, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map(), createdAt: now, updatedAt: now };
+    await this.applyPugRankRoles(guild, playerRanks.assignments);
     this.pugMatches.set(matchId, match);
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
 
@@ -595,16 +604,24 @@ export class TeamBot {
     this.startPugModeVoteReposter(match);
   }
 
-  private async buildPugPlayerRankLabels(playerIds: string[]) {
-    const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
+  private async buildPugPlayerRanks(guild: Guild, playerIds: string[]) {
+    const [ratings, rankSettings, rankRoles, rankEmojis] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings(), this.ensurePugRankRoles(guild), this.ensurePugRankEmojis(guild)]);
     const topMasterUserIds = new Set(ratings.slice(0, 3).map((rating) => rating.userId));
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const labels = new Map<string, string>();
+    const roleIds = new Map<string, string>();
+    const assignments = new Map<string, string>();
     await Promise.all(playerIds.map(async (userId) => {
       const rating = ratingsByUserId.get(userId) ?? await this.store.getPugEloRating(userId);
-      labels.set(userId, resolvePugRankLabel(rating, rankSettings, topMasterUserIds));
+      const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
+      const role = rankRoles.get(rank.id);
+      labels.set(userId, formatPugRankDisplay(rank, role, rankEmojis.get(rank.id)));
+      if (role) {
+        roleIds.set(userId, role.id);
+        assignments.set(userId, role.id);
+      }
     }));
-    return labels;
+    return { labels, roleIds, assignments };
   }
 
   private async waitForPugPlayersInQueue(guild: Guild, match: PugMatch) {
@@ -690,6 +707,7 @@ export class TeamBot {
       createdAt: now.toISOString()
     };
     await this.store.recordPugAbandon(log);
+    await this.syncPugRankRolesForUsers([userId]).catch((error) => console.warn('Unable to sync PUG rank role after abandon:', error));
     const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (channel?.type === ChannelType.GuildText) {
       const penaltyText = settings.eloPenalty > 0 ? ` They received a ${settings.eloPenalty} ELO abandon penalty.` : '';
@@ -705,9 +723,13 @@ export class TeamBot {
     match.playerUsernames.delete(abandonedUserId);
     match.playerUsernames.set(replacement.userId, replacement.username);
     match.playerRankLabels.delete(abandonedUserId);
-    const rankLabels = await this.buildPugPlayerRankLabels([replacement.userId]);
-    const replacementRank = rankLabels.get(replacement.userId);
+    match.playerRankRoleIds.delete(abandonedUserId);
+    const playerRanks = await this.buildPugPlayerRanks(guild, [replacement.userId]);
+    const replacementRank = playerRanks.labels.get(replacement.userId);
+    const replacementRoleId = playerRanks.roleIds.get(replacement.userId);
     if (replacementRank) match.playerRankLabels.set(replacement.userId, replacementRank);
+    if (replacementRoleId) match.playerRankRoleIds.set(replacement.userId, replacementRoleId);
+    await this.applyPugRankRoles(guild, playerRanks.assignments);
     match.modeVotes.delete(abandonedUserId);
     match.votes.delete(abandonedUserId);
     match.updatedAt = new Date().toISOString();
@@ -1085,6 +1107,7 @@ export class TeamBot {
     const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
     const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings, match.size);
     await this.store.applyPugEloChanges(changes);
+    await this.syncPugRankRolesForUsers(match.playerIds).catch((error) => console.warn('Unable to sync PUG rank roles after ELO changes:', error));
     return { changes, teamTotals };
   }
 
@@ -1277,8 +1300,12 @@ export class TeamBot {
     const guild = await this.getGuild();
     const teams = await this.store.getTeams();
     const organizationRoleIds = await this.ensureOrganizationalRoles(guild);
+    const rankRoleIds = await this.ensurePugRankRoles(guild);
+    await this.ensurePugRankRolePlacement(guild, [...rankRoleIds.values()], teams.map((team) => team.roleId)).catch((error) => {
+      console.warn('Unable to place PUG rank roles above team roles:', error);
+    });
     for (const team of teams) {
-      await this.ensureTeamRolePlacement(guild, team.roleId, organizationRoleIds).catch((error) => {
+      await this.ensureTeamRolePlacement(guild, team.roleId, organizationRoleIds, [...rankRoleIds.values()]).catch((error) => {
         console.warn(`Unable to place team role ${team.roleId} above organization roles:`, error);
       });
     }
@@ -1432,7 +1459,11 @@ export class TeamBot {
       createdAt: new Date().toISOString()
     };
     try {
-      await this.ensureTeamRolePlacement(guild, role, organizationRoleIds).catch((error) => {
+      const rankRoles = [...(await this.ensurePugRankRoles(guild)).values()];
+      await this.ensurePugRankRolePlacement(guild, rankRoles, [role.id]).catch((error) => {
+        console.warn('Unable to place PUG rank roles above newly created team role:', error);
+      });
+      await this.ensureTeamRolePlacement(guild, role, organizationRoleIds, rankRoles).catch((error) => {
         console.warn(`Unable to place newly created team role ${role.id} above organization roles:`, error);
       });
       await owner.roles.add(role, 'Team owner role assignment');
@@ -1614,7 +1645,147 @@ export class TeamBot {
     return addedInvites;
   }
 
-  private async ensureTeamRolePlacement(guild: Guild, roleOrId: Role | string, organizationRoleIds?: Map<TeamMemberRole, string>) {
+  private async ensurePugRankRoles(guild: Guild) {
+    const settings = await this.store.getPugRankSettings();
+    const definitions = pugRankRoleDefinitions(settings);
+    const existingRoles = await guild.roles.fetch();
+    const rankRoles = new Map<string, Role>();
+
+    for (const definition of definitions) {
+      const name = pugRankRoleName(definition.rank);
+      const existingRole = existingRoles.find((role) => role.name === name);
+      const color = pugRankRoleColor(definition.rank);
+      if (existingRole) {
+        if (!existingRole.managed) {
+          const needsStyleUpdate = existingRole.hexColor.toLowerCase() !== String(color).toLowerCase() || existingRole.hoist || existingRole.icon !== (definition.rank.iconDataUrl ? existingRole.icon : null);
+          if (needsStyleUpdate || definition.rank.iconDataUrl) {
+            await existingRole.edit({ color, hoist: false, icon: definition.rank.iconDataUrl ?? null, reason: 'PUG rank role style synchronized by 7th Circle Team Hub' }).catch((error) => {
+              console.warn(`Unable to update PUG rank role ${existingRole.id}:`, error);
+            });
+          }
+        }
+        rankRoles.set(definition.rank.id, existingRole);
+        continue;
+      }
+
+      const createdRole = await guild.roles.create({
+        name,
+        color,
+        hoist: false,
+        icon: definition.rank.iconDataUrl,
+        permissions: [],
+        reason: 'PUG rank role created by 7th Circle Team Hub'
+      }).catch(async (error) => {
+        console.warn(`Unable to create PUG rank role with icon for ${definition.rank.id}; retrying without icon:`, error);
+        return guild.roles.create({
+          name,
+          color,
+          hoist: false,
+          permissions: [],
+          reason: 'PUG rank role created by 7th Circle Team Hub'
+        });
+      });
+      rankRoles.set(definition.rank.id, createdRole);
+    }
+
+    return rankRoles;
+  }
+
+  private async ensurePugRankEmojis(guild: Guild) {
+    const settings = await this.store.getPugRankSettings();
+    const emojiByRankId = new Map<string, string>();
+    const definitions = pugRankRoleDefinitions(settings).filter((definition) => definition.rank.iconDataUrl);
+    if (!definitions.length) return emojiByRankId;
+
+    const existingEmojis = await guild.emojis.fetch().catch((error) => {
+      console.warn('Unable to fetch PUG rank emojis:', error);
+      return null;
+    });
+    if (!existingEmojis) return emojiByRankId;
+
+    for (const definition of definitions) {
+      const iconDataUrl = definition.rank.iconDataUrl;
+      if (!iconDataUrl) continue;
+      const baseName = pugRankEmojiBaseName(definition.rank);
+      const name = `${baseName}_${hashDataUrl(iconDataUrl).slice(0, 8)}`.slice(0, 32);
+      const existing = existingEmojis.find((emoji) => emoji.name === name);
+      if (existing) {
+        emojiByRankId.set(definition.rank.id, existing.toString());
+        continue;
+      }
+
+      const stale = existingEmojis.filter((emoji) => emoji.name?.startsWith(`${baseName}_`));
+      const created = await guild.emojis.create({ attachment: iconDataUrl, name, reason: 'PUG rank emblem emoji synchronized by 7th Circle Team Hub' }).catch((error) => {
+        console.warn(`Unable to create PUG rank emoji for ${definition.rank.id}:`, error);
+        return null;
+      });
+      if (created) {
+        emojiByRankId.set(definition.rank.id, created.toString());
+        await Promise.all(stale.map((emoji) => emoji.delete('PUG rank emblem changed').catch(() => undefined)));
+      } else {
+        const fallback = stale.first();
+        if (fallback) emojiByRankId.set(definition.rank.id, fallback.toString());
+      }
+    }
+
+    return emojiByRankId;
+  }
+
+  private async ensurePugRankRolePlacement(guild: Guild, rankRoles: Role[], teamRoleIds: string[]) {
+    if (!rankRoles.length) return;
+    const roles = await guild.roles.fetch();
+    const editableRankRoles = rankRoles.filter((role) => role.editable);
+    if (!editableRankRoles.length) return;
+
+    const me = await guild.members.fetchMe();
+    const highestManageablePosition = me.roles.highest.position - 1;
+    if (highestManageablePosition < 1) return;
+
+    const teamRoles = teamRoleIds.map((roleId) => roles.get(roleId)).filter((role): role is Role => Boolean(role));
+    const highestTeamRolePosition = teamRoles.length ? Math.max(...teamRoles.map((role) => role.position)) : 0;
+    let desiredPosition = Math.min(Math.max(highestTeamRolePosition + 1, 1), highestManageablePosition);
+    for (const role of editableRankRoles.sort((a, b) => a.position - b.position)) {
+      if (role.hoist) await role.setHoist(false, 'PUG rank roles are not displayed separately by 7th Circle Team Hub');
+      if (role.position < desiredPosition) {
+        await role.setPosition(desiredPosition, { reason: 'PUG rank roles are placed above team roles when Discord role hierarchy allows it' });
+      }
+      desiredPosition = Math.min(desiredPosition + 1, highestManageablePosition);
+    }
+  }
+
+  private async syncPugRankRolesForUsers(userIds: string[]) {
+    const guild = await this.getGuild();
+    const rankRoles = await this.ensurePugRankRoles(guild);
+    const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
+    const topMasterUserIds = new Set(ratings.slice(0, 3).map((rating) => rating.userId));
+    const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
+    const assignments = new Map<string, string>();
+    for (const userId of new Set(userIds)) {
+      const rating = ratingsByUserId.get(userId) ?? await this.store.getPugEloRating(userId);
+      const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
+      const role = rankRoles.get(rank.id);
+      if (role) assignments.set(userId, role.id);
+    }
+    await this.applyPugRankRoles(guild, assignments, [...rankRoles.values()].map((role) => role.id));
+  }
+
+  private async syncPugRankRolesForRatedMembers(guild: Guild) {
+    const ratings = await this.store.getPugEloRatings();
+    await this.syncPugRankRolesForUsers(ratings.map((rating) => rating.userId));
+  }
+
+  private async applyPugRankRoles(guild: Guild, assignments: Map<string, string>, knownRankRoleIds?: string[]) {
+    const rankRoleIds = knownRankRoleIds ?? [...(await this.ensurePugRankRoles(guild)).values()].map((role) => role.id);
+    await Promise.all([...assignments.entries()].map(async ([userId, selectedRoleId]) => {
+      const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+      if (!member) return;
+      const staleRoleIds = rankRoleIds.filter((roleId) => roleId !== selectedRoleId && member.roles.cache.has(roleId));
+      if (staleRoleIds.length) await member.roles.remove(staleRoleIds, 'PUG rank role changed').catch((error) => console.warn(`Unable to remove stale PUG rank roles from ${userId}:`, error));
+      if (!member.roles.cache.has(selectedRoleId)) await member.roles.add(selectedRoleId, 'PUG rank role changed').catch((error) => console.warn(`Unable to add PUG rank role to ${userId}:`, error));
+    }));
+  }
+
+  private async ensureTeamRolePlacement(guild: Guild, roleOrId: Role | string, organizationRoleIds?: Map<TeamMemberRole, string>, rankRoles: Role[] = []) {
     const roleIds = organizationRoleIds ?? (await this.ensureOrganizationalRoles(guild));
     const roles = await guild.roles.fetch();
     let teamRole = typeof roleOrId === 'string' ? roles.get(roleOrId) ?? (await guild.roles.fetch(roleOrId)) : roleOrId;
@@ -1638,11 +1809,13 @@ export class TeamBot {
     }
 
     const highestOrganizationRolePosition = Math.max(...organizationRoles.map((role) => role.position));
+    const lowestRankRolePosition = rankRoles.length ? Math.min(...rankRoles.map((role) => role.position)) : undefined;
     if (!teamRole.hoist) {
       teamRole = await teamRole.setHoist(true, 'Team roles are displayed separately by 7th Circle Team Hub');
     }
 
-    const desiredPosition = Math.min(highestOrganizationRolePosition + 1, highestManageablePosition);
+    const rankCeiling = lowestRankRolePosition === undefined ? highestManageablePosition : Math.max(1, lowestRankRolePosition - 1);
+    const desiredPosition = Math.min(highestOrganizationRolePosition + 1, rankCeiling, highestManageablePosition);
     if (highestOrganizationRolePosition >= highestManageablePosition) {
       console.warn(
         `Bot role is not high enough to place team role ${teamRole.id} above organization roles; placing it as high as the bot can manage.`
@@ -1901,11 +2074,47 @@ function getPugPlayerUsername(match: PugMatch, playerId: string) {
   return match.playerUsernames.get(playerId) ?? 'Unknown player';
 }
 
-function resolvePugRankLabel(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>) {
-  if (topMasterUserIds.has(rating.userId)) return 'M1';
+function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugRankDefinition {
+  if (topMasterUserIds.has(rating.userId)) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl };
   const ranks = settings.ranks.length ? settings.ranks : [];
-  const rank = [...ranks].reverse().find((item) => rating.rating >= item.minRating && (item.maxRating === undefined || rating.rating <= item.maxRating)) ?? ranks[0];
-  return rank?.label ?? 'Unranked';
+  return [...ranks].reverse().find((item) => rating.rating >= item.minRating && (item.maxRating === undefined || rating.rating <= item.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
+}
+
+function pugRankRoleDefinitions(settings: PugRankSettings) {
+  return [
+    ...settings.ranks.map((rank) => ({ rank })),
+    { rank: { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl } satisfies PugRankDefinition }
+  ];
+}
+
+function pugRankRoleName(rank: Pick<PugRankDefinition, 'id' | 'label'>) {
+  return `PUG Rank · ${rank.id}`.slice(0, 100);
+}
+
+function formatPugRankDisplay(rank: PugRankDefinition, role?: Role, emoji?: string) {
+  if (rank.iconDataUrl && emoji) return emoji;
+  if (rank.iconDataUrl && role) return `<@&${role.id}>`;
+  return rank.abbreviation || rank.label;
+}
+
+function pugRankEmojiBaseName(rank: Pick<PugRankDefinition, 'id'>) {
+  return `pug_${rank.id.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 19) || 'rank'}`.slice(0, 23);
+}
+
+function hashDataUrl(dataUrl: string) {
+  return createHash('sha256').update(dataUrl).digest('hex');
+}
+
+function pugRankRoleColor(rank: Pick<PugRankDefinition, 'id' | 'label'>): ColorResolvable {
+  const key = `${rank.id} ${rank.label}`.toLowerCase();
+  if (key.includes('bronze')) return '#cd7f32';
+  if (key.includes('silver')) return '#c0c0c0';
+  if (key.includes('gold')) return '#facc15';
+  if (key.includes('platinum')) return '#67e8f9';
+  if (key.includes('diamond')) return '#60a5fa';
+  if (key.includes('master')) return '#c2410c';
+  if (key.includes('infernal')) return '#f97316';
+  return '#f5d0fe';
 }
 
 function truncateButtonLabel(label: string) {
@@ -2126,6 +2335,7 @@ export type TeamBotApi = Pick<
   | 'getDeveloperStats'
   | 'restart'
   | 'updateDeveloperSettings'
+  | 'syncPugRankRoles'
   | 'publishPugQueueMessage'
   | 'getPugAdminState'
   | 'deletePugMatch'
