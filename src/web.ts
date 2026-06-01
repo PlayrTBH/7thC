@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugSettings } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSettings } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -24,7 +24,8 @@ type AdminPugEloPreviewTeam = { teamIndex: number; total: number; average: numbe
 type AdminPugMatchLog = PugMatchLog & { eloPreview?: AdminPugEloPreviewTeam[] };
 type PugPlayerSearchEntry = { userId: string; username?: string; rating: number; updatedAt?: string };
 type PugPlayerModeStats = { mode: PugMatchLog['size'] | 'unknown' | 'all'; label: string; wins: number; seconds: number; losses: number; total: number; winRate: number };
-type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats };
+type PugPlayerRank = PugRankDefinition & { isMaster?: boolean };
+type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats; rank: PugPlayerRank };
 type PugPlayerSearchState = { query: string; selectedPlayerId?: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[]; selected?: PugPlayerStats };
 
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
@@ -273,20 +274,23 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/leaderboard', requireAuth, async (req, res, next) => {
     try {
-      const [leaderboard, ownRating, administratorAccess] = await Promise.all([
+      const [leaderboard, ownRating, administratorAccess, rankSettings] = await Promise.all([
         store.getPugEloLeaderboard(10),
         store.getPugEloRating(req.session.discordUser!.id),
-        bot.getAdministratorAccess(req.session.discordUser!.id)
+        bot.getAdministratorAccess(req.session.discordUser!.id),
+        store.getPugRankSettings()
       ]);
+      const allRatings = await store.getPugEloRatings();
+      const topMasterUserIds = new Set(allRatings.slice(0, 3).map((rating) => rating.userId));
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
       const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
       const decoratedLeaderboard = leaderboard.map((rating) => {
         const profile = profilesByUserId.get(rating.userId);
         const displayName = profile?.displayName ?? rating.username ?? 'Unknown Discord user';
         const username = profile?.username ?? (rating.username && rating.username !== displayName ? rating.username : undefined);
-        return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '' };
+        return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '', rank: resolvePugRank(rating, rankSettings, topMasterUserIds) };
       });
-      res.send(layout('PUG ELO leaderboard', leaderboardPage(decoratedLeaderboard, ownRating), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      res.send(layout('PUG ELO leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds)), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -390,7 +394,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
           .split(/\r?\n|,/)
           .map((map) => map.trim())
           .filter(Boolean),
-        elo: existing?.elo
+        elo: existing?.elo,
+        ranks: existing?.ranks
       };
       await store.updatePugSettings(pugs);
       res.redirect('/administrator#pugs');
@@ -468,7 +473,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const elo = parsePugEloSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, ranks: existing?.ranks });
       res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
@@ -499,6 +504,46 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       await store.resetAllPugEloRatings();
       res.redirect('/administrator/pugs#elo');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/administrator/ranks', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const settings = await store.getPugRankSettings();
+      res.send(layout('Rank administration', administratorRanksPage(settings), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/administrator/ranks', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const existing = (await store.getAdministratorSettings()).pugs;
+      const ranks = parsePugRankSettings(req.body);
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, ranks });
+      res.redirect('/administrator/ranks');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/leaderboard/players/:userId', requireAuth, async (req, res, next) => {
+    try {
+      const userId = parseRequiredDiscordId(req.params.userId);
+      const [history, ratings, eloSettings, rankSettings, profiles, administratorAccess] = await Promise.all([
+        store.getPugMatchLogs(),
+        store.getPugEloRatings(),
+        store.getPugEloSettings(),
+        store.getPugRankSettings(),
+        bot.getGuildMemberProfiles([userId]),
+        bot.getAdministratorAccess(req.session.discordUser!.id)
+      ]);
+      const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
+      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, new Set(ratings.slice(0, 3).map((rating) => rating.userId)));
+      const profile = profiles[0];
+      res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -1254,7 +1299,7 @@ function administratorPage(
     <section class="card" id="pugs">
       <h2>PUG administration</h2>
       <p><small>Review full PUG match history, inspect ongoing matches, delete or reset live matches, and force teams or captains from the dedicated administrator-only PUG section.</small></p>
-      <a class="button" href="/administrator/pugs">Open PUG administration</a>
+      <div class="admin-team-actions"><a class="button" href="/administrator/pugs">Open PUG administration</a><a class="button secondary" href="/administrator/ranks">Edit ranks and icons</a></div>
       ${administratorPugSettingsForm(pugSettings)}
     </section>
     ${access.isOwner ? administratorSettingsForm(roles, adminRoleId) : ''}`;
@@ -1481,29 +1526,69 @@ function parseDiscordIds(value: string) {
   return [...value.matchAll(/\d{5,}/g)].map((match) => match[0]);
 }
 
-type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string };
+type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string; rank: PugPlayerRank };
 
-function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating) {
+function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank) {
   return `<section class="card">
     <h2>Top 10 PUG ELO players</h2>
     <p><small>Players start at 20,000 ELO by default. Winning as an underdog pays more, winning as a favorite pays less, and the maximum win gain is capped at 2,000 ELO.</small></p>
-    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating, index) => leaderboardEntry(rating, index)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
   </section>
   <section class="card">
     <h2>Your PUG ELO</h2>
-    <div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div>
+    <div class="stat-grid"><div class="stat-card"><small>Current rating</small><strong>${formatElo(ownRating.rating)}</strong></div><div class="stat-card"><small>Current rank</small><strong>${rankBadge(ownRank)}</strong></div></div>
     <p><small>You can also use the Discord <code>/elo</code> command to see this rating privately.</small></p>
   </section>`;
 }
 
-function leaderboardEntry(rating: LeaderboardRating) {
-  return `<li>
-    <div class="leaderboard-player">
+function leaderboardEntry(rating: LeaderboardRating, index: number) {
+  const masterClass = index < 3 ? ' leaderboard-master' : '';
+  return `<li class="leaderboard-entry${masterClass}">
+    <a class="leaderboard-player" href="/leaderboard/players/${encodeURIComponent(rating.userId)}">
       ${rating.avatarUrl ? `<img src="${escapeHtml(rating.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
       <span><strong>${escapeHtml(rating.displayName)}</strong>${rating.username ? `<small>@${escapeHtml(rating.username)}</small>` : ''}</span>
-    </div>
+    </a>
+    <span class="leaderboard-rank">${rankBadge(rating.rank)}</span>
     <span>${formatElo(rating.rating)} ELO</span>
   </li>`;
+}
+
+function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { displayName?: string; username?: string; avatarUrl?: string }) {
+  const displayName = profile?.displayName ?? stats.player.username ?? stats.player.userId;
+  return `<p><a href="/leaderboard">← Back to leaderboard</a></p>
+  <section class="card">
+    <div class="profile-card leaderboard-profile-card">
+      ${profile?.avatarUrl ? `<img class="profile-avatar" src="${escapeHtml(profile.avatarUrl)}" alt="" />` : '<span class="profile-avatar avatar-placeholder"></span>'}
+      <div>
+        <h2>${escapeHtml(displayName)} ${rankBadge(stats.rank)}</h2>
+        <p><small>${profile?.username ? `@${escapeHtml(profile.username)} · ` : ''}<code>${escapeHtml(stats.player.userId)}</code>${stats.player.updatedAt ? ` · ELO updated ${formatDateTime(stats.player.updatedAt)}` : ''}</small></p>
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><small>Current ELO</small><strong>${formatElo(stats.player.rating)}</strong></div>
+      <div class="stat-card"><small>Current rank</small><strong>${rankBadge(stats.rank)}</strong></div>
+      <div class="stat-card"><small>Total matches</small><strong>${stats.totals.total}</strong></div>
+      <div class="stat-card"><small>Wins</small><strong>${stats.totals.wins}</strong></div>
+      <div class="stat-card"><small>Seconds</small><strong>${stats.totals.seconds}</strong></div>
+      <div class="stat-card"><small>Losses</small><strong>${stats.totals.losses}</strong></div>
+      <div class="stat-card"><small>Win/loss</small><strong>${stats.totals.wins}/${stats.totals.losses}</strong></div>
+      <div class="stat-card"><small>Winrate</small><strong>${formatPercent(stats.totals.winRate)}</strong></div>
+    </div>
+    <div class="pug-player-stats-table"><span>Mode</span><span>Wins</span><span>Seconds</span><span>Losses</span><span>Winrate</span>${stats.modes.map((mode) => `<span>${escapeHtml(mode.label)}</span><span>${mode.wins}</span><span>${mode.seconds}</span><span>${mode.losses}</span><span>${formatPercent(mode.winRate)}</span>`).join('')}</div>
+  </section>`;
+}
+
+function rankBadge(rank: PugPlayerRank) {
+  const icon = rank.iconDataUrl ? `<img class="rank-icon" src="${escapeHtml(rank.iconDataUrl)}" alt="" />` : '<span class="rank-icon rank-icon-empty"></span>';
+  return `<span class="rank-badge${rank.isMaster ? ' master-rank' : ''}">${icon}<span>${escapeHtml(rank.label)}${rank.abbreviation ? ` <small>${escapeHtml(rank.abbreviation)}</small>` : ''}</span></span>`;
+}
+
+function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugPlayerRank {
+  if (topMasterUserIds.has(rating.userId)) {
+    return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating.rating, iconDataUrl: settings.masterIconDataUrl, isMaster: true };
+  }
+  const ranks = settings.ranks.length ? settings.ranks : [];
+  return [...ranks].reverse().find((rank) => rating.rating >= rank.minRating && (rank.maxRating === undefined || rating.rating <= rank.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
 }
 
 function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, playerSearch: PugPlayerSearchState) {
@@ -1568,7 +1653,7 @@ function buildPugPlayerSearchEntries(history: PugMatchLog[], ratings: PugEloRati
   return [...players.values()].sort((a, b) => (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
 }
 
-function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings): PugPlayerStats {
+function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], history: PugMatchLog[], ratings: PugEloRating[], settings: PugEloSettings, rankSettings?: PugRankSettings, topMasterUserIds = new Set<string>()): PugPlayerStats {
   const rating = ratings.find((item) => item.userId === userId);
   const knownPlayer = players.find((player) => player.userId === userId);
   const player: PugPlayerSearchEntry = {
@@ -1586,10 +1671,11 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
   for (const match of history) {
     if (match.status !== 'completed') continue;
     const change = match.eloChanges?.find((item) => item.userId === userId);
-    if (!change || change.delta === 0) continue;
+    if (!change) continue;
     const mode = match.size === 6 || match.size === 12 ? match.size : 'unknown';
     const stats = buckets.get(mode) ?? emptyPugPlayerModeStats(mode, mode === 'unknown' ? 'Mode not recorded' : pugQueueLabel(mode));
-    if (change.delta > 0) stats.wins += 1;
+    if (change.placement === 1 || change.delta > 0) stats.wins += 1;
+    else if (change.placement === 2 && match.teams.length > 2) stats.seconds += 1;
     else stats.losses += 1;
     stats.total += 1;
   }
@@ -1604,7 +1690,8 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
     total: modes.reduce((sum, mode) => sum + mode.total, 0),
     winRate: 0
   });
-  return { player, modes, totals };
+  const fallbackRanks: PugRankSettings = { ranks: [{ id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 }] };
+  return { player, modes, totals, rank: resolvePugRank(player, rankSettings ?? fallbackRanks, topMasterUserIds) };
 }
 
 function emptyPugPlayerModeStats(mode: PugPlayerModeStats['mode'], label: string): PugPlayerModeStats {
@@ -1711,6 +1798,88 @@ function parseRequiredDiscordId(value: string) {
   const [id] = parseDiscordIds(value);
   if (!id) throw new Error('A Discord user ID is required.');
   return id;
+}
+
+
+function administratorRanksPage(settings: PugRankSettings) {
+  return `<p><a href="/administrator">← Back to administrator</a></p>
+  <section class="card">
+    <h2>Rank values and icons</h2>
+    <p><small>Adjust ELO ranges and upload optional rank icons. Leave an icon blank to show an empty placeholder. Master Infernal (M1) is always assigned dynamically to the current top three leaderboard players.</small></p>
+    <form method="post" action="/administrator/ranks" class="rank-admin-form">
+      <div class="rank-admin-list">
+        ${settings.ranks.map((rank, index) => rankEditorRow(rank, index)).join('')}
+      </div>
+      <div class="rank-editor-row master-rank-editor" data-rank-icon-field>
+        <div>
+          <h3>Master Infernal <span class="pill">M1</span></h3>
+          <p><small>Dynamic rank for the top 3 players on the leaderboard. Its ELO range is not editable.</small></p>
+        </div>
+        <div class="rank-icon-editor">
+          <input type="hidden" name="masterIconDataUrl" value="${escapeHtml(settings.masterIconDataUrl ?? '')}" data-rank-icon-data />
+          <span class="rank-icon-preview${settings.masterIconDataUrl ? '' : ' is-empty'}" style="${settings.masterIconDataUrl ? `background-image: url('${escapeCssUrl(settings.masterIconDataUrl)}')` : ''}" data-rank-icon-preview>${settings.masterIconDataUrl ? '' : 'No icon'}</span>
+          <label class="button secondary">Upload icon <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-rank-icon-input hidden /></label>
+          <button type="button" class="secondary" data-rank-icon-clear${settings.masterIconDataUrl ? '' : ' disabled'}>Clear</button>
+        </div>
+      </div>
+      <button type="submit">Save ranks</button>
+    </form>
+  </section>`;
+}
+
+function rankEditorRow(rank: PugRankDefinition, index: number) {
+  return `<div class="rank-editor-row" data-rank-icon-field>
+    <input type="hidden" name="rankId" value="${escapeHtml(rank.id)}" />
+    <label>Name <input name="rankLabel" required maxlength="48" value="${escapeHtml(rank.label)}" /></label>
+    <label>Abbrev. <input name="rankAbbreviation" maxlength="8" value="${escapeHtml(rank.abbreviation)}" /></label>
+    <label>Minimum ELO <input name="rankMinRating" type="number" min="0" required value="${rank.minRating}" /></label>
+    <label>Maximum ELO <input name="rankMaxRating" type="number" min="0" value="${rank.maxRating ?? ''}" placeholder="No maximum" /></label>
+    <div class="rank-icon-editor">
+      <input type="hidden" name="rankIconDataUrl" value="${escapeHtml(rank.iconDataUrl ?? '')}" data-rank-icon-data />
+      <span class="rank-icon-preview${rank.iconDataUrl ? '' : ' is-empty'}" style="${rank.iconDataUrl ? `background-image: url('${escapeCssUrl(rank.iconDataUrl)}')` : ''}" data-rank-icon-preview>${rank.iconDataUrl ? '' : 'No icon'}</span>
+      <label class="button secondary">Upload icon <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-rank-icon-input hidden /></label>
+      <button type="button" class="secondary" data-rank-icon-clear${rank.iconDataUrl ? '' : ' disabled'}>Clear</button>
+    </div>
+    <small>Rank ${index + 1}</small>
+  </div>`;
+}
+
+function parsePugRankSettings(body: Record<string, unknown>): PugRankSettings {
+  const ids = formArray(body.rankId);
+  const labels = formArray(body.rankLabel);
+  const abbreviations = formArray(body.rankAbbreviation);
+  const minimums = formArray(body.rankMinRating);
+  const maximums = formArray(body.rankMaxRating);
+  const icons = formArray(body.rankIconDataUrl);
+  const ranks = ids.map((id, index) => {
+    const label = labels[index]?.trim() || id;
+    const minRating = parsePositiveInteger(minimums[index], `${label} minimum ELO`, 0);
+    const maxRaw = maximums[index]?.trim();
+    return {
+      id: id.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 48) || `rank-${index + 1}`,
+      label: label.slice(0, 48),
+      abbreviation: (abbreviations[index]?.trim() ?? '').slice(0, 8),
+      minRating,
+      maxRating: maxRaw ? parsePositiveInteger(maxRaw, `${label} maximum ELO`, minRating) : undefined,
+      iconDataUrl: parseOptionalRankIcon(icons[index])
+    };
+  });
+  if (!ranks.length) throw new Error('At least one rank is required.');
+  const masterIconDataUrl = parseOptionalRankIcon(String(body.masterIconDataUrl ?? ''));
+  return { ranks, masterIconDataUrl };
+}
+
+function formArray(value: unknown) {
+  if (Array.isArray(value)) return value.map((item) => String(item ?? ''));
+  return value === undefined ? [] : [String(value)];
+}
+
+function parseOptionalRankIcon(value: unknown) {
+  const dataUrl = String(value ?? '').trim();
+  if (!dataUrl) return undefined;
+  if (dataUrl.length > 1_000_000) throw new Error('Rank icons must be 1 MB or smaller.');
+  if (!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw new Error('Rank icons must be PNG, JPEG, WebP, or GIF images.');
+  return dataUrl;
 }
 
 function parsePugEloSettings(body: Record<string, unknown>): PugEloSettings {
@@ -2288,9 +2457,25 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .leaderboard-list li, .leaderboard-player { display: flex; align-items: center; gap: .75rem; }
     .leaderboard-list li { counter-increment: leaderboard-rank; justify-content: space-between; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; padding: .75rem .85rem; }
     .leaderboard-list li::before { content: counter(leaderboard-rank); display: grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 999px; background: var(--red-soft); color: var(--red-strong); font-weight: 900; flex: 0 0 auto; }
-    .leaderboard-player { min-width: 0; }
+    .leaderboard-player { min-width: 0; color: var(--text); text-decoration: none; flex: 1 1 auto; }
     .leaderboard-player span { display: grid; min-width: 0; }
     .leaderboard-player strong, .leaderboard-player small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .leaderboard-entry.leaderboard-master { border-color: rgba(251, 146, 60, .55); background: radial-gradient(circle at 14% 50%, rgba(251, 146, 60, .24), transparent 18rem), linear-gradient(135deg, rgba(124, 45, 18, .32), #12141a 55%); box-shadow: 0 0 24px rgba(251, 146, 60, .18); }
+    .leaderboard-master .leaderboard-player strong { color: #c2410c; text-shadow: 0 0 12px rgba(251, 146, 60, .9), 0 0 24px rgba(239, 68, 68, .55); }
+    .leaderboard-master .leaderboard-player strong::before, .leaderboard-master .leaderboard-player strong::after { content: '🔥'; margin: 0 .2rem; filter: drop-shadow(0 0 8px rgba(251, 146, 60, .8)); }
+    .leaderboard-rank { flex: 0 0 auto; }
+    .rank-badge { display: inline-flex; align-items: center; gap: .4rem; color: #f5d0fe; font-weight: 900; white-space: nowrap; }
+    .rank-badge small { color: inherit; opacity: .8; font-weight: 800; }
+    .rank-badge.master-rank { color: #c2410c; text-shadow: 0 0 12px rgba(251, 146, 60, .72); }
+    .rank-icon { width: 1.6rem; height: 1.6rem; border-radius: .4rem; object-fit: cover; background: #0f1116; border: 1px solid var(--line); flex: 0 0 auto; }
+    .rank-icon-empty { display: inline-block; }
+    .rank-admin-form, .rank-admin-list { display: grid; gap: 1rem; }
+    .rank-editor-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .75rem; align-items: end; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; }
+    .master-rank-editor { grid-template-columns: minmax(14rem, 1fr) auto; }
+    .rank-icon-editor { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    .rank-icon-preview { display: grid; place-items: center; width: 3rem; height: 3rem; border: 1px dashed rgba(255,255,255,.24); border-radius: .75rem; background-color: #0f1116; background-size: cover; background-position: center; color: var(--muted); font-size: .65rem; text-align: center; }
+    .rank-icon-preview.is-empty { background-image: none !important; }
+    .leaderboard-profile-card { margin-bottom: 1rem; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
     .section-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
@@ -2370,6 +2555,47 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
         }
         if (file.size > 2 * 1024 * 1024) {
           alert('Please choose an image that is 2 MB or smaller.');
+          input.value = '';
+          return;
+        }
+        const reader = new FileReader();
+        reader.addEventListener('load', () => {
+          if (typeof reader.result === 'string') renderPreview(reader.result);
+        });
+        reader.readAsDataURL(file);
+      });
+
+      clear.addEventListener('click', () => {
+        input.value = '';
+        renderPreview('');
+      });
+    });
+
+    document.querySelectorAll('[data-rank-icon-field]').forEach((field) => {
+      const input = field.querySelector('[data-rank-icon-input]');
+      const hidden = field.querySelector('[data-rank-icon-data]');
+      const preview = field.querySelector('[data-rank-icon-preview]');
+      const clear = field.querySelector('[data-rank-icon-clear]');
+      if (!(input instanceof HTMLInputElement) || !(hidden instanceof HTMLInputElement) || !(preview instanceof HTMLElement) || !(clear instanceof HTMLButtonElement)) return;
+
+      const renderPreview = (dataUrl) => {
+        hidden.value = dataUrl;
+        preview.style.backgroundImage = dataUrl ? "url('" + dataUrl + "')" : '';
+        preview.textContent = dataUrl ? '' : 'No icon';
+        preview.classList.toggle('is-empty', !dataUrl);
+        clear.disabled = !dataUrl;
+      };
+
+      input.addEventListener('change', () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
+          alert('Please choose a PNG, JPEG, WebP, or GIF image.');
+          input.value = '';
+          return;
+        }
+        if (file.size > 700 * 1024) {
+          alert('Please choose an icon that is 700 KB or smaller.');
           input.value = '';
           return;
         }

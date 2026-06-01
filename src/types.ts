@@ -81,11 +81,26 @@ export type PugEloSettings = {
   strength: number;
 };
 
+export type PugRankDefinition = {
+  id: string;
+  label: string;
+  abbreviation: string;
+  minRating: number;
+  maxRating?: number;
+  iconDataUrl?: string;
+};
+
+export type PugRankSettings = {
+  ranks: PugRankDefinition[];
+  masterIconDataUrl?: string;
+};
+
 export type PugSettings = {
   queueChannelId?: string;
   mapPool: string[];
   queueMessageId?: string;
   elo?: PugEloSettings;
+  ranks?: PugRankSettings;
 };
 
 export type PugTeamMode = 'random' | 'captains';
