@@ -26,9 +26,10 @@ import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugE
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
-const PUG_QUEUE_COUNTDOWN_MS = 60 * 1000;
+const PUG_QUEUE_COUNTDOWN_MS = 30 * 1000;
 const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
+const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
@@ -61,6 +62,7 @@ export class TeamBot {
   private pugQueueOperation: Promise<void> = Promise.resolve();
   private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
   private pugQueueMessageRefresh?: NodeJS.Timeout;
+  private pugQueueCountdownRefresh?: NodeJS.Timeout;
   private pugQueueMessageRefreshInFlight?: Promise<void>;
   private pugQueueMessageRefreshAgain = false;
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
@@ -331,7 +333,7 @@ export class TeamBot {
   private buildPugQueueMessage() {
     const embed = new EmbedBuilder()
       .setTitle('PUG Queue')
-      .setDescription('Join a pickup-game queue. Once a queue reaches the game-mode size, a 60 second countdown starts. New players can still join during the countdown, and completed lobbies are grouped by similar ELO before matches start.')
+      .setDescription('Join a pickup-game queue. Once a queue reaches the game-mode size, a 30 second countdown starts. New players can still join during the countdown, and completed lobbies are grouped by similar ELO before matches start.')
       .setColor(0xc90820)
       .addFields(
         pugQueueSizes.map((size) => {
@@ -374,6 +376,26 @@ export class TeamBot {
       this.pugQueueMessageRefresh = undefined;
       this.refreshPugQueueMessage().catch((error) => console.warn('Unable to refresh PUG queue message:', error));
     }, delayMs);
+  }
+
+  private syncPugQueueCountdownRefresh() {
+    if (!this.pugQueueCountdowns.size) {
+      if (this.pugQueueCountdownRefresh) {
+        clearInterval(this.pugQueueCountdownRefresh);
+        this.pugQueueCountdownRefresh = undefined;
+      }
+      return;
+    }
+
+    if (this.pugQueueCountdownRefresh) return;
+    this.pugQueueCountdownRefresh = setInterval(() => {
+      if (!this.pugQueueCountdowns.size) {
+        this.syncPugQueueCountdownRefresh();
+        return;
+      }
+
+      this.refreshPugQueueMessage().catch((error) => console.warn('Unable to refresh PUG queue countdown:', error));
+    }, PUG_QUEUE_COUNTDOWN_REFRESH_MS);
   }
 
   private async refreshPugQueueMessage(message?: import('discord.js').Message) {
@@ -500,6 +522,7 @@ export class TeamBot {
         this.finishPugQueueCountdown(size).catch((error) => console.warn(`Unable to finish ${pugQueueLabel(size)} PUG queue countdown:`, error));
       }, PUG_QUEUE_COUNTDOWN_MS);
       this.pugQueueCountdowns.set(size, { endsAt, timer });
+      this.syncPugQueueCountdownRefresh();
       this.schedulePugQueueMessageRefresh(0);
       this.schedulePugQueueMessageRefresh(PUG_QUEUE_COUNTDOWN_MS);
       return;
@@ -508,6 +531,7 @@ export class TeamBot {
     if (!countdown) return;
     clearTimeout(countdown.timer);
     this.pugQueueCountdowns.delete(size);
+    this.syncPugQueueCountdownRefresh();
     this.schedulePugQueueMessageRefresh(0);
   }
 
@@ -518,6 +542,7 @@ export class TeamBot {
       if (countdown) {
         clearTimeout(countdown.timer);
         this.pugQueueCountdowns.delete(size);
+        this.syncPugQueueCountdownRefresh();
       }
 
       const queue = this.pugQueues.get(size) ?? [];
