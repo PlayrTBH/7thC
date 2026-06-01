@@ -1417,7 +1417,7 @@ function administratorPugSettingsForm(settings?: PugSettings) {
           <input name="cashoutMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings?.elo?.cashoutMultiplier ?? 1.25)}" />
         </label>
       </div>
-      <p><small>These multipliers scale every ELO gain and loss by mode. Use <code>1</code> for normal value; Cashout defaults to <code>1.25</code> so those games are 25% more valuable.</small></p>
+      <p><small>These multipliers scale ELO value by mode. Use <code>1</code> for normal value; Cashout defaults to <code>1.25</code>, which boosts first-place and second-place rewards without increasing losses.</small></p>
       <button type="submit">Save PUG settings</button>
     </form>
     <form method="post" action="/administrator/pugs/publish" onsubmit="return confirm('Publish or refresh the PUG queue message in the configured channel?');">
@@ -1529,7 +1529,7 @@ function buildAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], se
           rating: rating.rating,
           first: applyAdminPugEloValueMultiplier(first, match.size, settings),
           second: match.teams.length > 2 ? applyAdminPugEloValueMultiplier(Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(first / 2)), match.size, settings) : undefined,
-          loss: -applyAdminPugEloValueMultiplier(calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings), match.size, settings)
+          loss: applyAdminPugEloValueMultiplier(-calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings), match.size, settings)
         };
       })
     };
@@ -1541,7 +1541,7 @@ function getAdminPugRating(userId: string, ratings: Map<string, PugEloRating>, s
 }
 
 function applyAdminPugEloValueMultiplier(delta: number, size: PugMatchLog['size'], settings: PugEloSettings) {
-  const multiplier = size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
+  const multiplier = size === 12 && delta <= 0 ? 1 : size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
   return Math.round(delta * multiplier);
 }
 
@@ -1756,7 +1756,7 @@ function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, setting
 function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, playerSearch: PugPlayerSearchState) {
   return `<div class="subsection">
     <h3>ELO formula settings</h3>
-    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Mode values then scale every gain/loss, letting admins make Final Round or Cashout worth more or less. Cashout defaults to 1.25 (25% more valuable).</small></p>
+    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Mode values then scale ELO impact, letting admins make Final Round or Cashout worth more or less. Cashout defaults to 1.25 and applies its 25% boost only to first-place and second-place rewards, not losses.</small></p>
     <form method="post" action="/administrator/pugs/elo/settings" class="inline-form">
       <label>Starting ELO <input name="startingRating" type="number" min="1" value="${settings.startingRating}" /></label>
       <label>Fair-win base <input name="baseChange" type="number" min="1" value="${settings.baseChange}" /></label>
