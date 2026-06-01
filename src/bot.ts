@@ -811,6 +811,11 @@ export class TeamBot {
     await this.store.removePugMatchLog(matchId);
   }
 
+  async rollbackPugMatch(matchId: string) {
+    if (this.pugMatches.has(matchId)) throw new Error('Only completed PUG matches can be rolled back.');
+    await this.store.rollbackPugMatch(matchId);
+  }
+
   async resetPugMatch(matchId: string) {
     const match = this.pugMatches.get(matchId);
     if (!match) throw new Error('PUG match is not currently active.');
@@ -1805,6 +1810,7 @@ export type TeamBotApi = Pick<
   | 'publishPugQueueMessage'
   | 'getPugAdminState'
   | 'deletePugMatch'
+  | 'rollbackPugMatch'
   | 'resetPugMatch'
   | 'forcePugTeams'
   | 'forcePugCaptains'
