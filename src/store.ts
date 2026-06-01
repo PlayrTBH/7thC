@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugAbandonLog, PugAbandonSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 
 const initialStore: StoreShape = {
@@ -10,6 +10,7 @@ const initialStore: StoreShape = {
   events: [],
   eventRegistrations: [],
   pugMatchLogs: [],
+  pugAbandonLogs: [],
   pugEloRatings: [],
   pugSeasonLeaderboards: [],
   pugUserBadges: [],
@@ -27,6 +28,7 @@ export class JsonStore {
     await withFileLock(this.filePath, async () => {
       try {
         const data = await this.readUnlocked();
+        data.pugAbandonLogs ??= [];
         await this.writeUnlocked(data);
       } catch {
         await this.writeUnlocked(initialStore);
@@ -187,6 +189,50 @@ export class JsonStore {
   async getPugRankSettings() {
     const data = await this.read();
     return normalizePugRankSettings(data.settings.pugs?.ranks);
+  }
+
+  async getPugAbandonSettings() {
+    const data = await this.read();
+    return normalizePugAbandonSettings(data.settings.pugs?.abandons);
+  }
+
+  async getPugAbandonLogs() {
+    const data = await this.read();
+    return [...(data.pugAbandonLogs ?? [])].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async getPugActiveAbandonBlock(userId: string, at = new Date()) {
+    const data = await this.read();
+    const now = at.getTime();
+    return (data.pugAbandonLogs ?? [])
+      .filter((log) => log.userId === userId && log.blockedUntil && new Date(log.blockedUntil).getTime() > now)
+      .sort((a, b) => String(b.blockedUntil).localeCompare(String(a.blockedUntil)))[0];
+  }
+
+  async recordPugAbandon(log: PugAbandonLog) {
+    await this.update((data) => {
+      data.pugAbandonLogs ??= [];
+      const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+      const seasonId = getActivePugSeason(data).id;
+      const now = log.createdAt;
+      let finalLog = { ...log };
+      if (log.eloPenalty > 0) {
+        const existing = data.pugEloRatings.find((rating) => rating.userId === log.userId);
+        const before = existing?.rating ?? settings.startingRating;
+        const after = Math.max(0, Math.round(before - log.eloPenalty));
+        finalLog = { ...finalLog, ratingBefore: before, ratingAfter: after };
+        if (existing) {
+          existing.rating = after;
+          existing.seasonId = seasonId;
+          if (log.username) existing.username = log.username;
+          existing.updatedAt = now;
+        } else {
+          data.pugEloRatings.push({ userId: log.userId, username: log.username, rating: after, peakRating: before, seasonId, updatedAt: now });
+        }
+      }
+      data.pugAbandonLogs.push(finalLog);
+      return data;
+    });
   }
 
   async getPugSeasons() {
@@ -611,6 +657,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     events: data.events ?? [],
     eventRegistrations: data.eventRegistrations ?? [],
     pugMatchLogs: Array.isArray(data.pugMatchLogs) ? data.pugMatchLogs.map(normalizePugMatchLog) : [],
+    pugAbandonLogs: Array.isArray(data.pugAbandonLogs) ? data.pugAbandonLogs.map(normalizePugAbandonLog).filter(Boolean) as PugAbandonLog[] : [],
     pugEloRatings: Array.isArray(data.pugEloRatings) ? data.pugEloRatings.map(normalizePugEloRating).filter(Boolean) as PugEloRating[] : [],
     pugSeasonLeaderboards: Array.isArray(data.pugSeasonLeaderboards) ? data.pugSeasonLeaderboards.map(normalizePugSeasonLeaderboardEntry).filter(Boolean) as PugSeasonLeaderboardEntry[] : [],
     pugUserBadges: Array.isArray(data.pugUserBadges) ? data.pugUserBadges.map(normalizePugUserBadge).filter(Boolean) as PugUserBadge[] : [],
@@ -657,6 +704,25 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
   return normalized;
 }
 
+function normalizePugAbandonLog(log: Partial<PugAbandonLog>) {
+  if (typeof log.id !== 'string' || typeof log.matchId !== 'string' || typeof log.userId !== 'string') return undefined;
+  const now = new Date().toISOString();
+  return {
+    id: log.id,
+    matchId: log.matchId,
+    size: log.size === 12 ? 12 : 6,
+    userId: log.userId,
+    username: typeof log.username === 'string' ? log.username : undefined,
+    replacementUserId: typeof log.replacementUserId === 'string' ? log.replacementUserId : undefined,
+    replacementUsername: typeof log.replacementUsername === 'string' ? log.replacementUsername : undefined,
+    eloPenalty: typeof log.eloPenalty === 'number' && Number.isFinite(log.eloPenalty) ? Math.max(0, Math.round(log.eloPenalty)) : 0,
+    ratingBefore: typeof log.ratingBefore === 'number' && Number.isFinite(log.ratingBefore) ? Math.max(0, Math.round(log.ratingBefore)) : undefined,
+    ratingAfter: typeof log.ratingAfter === 'number' && Number.isFinite(log.ratingAfter) ? Math.max(0, Math.round(log.ratingAfter)) : undefined,
+    blockedUntil: typeof log.blockedUntil === 'string' ? log.blockedUntil : undefined,
+    createdAt: typeof log.createdAt === 'string' ? log.createdAt : now
+  };
+}
+
 function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
   const now = new Date().toISOString();
   return {
@@ -690,6 +756,7 @@ function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSe
     mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : [],
     queueMessageId: typeof settings?.queueMessageId === 'string' ? settings.queueMessageId : undefined,
     elo: normalizePugEloSettings(settings?.elo),
+    abandons: normalizePugAbandonSettings(settings?.abandons),
     ranks: normalizePugRankSettings(settings?.ranks),
     seasons: normalizePugSeasons(settings?.seasons)
   };
@@ -706,6 +773,13 @@ const defaultPugRanks: PugRankSettings = {
     { id: 'infernal', label: 'Infernal', abbreviation: 'I', minRating: 35000 }
   ]
 };
+
+function normalizePugAbandonSettings(settings: Partial<PugAbandonSettings> | undefined): PugAbandonSettings {
+  return {
+    eloPenalty: Math.max(0, Math.round(typeof settings?.eloPenalty === 'number' && Number.isFinite(settings.eloPenalty) ? settings.eloPenalty : 0)),
+    blockMinutes: Math.max(0, Math.round(typeof settings?.blockMinutes === 'number' && Number.isFinite(settings.blockMinutes) ? settings.blockMinutes : 0))
+  };
+}
 
 function normalizePugRankSettings(settings: Partial<PugRankSettings> | undefined): PugRankSettings {
   const ranks = Array.isArray(settings?.ranks) ? settings.ranks.map(normalizePugRankDefinition).filter(Boolean) as PugRankSettings['ranks'] : [];

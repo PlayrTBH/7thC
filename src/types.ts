@@ -83,6 +83,11 @@ export type PugEloSettings = {
   cashoutMultiplier: number;
 };
 
+export type PugAbandonSettings = {
+  eloPenalty: number;
+  blockMinutes: number;
+};
+
 export type PugRankDefinition = {
   id: string;
   label: string;
@@ -102,6 +107,7 @@ export type PugSettings = {
   mapPool: string[];
   queueMessageId?: string;
   elo?: PugEloSettings;
+  abandons?: PugAbandonSettings;
   ranks?: PugRankSettings;
   seasons?: PugSeason[];
 };
@@ -178,6 +184,21 @@ export type PugEloChange = {
   delta: number;
 };
 
+export type PugAbandonLog = {
+  id: string;
+  matchId: string;
+  size: PugQueueSize;
+  userId: string;
+  username?: string;
+  replacementUserId?: string;
+  replacementUsername?: string;
+  eloPenalty: number;
+  ratingBefore?: number;
+  ratingAfter?: number;
+  blockedUntil?: string;
+  createdAt: string;
+};
+
 export type PugMatchLog = {
   id: string;
   size: PugQueueSize;
@@ -212,6 +233,7 @@ export type StoreShape = {
   events: Event[];
   eventRegistrations: EventRegistration[];
   pugMatchLogs: PugMatchLog[];
+  pugAbandonLogs: PugAbandonLog[];
   pugEloRatings: PugEloRating[];
   pugSeasonLeaderboards: PugSeasonLeaderboardEntry[];
   pugUserBadges: PugUserBadge[];

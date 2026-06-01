@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugAbandonLog, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -424,6 +424,10 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
           finalRoundMultiplier: parseDecimalInRange(req.body.finalRoundMultiplier, 'Final Round ELO value', 0, 5),
           cashoutMultiplier: parseDecimalInRange(req.body.cashoutMultiplier, 'Cashout ELO value', 0, 5)
         },
+        abandons: {
+          eloPenalty: parsePositiveInteger(req.body.abandonEloPenalty, 'Abandon ELO penalty', 0),
+          blockMinutes: parsePositiveInteger(req.body.abandonBlockMinutes, 'Abandon queue block minutes', 0)
+        },
         ranks: existing?.ranks,
         seasons: existing?.seasons
       };
@@ -445,10 +449,10 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
 
   app.get('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
-      const [state, ratings, eloSettings] = await Promise.all([bot.getPugAdminState(), store.getPugEloRatings(), store.getPugEloSettings()]);
+      const [state, ratings, eloSettings, abandonLogs] = await Promise.all([bot.getPugAdminState(), store.getPugEloRatings(), store.getPugEloSettings(), store.getPugAbandonLogs()]);
       const activeMatches = state.activeMatches.map((match) => addAdminPugEloPreview(match, ratings, eloSettings));
       const playerSearch = buildPugPlayerSearchState(state.history, ratings, eloSettings, String(req.query.q ?? ''), String(req.query.playerId ?? ''));
-      res.send(layout('PUG administration', administratorPugsPage(activeMatches, state.history, ratings, eloSettings, playerSearch), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+      res.send(layout('PUG administration', administratorPugsPage(activeMatches, state.history, ratings, eloSettings, playerSearch, abandonLogs), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -503,7 +507,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const elo = parsePugEloSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, ranks: existing?.ranks, seasons: existing?.seasons });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, abandons: existing?.abandons, ranks: existing?.ranks, seasons: existing?.seasons });
       res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
@@ -1418,6 +1422,15 @@ function administratorPugSettingsForm(settings?: PugSettings) {
         </label>
       </div>
       <p><small>These multipliers scale ELO value by mode. Use <code>1</code> for normal value; Cashout defaults to <code>1.25</code>, which boosts first-place and second-place rewards without increasing losses.</small></p>
+      <div class="inline-form">
+        <label>Abandon ELO penalty
+          <input name="abandonEloPenalty" type="number" min="0" step="1" value="${settings?.abandons?.eloPenalty ?? 0}" />
+        </label>
+        <label>Abandon queue block minutes
+          <input name="abandonBlockMinutes" type="number" min="0" step="1" value="${settings?.abandons?.blockMinutes ?? 0}" />
+        </label>
+      </div>
+      <p><small>Players who fail to join their match queue voice channel within 2 minutes are logged as abandoned. Configure the optional fixed ELO penalty and temporary queue block here.</small></p>
       <button type="submit">Save PUG settings</button>
     </form>
     <form method="post" action="/administrator/pugs/publish" onsubmit="return confirm('Publish or refresh the PUG queue message in the configured channel?');">
@@ -1428,7 +1441,7 @@ function administratorPugSettingsForm(settings?: PugSettings) {
 }
 
 
-function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings, playerSearch: PugPlayerSearchState) {
+function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings, playerSearch: PugPlayerSearchState, abandonLogs: PugAbandonLog[]) {
   return `<p><a href="/administrator">← Back to administrator</a></p>
     <section class="card">
       <h2>Ongoing PUG matches</h2>
@@ -1437,6 +1450,10 @@ function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMa
     <section class="card" id="elo">
       <h2>PUG ELO administration</h2>
       ${pugEloAdminPanel(ratings, eloSettings, playerSearch)}
+    </section>
+    <section class="card" id="abandons">
+      <h2>Full abandon log</h2>
+      ${abandonLogs.length ? `<div class="pug-history">${abandonLogs.map(pugAbandonCard).join('')}</div>` : '<p>No PUG abandons have been logged yet.</p>'}
     </section>
     <section class="card">
       <h2>Full PUG match history</h2>
@@ -1471,6 +1488,18 @@ function pugActiveMatchCard(match: AdminPugMatchLog) {
         <button type="submit">Force captains</button>
       </form>
     </details>
+  </div>`;
+}
+
+function pugAbandonCard(log: PugAbandonLog) {
+  const replacement = log.replacementUserId ? ` · Replacement ${escapeHtml(log.replacementUsername ?? log.replacementUserId)} (<code>${escapeHtml(log.replacementUserId)}</code>)` : ' · No replacement available at abandon time';
+  const penalty = log.eloPenalty > 0 ? ` · Penalty ${formatElo(log.eloPenalty)} ELO${log.ratingBefore !== undefined && log.ratingAfter !== undefined ? ` (${formatElo(log.ratingBefore)} → ${formatElo(log.ratingAfter)})` : ''}` : ' · No ELO penalty';
+  const block = log.blockedUntil ? ` · Blocked until ${formatDateTime(log.blockedUntil)}` : ' · No queue block';
+  return `<div class="pug-admin-match">
+    <div class="admin-team-row">
+      <div><strong>${escapeHtml(log.username ?? log.userId)}</strong> <span class="pill">abandoned</span><br /><small><code>${escapeHtml(log.userId)}</code> · ${escapeHtml(pugQueueLabel(log.size))} · Match <code>${escapeHtml(log.matchId)}</code> · ${formatDateTime(log.createdAt)}</small></div>
+    </div>
+    <p><small>${replacement}${penalty}${block}</small></p>
   </div>`;
 }
 

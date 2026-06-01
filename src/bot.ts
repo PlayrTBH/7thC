@@ -22,15 +22,18 @@ import {
 import { randomInt, randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import type { JsonStore } from './store.js';
-import type { BotActivityType, BotStatus, DeveloperSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
 const PUG_QUEUE_COUNTDOWN_MS = 60 * 1000;
+const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
+const PUG_VOTE_REPOST_MS = 12 * 1000;
+const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -418,6 +421,10 @@ export class TeamBot {
       ? interaction.member
       : guild.members.cache.get(interaction.user.id) ?? (await guild.members.fetch(interaction.user.id).catch(() => null));
     if (!member || member.user.bot) throw new Error('Only server members can join the PUG queue.');
+    const activeBlock = await this.store.getPugActiveAbandonBlock(member.id);
+    if (activeBlock?.blockedUntil) {
+      throw new Error(`You are temporarily blocked from PUG queues until ${new Date(activeBlock.blockedUntil).toLocaleString('en-US', { timeZone: 'UTC' })} UTC because of a recent abandon.`);
+    }
 
     await this.withPugQueueLock(async () => {
       for (const [queueSize, players] of this.pugQueues) {
@@ -565,8 +572,9 @@ export class TeamBot {
     );
     await text.send({ content: `${playerIds.map((id) => `<@${id}>`).join(' ')} PUG queue is full. Waiting for everyone to join ${queueVoice.toString()} before team selection starts.`, allowedMentions: { users: playerIds } });
     await this.waitForPugPlayersInQueue(guild, match);
-    const modeMessage = await text.send({ content: `${playerIds.map((id) => `<@${id}>`).join(' ')} everyone is in the queue voice channel. Vote on how teams should be created. A majority vote decides the team selection mode.`, embeds: [buildPugModeVoteEmbed(match)], components: [modeRow], allowedMentions: { users: playerIds } });
+    const modeMessage = await text.send({ content: `${match.playerIds.map((id) => `<@${id}>`).join(' ')} everyone is in the queue voice channel. Vote on how teams should be created. A majority vote decides the team selection mode.`, embeds: [buildPugModeVoteEmbed(match)], components: [modeRow], allowedMentions: { users: match.playerIds } });
     match.modeVoteMessageId = modeMessage.id;
+    this.startPugModeVoteReposter(match);
   }
 
   private async buildPugPlayerRankLabels(playerIds: string[]) {
@@ -582,19 +590,129 @@ export class TeamBot {
   }
 
   private async waitForPugPlayersInQueue(guild: Guild, match: PugMatch) {
-    const deadline = Date.now() + 10 * 60 * 1000;
-    while (Date.now() < deadline) {
-      const missingPlayerIds = match.playerIds.filter((userId) => guild.members.cache.get(userId)?.voice.channelId !== match.queueVoiceChannelId);
+    const firstMissingAt = new Map<string, number>();
+    const abandonedMissingPlayerIds = new Set<string>();
+
+    while (this.pugMatches.has(match.id)) {
+      const missingPlayerIds: string[] = [];
+      for (const userId of match.playerIds) {
+        const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+        if (member?.voice.channelId !== match.queueVoiceChannelId) missingPlayerIds.push(userId);
+      }
+
       if (!missingPlayerIds.length) return;
-      const members = await Promise.all(missingPlayerIds.map((userId) => guild.members.fetch(userId).catch(() => null)));
-      if (members.every((member) => member?.voice.channelId === match.queueVoiceChannelId)) return;
+
+      const now = Date.now();
+      for (const userId of missingPlayerIds) {
+        if (abandonedMissingPlayerIds.has(userId)) {
+          const replacement = await this.pullPugReplacement(match);
+          if (replacement) {
+            abandonedMissingPlayerIds.delete(userId);
+            await this.replacePugPlayer(guild, match, userId, replacement);
+            firstMissingAt.set(replacement.userId, Date.now());
+          }
+          continue;
+        }
+        if (!firstMissingAt.has(userId)) firstMissingAt.set(userId, now);
+        if (now - (firstMissingAt.get(userId) ?? now) < PUG_ABANDON_GRACE_MS) continue;
+
+        const replacement = await this.pullPugReplacement(match);
+        await this.recordPugAbandon(guild, match, userId, replacement);
+        firstMissingAt.delete(userId);
+        if (replacement) {
+          await this.replacePugPlayer(guild, match, userId, replacement);
+          firstMissingAt.set(replacement.userId, Date.now());
+        } else {
+          abandonedMissingPlayerIds.add(userId);
+          const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
+          if (channel?.type === ChannelType.GuildText) {
+            await channel.send(`<@${userId}> did not join within 2 minutes and has been marked abandoned. Waiting for the next queued player to replace them.`).catch(() => undefined);
+          }
+        }
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
+  }
 
+  private async pullPugReplacement(match: PugMatch) {
+    return this.withPugQueueLock(async () => {
+      const queue = this.pugQueues.get(match.size) ?? [];
+      while (queue.length) {
+        const candidate = queue.shift()!;
+        if (!match.playerIds.includes(candidate.userId) && !(await this.store.getPugActiveAbandonBlock(candidate.userId))) {
+          if (queue.length) this.pugQueues.set(match.size, queue);
+          else this.pugQueues.delete(match.size);
+          this.updatePugQueueCountdown(match.size);
+          this.schedulePugQueueMessageRefresh(0);
+          return candidate;
+        }
+      }
+      this.pugQueues.delete(match.size);
+      this.updatePugQueueCountdown(match.size);
+      this.schedulePugQueueMessageRefresh(0);
+      return undefined;
+    });
+  }
+
+  private async recordPugAbandon(guild: Guild, match: PugMatch, userId: string, replacement?: PugQueuedPlayer) {
+    const settings = await this.store.getPugAbandonSettings();
+    const now = new Date();
+    const blockedUntil = settings.blockMinutes > 0 ? new Date(now.getTime() + settings.blockMinutes * 60 * 1000).toISOString() : undefined;
+    const log: PugAbandonLog = {
+      id: randomUUID(),
+      matchId: match.id,
+      size: match.size,
+      userId,
+      username: match.playerUsernames.get(userId),
+      replacementUserId: replacement?.userId,
+      replacementUsername: replacement?.username,
+      eloPenalty: settings.eloPenalty,
+      blockedUntil,
+      createdAt: now.toISOString()
+    };
+    await this.store.recordPugAbandon(log);
     const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (channel?.type === ChannelType.GuildText) {
-      await channel.send('Not every queued player joined the queue voice channel within 10 minutes. Continuing with team selection for the queued match.').catch(() => undefined);
+      const penaltyText = settings.eloPenalty > 0 ? ` They received a ${settings.eloPenalty} ELO abandon penalty.` : '';
+      const blockText = blockedUntil ? ` They are blocked from queues until ${new Date(blockedUntil).toLocaleString('en-US', { timeZone: 'UTC' })} UTC.` : '';
+      await channel.send(`<@${userId}> did not join the queue voice channel in time and has been marked abandoned.${penaltyText}${blockText}`).catch(() => undefined);
     }
+  }
+
+  private async replacePugPlayer(guild: Guild, match: PugMatch, abandonedUserId: string, replacement: PugQueuedPlayer) {
+    const index = match.playerIds.indexOf(abandonedUserId);
+    if (index < 0) return;
+    match.playerIds[index] = replacement.userId;
+    match.playerUsernames.delete(abandonedUserId);
+    match.playerUsernames.set(replacement.userId, replacement.username);
+    match.playerRankLabels.delete(abandonedUserId);
+    const rankLabels = await this.buildPugPlayerRankLabels([replacement.userId]);
+    const replacementRank = rankLabels.get(replacement.userId);
+    if (replacementRank) match.playerRankLabels.set(replacement.userId, replacementRank);
+    match.modeVotes.delete(abandonedUserId);
+    match.votes.delete(abandonedUserId);
+    match.updatedAt = new Date().toISOString();
+
+    await Promise.all([match.categoryId, match.queueVoiceChannelId, match.textChannelId].map(async (channelId) => {
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (!channel || !('permissionOverwrites' in channel)) return;
+      await channel.permissionOverwrites.delete(abandonedUserId, 'PUG abandoned before joining').catch(() => undefined);
+      await channel.permissionOverwrites.edit(replacement.userId, { ViewChannel: true, Connect: true, Speak: true, SendMessages: true, ReadMessageHistory: true }, { type: OverwriteType.Member, reason: 'PUG replacement added' }).catch(() => undefined);
+    }));
+
+    const member = guild.members.cache.get(replacement.userId) ?? (await guild.members.fetch(replacement.userId).catch(() => null));
+    const queueVoice = await guild.channels.fetch(match.queueVoiceChannelId).catch(() => null);
+    if (member && queueVoice?.type === ChannelType.GuildVoice) {
+      if (member.voice.channelId) await member.voice.setChannel(queueVoice, 'PUG replacement added').catch(() => undefined);
+      else await member.send({ content: `You are replacing a player who did not join in time for a PUG match in **${guild.name}**. Join ${queueVoice.toString()} now.` }).catch(() => undefined);
+    }
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (text?.type === ChannelType.GuildText) {
+      await text.send({ content: `<@${replacement.userId}> you are replacing a player who did not join in time. Please join ${queueVoice?.toString() ?? 'the queue voice channel'} now.`, allowedMentions: { users: [replacement.userId] } }).catch(() => undefined);
+      await this.refreshPugModeVoteMessage(match);
+    }
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
   }
 
   private async recordPugModeVote(interaction: import('discord.js').ButtonInteraction, matchId: string, mode: PugTeamMode) {
@@ -637,6 +755,7 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG text channel no longer exists.');
 
+    this.stopPugModeVoteReposter(match);
     if (match.modeVoteMessageId) {
       const message = await text.messages.fetch(match.modeVoteMessageId).catch(() => null);
       await message?.edit({ embeds: [buildPugModeVoteEmbed(match)], components: [] }).catch((error) => console.warn('Unable to finalize PUG mode vote message:', error));
@@ -758,6 +877,7 @@ export class TeamBot {
     const message = await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team. A majority vote ends the match.' : 'Vote for the winner and second place. Separate majorities for winner and second place end the match.', embeds: [buildPugResultVoteEmbed(match, teamCount)], components: rows });
     match.voteMessageId = message.id;
     match.updatedAt = new Date().toISOString();
+    this.startPugResultVoteReposter(match);
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
   }
 
@@ -812,6 +932,86 @@ export class TeamBot {
     await message?.edit({ embeds: [buildPugResultVoteEmbed(match, getPugTeamCount(match.size))] }).catch((error) => console.warn('Unable to refresh PUG result vote message:', error));
   }
 
+  private startPugModeVoteReposter(match: PugMatch) {
+    this.stopPugModeVoteReposter(match);
+    match.modeVoteRefreshTimer = setInterval(() => {
+      this.repostPugModeVoteMessage(match).catch((error) => console.warn('Unable to repost PUG mode vote message:', error));
+    }, PUG_VOTE_REPOST_MS);
+  }
+
+  private stopPugModeVoteReposter(match: PugMatch) {
+    if (!match.modeVoteRefreshTimer) return;
+    clearInterval(match.modeVoteRefreshTimer);
+    match.modeVoteRefreshTimer = undefined;
+  }
+
+  private async repostPugModeVoteMessage(match: PugMatch) {
+    if (match.selectedMode || !this.pugMatches.has(match.id)) return;
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) return;
+    if (match.modeVoteMessageId) {
+      const oldMessage = await text.messages.fetch(match.modeVoteMessageId).catch(() => null);
+      await oldMessage?.delete().catch(() => undefined);
+    }
+    const modeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`pug:mode:${match.id}:random`).setLabel('Random teams').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`pug:mode:${match.id}:captains`).setLabel('Captains').setStyle(ButtonStyle.Primary)
+    );
+    const message = await text.send({ content: `${match.playerIds.map((id) => `<@${id}>`).join(' ')} vote on how teams should be created.`, embeds: [buildPugModeVoteEmbed(match)], components: [modeRow], allowedMentions: { users: match.playerIds } });
+    match.modeVoteMessageId = message.id;
+  }
+
+  private startPugResultVoteReposter(match: PugMatch) {
+    this.stopPugResultVoteReposter(match);
+    match.voteRefreshTimer = setInterval(() => {
+      this.repostPugResultVoteMessage(match).catch((error) => console.warn('Unable to repost PUG result vote message:', error));
+    }, PUG_VOTE_REPOST_MS);
+    match.deadMatchTimer = setTimeout(() => {
+      this.cancelDeadPugMatch(match).catch((error) => console.warn('Unable to cancel dead PUG match:', error));
+    }, PUG_DEAD_MATCH_MS);
+  }
+
+  private stopPugResultVoteReposter(match: PugMatch) {
+    if (match.voteRefreshTimer) clearInterval(match.voteRefreshTimer);
+    if (match.deadMatchTimer) clearTimeout(match.deadMatchTimer);
+    match.voteRefreshTimer = undefined;
+    match.deadMatchTimer = undefined;
+  }
+
+  private stopPugVoteTimers(match: PugMatch) {
+    this.stopPugModeVoteReposter(match);
+    this.stopPugResultVoteReposter(match);
+  }
+
+  private async repostPugResultVoteMessage(match: PugMatch) {
+    if (!match.voteMode || !this.pugMatches.has(match.id)) return;
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) return;
+    if (match.voteMessageId) {
+      const oldMessage = await text.messages.fetch(match.voteMessageId).catch(() => null);
+      await oldMessage?.delete().catch(() => undefined);
+    }
+    const message = await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team. A majority vote ends the match.' : 'Vote for the winner and second place. Separate majorities for winner and second place end the match.', embeds: [buildPugResultVoteEmbed(match, getPugTeamCount(match.size))], components: buildPugVoteRows(match.id, getPugTeamCount(match.size), match.voteMode) });
+    match.voteMessageId = message.id;
+  }
+
+  private async cancelDeadPugMatch(match: PugMatch) {
+    if (!this.pugMatches.has(match.id)) return;
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (text?.type === ChannelType.GuildText) {
+      await text.send('This PUG match has been open for more than 60 minutes without a completed vote. Canceling it as dead with no ELO changes or penalties.').catch(() => undefined);
+    }
+    this.stopPugVoteTimers(match);
+    await this.cleanupPugMatchChannels(match, 'PUG match canceled after 60 minutes without a result vote');
+    const endedAt = new Date().toISOString();
+    match.updatedAt = endedAt;
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Canceled as dead match with no ELO changes', endedAt }));
+    this.pugMatches.delete(match.id);
+  }
+
   private async endPugMatch(match: PugMatch, result: string) {
     const existing = this.pugMatchEndLocks.get(match.id);
     if (existing) {
@@ -828,6 +1028,7 @@ export class TeamBot {
 
   private async finishPugMatch(match: PugMatch, result: string) {
     if (!this.pugMatches.has(match.id)) return;
+    this.stopPugVoteTimers(match);
 
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
@@ -881,6 +1082,7 @@ export class TeamBot {
   async deletePugMatch(matchId: string) {
     const match = this.pugMatches.get(matchId);
     if (match) {
+      this.stopPugVoteTimers(match);
       await this.cleanupPugMatchChannels(match, 'PUG match deleted by administrator');
       const endedAt = new Date().toISOString();
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Deleted by administrator', endedAt }));
@@ -902,6 +1104,7 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
+    this.stopPugVoteTimers(match);
     await this.deletePugTeamVoiceChannels(guild, match, 'PUG match reset by administrator');
     match.modeVotes.clear();
     match.selectedMode = undefined;
@@ -921,6 +1124,7 @@ export class TeamBot {
     );
     const message = await text.send({ content: 'This PUG match was reset by an administrator. Vote again on how teams should be created.', embeds: [buildPugModeVoteEmbed(match)], components: [modeRow], allowedMentions: { users: match.playerIds } });
     match.modeVoteMessageId = message.id;
+    this.startPugModeVoteReposter(match);
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'reset' }));
   }
 
@@ -932,6 +1136,7 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
+    this.stopPugResultVoteReposter(match);
     await this.deletePugTeamVoiceChannels(guild, match, 'PUG teams changed by administrator');
     match.selectedMode = 'random';
     match.captainDraft = undefined;
@@ -952,6 +1157,7 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
+    this.stopPugResultVoteReposter(match);
     await this.deletePugTeamVoiceChannels(guild, match, 'PUG captains changed by administrator');
     match.selectedMode = 'captains';
     match.teams = undefined;
@@ -1694,6 +1900,7 @@ function majorityModeVote(match: PugMatch) {
   for (const mode of ['random', 'captains'] as const) {
     if ((counts.get(mode) ?? 0) >= threshold) return mode;
   }
+  if (match.modeVotes.size === match.playerIds.length && (counts.get('random') ?? 0) === (counts.get('captains') ?? 0)) return 'random';
   return undefined;
 }
 
