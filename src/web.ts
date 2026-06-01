@@ -19,6 +19,10 @@ declare module 'express-session' {
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
+type AdminPugEloPreviewPlayer = { userId: string; username?: string; rating: number; first: number; second?: number; loss: number };
+type AdminPugEloPreviewTeam = { teamIndex: number; total: number; average: number; players: AdminPugEloPreviewPlayer[] };
+type AdminPugMatchLog = PugMatchLog & { eloPreview?: AdminPugEloPreviewTeam[] };
+
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
 
@@ -403,7 +407,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/administrator/pugs', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const [state, ratings, eloSettings] = await Promise.all([bot.getPugAdminState(), store.getPugEloRatings(), store.getPugEloSettings()]);
-      res.send(layout('PUG administration', administratorPugsPage(state.activeMatches, state.history, ratings, eloSettings), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
+      const activeMatches = state.activeMatches.map((match) => addAdminPugEloPreview(match, ratings, eloSettings));
+      res.send(layout('PUG administration', administratorPugsPage(activeMatches, state.history, ratings, eloSettings), { user: req.session.discordUser, isAdmin: true, active: 'administrator' }));
     } catch (error) {
       next(error);
     }
@@ -1293,7 +1298,7 @@ function administratorPugSettingsForm(settings?: PugSettings) {
 }
 
 
-function administratorPugsPage(activeMatches: PugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings) {
+function administratorPugsPage(activeMatches: AdminPugMatchLog[], history: PugMatchLog[], ratings: PugEloRating[], eloSettings: PugEloSettings) {
   return `<p><a href="/administrator">← Back to administrator</a></p>
     <section class="card">
       <h2>Ongoing PUG matches</h2>
@@ -1309,7 +1314,7 @@ function administratorPugsPage(activeMatches: PugMatchLog[], history: PugMatchLo
     </section>`;
 }
 
-function pugActiveMatchCard(match: PugMatchLog) {
+function pugActiveMatchCard(match: AdminPugMatchLog) {
   const teamText = formatPugTeamsForInput(match);
   const captainsText = match.captainIds.length ? match.captainIds.join('\n') : '';
   return `<div class="pug-admin-match">
@@ -1346,7 +1351,8 @@ function pugHistoryCard(match: PugMatchLog) {
   </div>`;
 }
 
-function pugMatchSummary(match: PugMatchLog) {
+function pugMatchSummary(match: AdminPugMatchLog | PugMatchLog) {
+  const eloPreview = 'eloPreview' in match ? pugEloPreviewSummary(match.eloPreview) : '';
   return `<div class="admin-team-row">
     <div>
       <strong>${escapeHtml(pugQueueLabel(match.size))}</strong> <span class="pill">${escapeHtml(match.status)}</span><br />
@@ -1356,9 +1362,70 @@ function pugMatchSummary(match: PugMatchLog) {
   </div>
   <div class="pug-admin-grid">
     <div><h3>Players</h3>${pugPlayerList(match, match.playerIds)}</div>
-    <div><h3>Teams</h3>${match.teams.length ? match.teams.map((team, index) => `<p><strong>Team ${index + 1}</strong><br />${pugPlayerList(match, team)}</p>`).join('') : '<p><small>Teams have not been created yet.</small></p>'}</div>
+    <div><h3>Teams</h3>${match.teams.length ? match.teams.map((team, index) => `<p><strong>Team ${index + 1}</strong><br />${pugPlayerList(match, team)}</p>`).join('') : '<p><small>Teams have not been created yet.</small></p>'}${eloPreview}</div>
     <div><h3>Results</h3><p>${match.result ? escapeHtml(match.result) : 'No result yet.'}</p>${pugVoteSummary(match)}${pugEloChangeSummary(match)}</div>
   </div>`;
+}
+
+
+function addAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], settings: PugEloSettings): AdminPugMatchLog {
+  if (!match.teams.length) return match;
+  return { ...match, eloPreview: buildAdminPugEloPreview(match, ratings, settings) };
+}
+
+function buildAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], settings: PugEloSettings): AdminPugEloPreviewTeam[] {
+  const ratingMap = new Map(ratings.map((rating) => [rating.userId, rating]));
+  const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + getAdminPugRating(userId, ratingMap, settings).rating, 0));
+  return match.teams.map((team, teamIndex) => {
+    const teamAverage = teamTotals[teamIndex] / Math.max(1, team.length);
+    const opponents = match.teams.flatMap((otherTeam, otherIndex) => otherIndex === teamIndex ? [] : otherTeam);
+    const opponentAverage = opponents.reduce((sum, userId) => sum + getAdminPugRating(userId, ratingMap, settings).rating, 0) / Math.max(1, opponents.length);
+    return {
+      teamIndex,
+      total: teamTotals[teamIndex],
+      average: teamAverage,
+      players: team.map((userId) => {
+        const rating = getAdminPugRating(userId, ratingMap, settings);
+        const first = calculateAdminPugEloGain(rating.rating, teamAverage, opponentAverage, settings);
+        return {
+          userId,
+          username: match.playerUsernames[userId] ?? rating.username,
+          rating: rating.rating,
+          first,
+          second: match.teams.length > 2 ? Math.round(first / 2) : undefined,
+          loss: -calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings)
+        };
+      })
+    };
+  });
+}
+
+function getAdminPugRating(userId: string, ratings: Map<string, PugEloRating>, settings: PugEloSettings) {
+  return ratings.get(userId) ?? { userId, rating: settings.startingRating, updatedAt: '' };
+}
+
+function calculateAdminPugEloGain(playerRating: number, teamAverage: number, opponentAverage: number, settings: PugEloSettings) {
+  const teamFactor = Math.exp(((opponentAverage - teamAverage) / settings.startingRating) * settings.strength);
+  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
+  return Math.max(1, Math.min(2000, Math.round(settings.baseChange * teamFactor * playerFactor)));
+}
+
+function calculateAdminPugEloLoss(playerRating: number, teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
+  const teamLossFactor = Math.exp(((teamAverage - opponentAverage) / settings.startingRating) * settings.strength);
+  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
+  const uncappedLoss = Math.max(1, Math.round(settings.baseChange * teamLossFactor * playerFactor));
+  return Math.min(possibleGain * 2, uncappedLoss);
+}
+
+function pugEloPreviewSummary(preview?: AdminPugEloPreviewTeam[]) {
+  if (!preview?.length) return '';
+  const playerRows = (team: AdminPugEloPreviewTeam) => team.players.map((player) => `
+    <span>${escapeHtml(player.username ?? player.userId)}</span>
+    <span>${formatElo(player.rating)}</span>
+    <span class="elo-gain">+${formatElo(player.first)}</span>
+    <span${player.second === undefined ? '' : ' class="elo-gain"'}>${player.second === undefined ? '—' : `+${formatElo(player.second)}`}</span>
+    <span class="elo-loss">${formatElo(player.loss)}</span>`).join('');
+  return `<div class="pug-elo-preview"><h3>ELO preview</h3><p><small>Administrator-only estimate. Values show each player’s current ELO and potential change for First, Second, or Loss.</small></p>${preview.map((team) => `<div class="pug-elo-preview-team"><strong>Team ${team.teamIndex + 1}: ${formatElo(team.total)} total ELO</strong><br /><small>${formatElo(team.average)} average ELO</small><div class="pug-elo-preview-table"><span>Player</span><span>ELO</span><span>First</span><span>Second</span><span>Loss</span>${playerRows(team)}</div></div>`).join('')}</div>`;
 }
 
 function pugPlayerList(match: PugMatchLog, ids: string[]) {
@@ -2058,6 +2125,12 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .pug-admin-match { display: grid; gap: .85rem; background: rgba(255,255,255,.025); border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; }
     .pug-admin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
     .pug-admin-grid h3 { margin: 0 0 .45rem; }
+    .pug-elo-preview { margin-top: 1rem; display: grid; gap: .75rem; }
+    .pug-elo-preview-team { border-top: 1px solid var(--line); padding-top: .75rem; }
+    .pug-elo-preview-table { display: grid; grid-template-columns: minmax(7rem, 1fr) repeat(4, auto); gap: .35rem .7rem; align-items: center; margin-top: .5rem; font-size: .84rem; }
+    .pug-elo-preview-table > span:nth-child(-n+5) { color: var(--muted); font-weight: 700; }
+    .elo-gain { color: #86efac; }
+    .elo-loss { color: #fca5a5; }
     .pug-player { display: block; margin: .2rem 0; }
     .pug-history { display: grid; gap: 1rem; }
     .member-info { flex: 1 1 12rem; }
