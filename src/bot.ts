@@ -798,7 +798,7 @@ export class TeamBot {
 
     const placements = parsePugResultPlacements(result, match.teams.length);
     const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
-    const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings);
+    const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings, match.size);
     await this.store.applyPugEloChanges(changes);
     return { changes, teamTotals };
   }
@@ -1489,7 +1489,8 @@ function calculatePugEloChanges(
   placements: number[],
   ratings: Map<string, PugEloRating>,
   playerUsernames: Map<string, string>,
-  settings: PugEloSettings
+  settings: PugEloSettings,
+  size: PugQueueSize
 ): PugEloChange[] {
   const teamTotals = teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
   return teams.flatMap((team, teamIndex) => {
@@ -1497,14 +1498,16 @@ function calculatePugEloChanges(
     const opponents = teams.flatMap((otherTeam, otherIndex) => otherIndex === teamIndex ? [] : otherTeam);
     const opponentAverage = opponents.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0) / Math.max(1, opponents.length);
     const placement = placements[teamIndex] ?? teams.length;
+    const valueMultiplier = getPugEloValueMultiplier(settings, size);
     return team.map((userId) => {
       const before = ratings.get(userId)?.rating ?? settings.startingRating;
       const possibleGain = calculatePugEloGain(before, teamAverage, opponentAverage, settings);
-      const delta = placement === 1
+      const baseDelta = placement === 1
         ? possibleGain
         : placement === 2 && teams.length > 2
           ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain / 2))
           : -calculatePugEloLoss(before, teamAverage, opponentAverage, possibleGain, settings);
+      const delta = Math.round(baseDelta * valueMultiplier);
       return {
         userId,
         username: playerUsernames.get(userId) ?? ratings.get(userId)?.username,
@@ -1516,6 +1519,10 @@ function calculatePugEloChanges(
       };
     });
   });
+}
+
+function getPugEloValueMultiplier(settings: PugEloSettings, size: PugQueueSize) {
+  return size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
 }
 
 const MINIMUM_PUG_ELO_CHANGE = 200;
