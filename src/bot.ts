@@ -991,10 +991,9 @@ export class TeamBot {
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) return;
-    if (match.modeVoteMessageId) {
-      const oldMessage = await text.messages.fetch(match.modeVoteMessageId).catch(() => null);
-      await oldMessage?.delete().catch(() => undefined);
-    }
+    const oldMessage = match.modeVoteMessageId ? await text.messages.fetch(match.modeVoteMessageId).catch(() => null) : null;
+    if (oldMessage && !(await this.hasNewerNonBotMessage(text, oldMessage.id))) return;
+    await oldMessage?.delete().catch(() => undefined);
     const modeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`pug:mode:${match.id}:random`).setLabel('Random teams').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`pug:mode:${match.id}:captains`).setLabel('Captains').setStyle(ButtonStyle.Primary)
@@ -1030,12 +1029,22 @@ export class TeamBot {
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) return;
-    if (match.voteMessageId) {
-      const oldMessage = await text.messages.fetch(match.voteMessageId).catch(() => null);
-      await oldMessage?.delete().catch(() => undefined);
-    }
+    const oldMessage = match.voteMessageId ? await text.messages.fetch(match.voteMessageId).catch(() => null) : null;
+    if (oldMessage && !(await this.hasNewerNonBotMessage(text, oldMessage.id))) return;
+    await oldMessage?.delete().catch(() => undefined);
     const message = await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team. A majority vote ends the match.' : 'Vote for the winner and second place. Separate majorities for winner and second place end the match.', embeds: [buildPugResultVoteEmbed(match, getPugTeamCount(match.size))], components: buildPugVoteRows(match.id, getPugTeamCount(match.size), match.voteMode) });
     match.voteMessageId = message.id;
+  }
+
+
+  private async hasNewerNonBotMessage(text: import('discord.js').TextChannel, messageId: string) {
+    const botUserId = this.client.user?.id;
+    const newerMessages = await text.messages.fetch({ after: messageId, limit: 100 }).catch((error) => {
+      console.warn('Unable to check for newer PUG vote messages:', error);
+      return null;
+    });
+    if (!newerMessages) return false;
+    return newerMessages.some((message) => message.author.id !== botUserId);
   }
 
   private async cancelDeadPugMatch(match: PugMatch) {
