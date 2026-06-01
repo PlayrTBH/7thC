@@ -618,7 +618,7 @@ export class TeamBot {
   private async sendPugVotePrompt(text: import('discord.js').TextChannel, match: PugMatch, teamCount: number) {
     match.voteMode = teamCount === 2 ? 'winner' : 'placements';
     const rows = buildPugVoteRows(match.id, teamCount, match.voteMode);
-    const message = await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team. A majority vote ends the match.' : 'Vote for first and second place. A majority on matching placements ends the match.', embeds: [buildPugResultVoteEmbed(match, teamCount)], components: rows });
+    const message = await text.send({ content: match.voteMode === 'winner' ? 'Vote for the winning team. A majority vote ends the match.' : 'Vote for the winner and second place. Separate majorities for winner and second place end the match.', embeds: [buildPugResultVoteEmbed(match, teamCount)], components: rows });
     match.voteMessageId = message.id;
     match.updatedAt = new Date().toISOString();
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
@@ -1543,14 +1543,9 @@ function buildPugModeVoteEmbed(match: PugMatch) {
 
 function buildPugResultVoteEmbed(match: PugMatch, teamCount: number) {
   const totalVoters = match.playerIds.length;
-  const completeVotes = [...match.votes.values()].filter((vote) => isCompletePugResultVote(vote));
-  const counts = countVotes(completeVotes);
   const lines = match.voteMode === 'winner'
-    ? Array.from({ length: teamCount }, (_, index) => formatVotePercentageLine(`Team ${index + 1}`, counts.get(String(index)) ?? 0, totalVoters))
-    : buildPlacementVoteOptions(teamCount).map((vote) => {
-        const [first, second] = vote.split(',').map((value) => Number(value) + 1);
-        return formatVotePercentageLine(`Team ${first} first, Team ${second} second`, counts.get(vote) ?? 0, totalVoters);
-      });
+    ? buildWinnerVoteLines(match, teamCount, totalVoters)
+    : buildPlacementVoteLines(match, teamCount, totalVoters);
 
   return new EmbedBuilder()
     .setTitle(match.voteMode === 'winner' ? 'Winning Team Vote' : 'Placement Vote')
@@ -1559,15 +1554,27 @@ function buildPugResultVoteEmbed(match: PugMatch, teamCount: number) {
     .setFooter({ text: `Majority required: ${getMajorityThreshold(totalVoters)}/${totalVoters}` });
 }
 
-function buildPlacementVoteOptions(teamCount: number) {
-  const votes: string[] = [];
-  for (let first = 0; first < teamCount; first += 1) {
-    for (let second = 0; second < teamCount; second += 1) {
-      if (second === first) continue;
-      votes.push(`${first},${second}`);
-    }
+function buildWinnerVoteLines(match: PugMatch, teamCount: number, totalVoters: number) {
+  const counts = countVotes([...match.votes.values()].filter((vote) => isCompletePugResultVote(vote)));
+  return Array.from({ length: teamCount }, (_, index) => formatVotePercentageLine(`Team ${index + 1}`, counts.get(String(index)) ?? 0, totalVoters));
+}
+
+function buildPlacementVoteLines(match: PugMatch, teamCount: number, totalVoters: number) {
+  const { winnerCounts, secondCounts } = countPlacementVotes(match.votes.values());
+  const winnerLines = Array.from({ length: teamCount }, (_, index) => formatVotePercentageLine(`Winner: Team ${index + 1}`, winnerCounts.get(String(index)) ?? 0, totalVoters));
+  const secondLines = Array.from({ length: teamCount }, (_, index) => formatVotePercentageLine(`Second: Team ${index + 1}`, secondCounts.get(String(index)) ?? 0, totalVoters));
+  return [...winnerLines, '', ...secondLines];
+}
+
+function countPlacementVotes(votes: Iterable<string>) {
+  const winnerCounts = new Map<string, number>();
+  const secondCounts = new Map<string, number>();
+  for (const vote of votes) {
+    const [winner, second] = vote.split(',');
+    if (winner) winnerCounts.set(winner, (winnerCounts.get(winner) ?? 0) + 1);
+    if (second) secondCounts.set(second, (secondCounts.get(second) ?? 0) + 1);
   }
-  return votes;
+  return { winnerCounts, secondCounts };
 }
 
 function isCompletePugResultVote(vote: string) {
@@ -1616,7 +1623,7 @@ function shuffle(values: string[]) {
 
 function buildPugVoteRows(matchId: string, teamCount: number, voteMode: 'winner' | 'placements') {
   const winnerRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    Array.from({ length: teamCount }, (_, index) => new ButtonBuilder().setCustomId(`pug:vote:${matchId}:${index}`).setLabel(`${voteMode === 'winner' ? 'Winner' : 'First'}: Team ${index + 1}`).setStyle(ButtonStyle.Primary))
+    Array.from({ length: teamCount }, (_, index) => new ButtonBuilder().setCustomId(`pug:vote:${matchId}:${index}`).setLabel(`Winner: Team ${index + 1}`).setStyle(ButtonStyle.Primary))
   );
   if (voteMode === 'winner') return [winnerRow];
   return [
@@ -1629,16 +1636,26 @@ function buildPugVoteRows(matchId: string, teamCount: number, voteMode: 'winner'
 
 function majorityVote(match: PugMatch) {
   const threshold = Math.floor(match.playerIds.length / 2) + 1;
+  if (match.voteMode === 'placements') {
+    const { winnerCounts, secondCounts } = countPlacementVotes(match.votes.values());
+    const winningTeam = findMajorityTeam(winnerCounts, threshold);
+    const secondPlaceTeam = findMajorityTeam(secondCounts, threshold);
+    if (winningTeam && secondPlaceTeam) return `Team ${Number(winningTeam) + 1} wins, Team ${Number(secondPlaceTeam) + 1} second place`;
+    return undefined;
+  }
+
   const counts = new Map<string, number>();
   for (const vote of match.votes.values()) {
     if (!vote || vote.endsWith(',') || vote.startsWith(',')) continue;
     counts.set(vote, (counts.get(vote) ?? 0) + 1);
   }
-  for (const [vote, count] of counts) {
-    if (count < threshold) continue;
-    if (match.voteMode === 'winner') return `Team ${Number(vote) + 1} wins`;
-    const [first, second] = vote.split(',').map((value) => Number(value) + 1);
-    return `Team ${first} first place, Team ${second} second place`;
+  const winningTeam = findMajorityTeam(counts, threshold);
+  return winningTeam ? `Team ${Number(winningTeam) + 1} wins` : undefined;
+}
+
+function findMajorityTeam(counts: Map<string, number>, threshold: number) {
+  for (const [team, count] of counts) {
+    if (count >= threshold) return team;
   }
   return undefined;
 }
