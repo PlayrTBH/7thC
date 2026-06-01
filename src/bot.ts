@@ -1498,7 +1498,6 @@ function calculatePugEloChanges(
     const opponents = teams.flatMap((otherTeam, otherIndex) => otherIndex === teamIndex ? [] : otherTeam);
     const opponentAverage = opponents.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0) / Math.max(1, opponents.length);
     const placement = placements[teamIndex] ?? teams.length;
-    const valueMultiplier = getPugEloValueMultiplier(settings, size);
     return team.map((userId) => {
       const before = ratings.get(userId)?.rating ?? settings.startingRating;
       const possibleGain = calculatePugEloGain(before, teamAverage, opponentAverage, settings);
@@ -1507,7 +1506,7 @@ function calculatePugEloChanges(
         : placement === 2 && teams.length > 2
           ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain / 2))
           : -calculatePugEloLoss(before, teamAverage, opponentAverage, possibleGain, settings);
-      const delta = Math.round(baseDelta * valueMultiplier);
+      const delta = Math.round(baseDelta * getPugEloValueMultiplier(settings, size, baseDelta));
       return {
         userId,
         username: playerUsernames.get(userId) ?? ratings.get(userId)?.username,
@@ -1521,7 +1520,8 @@ function calculatePugEloChanges(
   });
 }
 
-function getPugEloValueMultiplier(settings: PugEloSettings, size: PugQueueSize) {
+function getPugEloValueMultiplier(settings: PugEloSettings, size: PugQueueSize, delta: number) {
+  if (size === 12 && delta <= 0) return 1;
   return size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
 }
 
