@@ -290,7 +290,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         const username = profile?.username ?? (rating.username && rating.username !== displayName ? rating.username : undefined);
         return { ...rating, displayName, username, avatarUrl: profile?.avatarUrl ?? '', rank: resolvePugRank(rating, rankSettings, topMasterUserIds) };
       });
-      res.send(layout('PUG ELO leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds)), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      res.send(layout('7th Circle Leaderboard', leaderboardPage(decoratedLeaderboard, ownRating, resolvePugRank(ownRating, rankSettings, topMasterUserIds)), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -1530,8 +1530,8 @@ type LeaderboardRating = PugEloRating & { displayName: string; username?: string
 
 function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank) {
   return `<section class="card">
-    <h2>Top 10 PUG ELO players</h2>
-    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating, index) => leaderboardEntry(rating, index)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+    <h2>Top 10 7th Circle players</h2>
+    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
   </section>
   <section class="card">
     <h2>Your PUG ELO</h2>
@@ -1540,9 +1540,10 @@ function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRati
   </section>`;
 }
 
-function leaderboardEntry(rating: LeaderboardRating, index: number) {
-  const masterClass = index < 3 ? ' leaderboard-master' : '';
-  return `<li class="leaderboard-entry${masterClass}">
+function leaderboardEntry(rating: LeaderboardRating) {
+  const rankClass = ` leaderboard-${rankClassId(rating.rank.id)}`;
+  const masterClass = rating.rank.isMaster ? ' leaderboard-master' : '';
+  return `<li class="leaderboard-entry${rankClass}${masterClass}">
     <a class="leaderboard-player" href="/leaderboard/players/${encodeURIComponent(rating.userId)}">
       ${rating.avatarUrl ? `<img src="${escapeHtml(rating.avatarUrl)}" alt="" />` : '<span class="avatar-placeholder"></span>'}
       <span><strong>${escapeHtml(rating.displayName)}</strong>${rating.username ? `<small>@${escapeHtml(rating.username)}</small>` : ''}</span>
@@ -1554,8 +1555,10 @@ function leaderboardEntry(rating: LeaderboardRating, index: number) {
 
 function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile?: { displayName?: string; username?: string; avatarUrl?: string }) {
   const displayName = profile?.displayName ?? stats.player.username ?? stats.player.userId;
+  const profileClasses = ['card', 'leaderboard-profile-section', `profile-${rankClassId(stats.rank.id)}`];
+  if (stats.rank.isMaster) profileClasses.push('profile-master');
   return `<p><a href="/leaderboard">← Back to leaderboard</a></p>
-  <section class="card">
+  <section class="${profileClasses.map(escapeHtml).join(' ')}">
     <div class="profile-card leaderboard-profile-card">
       ${profile?.avatarUrl ? `<img class="profile-avatar" src="${escapeHtml(profile.avatarUrl)}" alt="" />` : '<span class="profile-avatar avatar-placeholder"></span>'}
       <div>
@@ -2466,11 +2469,13 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .leaderboard-player { min-width: 0; color: var(--text); text-decoration: none; flex: 1 1 auto; }
     .leaderboard-player span { display: grid; min-width: 0; }
     .leaderboard-player strong, .leaderboard-player small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .leaderboard-entry.leaderboard-master { position: relative; border-color: rgba(251, 146, 60, .55); background: radial-gradient(ellipse at 18% 50%, rgba(251, 146, 60, .22), rgba(239, 68, 68, .08) 38%, transparent 72%), linear-gradient(135deg, rgba(124, 45, 18, .32), #12141a 60%); box-shadow: 0 0 18px rgba(251, 146, 60, .14), inset 0 0 28px rgba(251, 146, 60, .08); }
-    .leaderboard-entry.leaderboard-master::after { content: ''; position: absolute; inset: -.8rem auto -.8rem 2.2rem; width: min(18rem, 58%); pointer-events: none; background: radial-gradient(ellipse, rgba(251, 146, 60, .18), transparent 70%); filter: blur(12px); }
+    .leaderboard-entry.leaderboard-infernal:not(.leaderboard-master) { position: relative; border-color: rgba(250, 204, 21, .42); background: radial-gradient(ellipse at 18% 50%, rgba(250, 204, 21, .2), rgba(234, 179, 8, .07) 42%, transparent 72%), linear-gradient(135deg, rgba(113, 63, 18, .24), #12141a 62%); box-shadow: 0 0 18px rgba(250, 204, 21, .14), inset 0 0 26px rgba(250, 204, 21, .07); }
+    .leaderboard-infernal:not(.leaderboard-master) .leaderboard-player strong { color: #fde047; text-shadow: 0 0 10px rgba(250, 204, 21, .68), 0 0 22px rgba(234, 179, 8, .34); }
+    .leaderboard-entry.leaderboard-master { position: relative; border-color: rgba(239, 68, 68, .8); background: radial-gradient(ellipse at 18% 50%, rgba(251, 146, 60, .28), rgba(239, 68, 68, .1) 38%, transparent 72%), linear-gradient(135deg, rgba(124, 45, 18, .38), #12141a 60%); box-shadow: 0 0 18px rgba(251, 146, 60, .18), 0 0 24px rgba(239, 68, 68, .2), inset 0 0 28px rgba(251, 146, 60, .1); }
+    .leaderboard-entry.leaderboard-master::after { content: ''; position: absolute; inset: -.8rem auto -.8rem 2.2rem; width: min(18rem, 58%); pointer-events: none; background: radial-gradient(ellipse, rgba(251, 146, 60, .22), transparent 70%); filter: blur(12px); }
     .leaderboard-master .leaderboard-player, .leaderboard-master .leaderboard-rank, .leaderboard-master > span:not(.leaderboard-rank) { position: relative; z-index: 1; }
     .leaderboard-master .leaderboard-player span, .leaderboard-master .leaderboard-player strong { overflow: visible; }
-    .leaderboard-master .leaderboard-player strong { color: #c2410c; text-shadow: 0 0 10px rgba(251, 146, 60, .72), 0 0 22px rgba(239, 68, 68, .42); }
+    .leaderboard-master .leaderboard-player strong { color: #fb923c; text-shadow: 0 0 10px rgba(251, 146, 60, .72), 0 0 22px rgba(239, 68, 68, .42); }
     .leaderboard-master .leaderboard-player strong::before, .leaderboard-master .leaderboard-player strong::after { content: '🔥'; margin: 0 .2rem; filter: drop-shadow(0 0 6px rgba(251, 146, 60, .7)); }
     .leaderboard-rank { flex: 0 0 auto; }
     .rank-badge { display: inline-flex; align-items: center; gap: .4rem; color: #f5d0fe; font-weight: 900; white-space: nowrap; }
@@ -2489,6 +2494,12 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .rank-icon-editor { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .rank-icon-preview { display: grid; place-items: center; width: 3rem; height: 3rem; border: 1px dashed rgba(255,255,255,.24); border-radius: .75rem; background-color: #0f1116; background-size: cover; background-position: center; color: var(--muted); font-size: .65rem; text-align: center; }
     .rank-icon-preview.is-empty { background-image: none !important; }
+    .leaderboard-profile-section { position: relative; overflow: hidden; }
+    .leaderboard-profile-section > * { position: relative; z-index: 1; }
+    .leaderboard-profile-section.profile-infernal:not(.profile-master) { border-color: rgba(250, 204, 21, .48); background: radial-gradient(ellipse at 20% 14%, rgba(250, 204, 21, .24), rgba(234, 179, 8, .08) 42%, transparent 72%), #12141a; box-shadow: 0 0 24px rgba(250, 204, 21, .18), inset 0 0 36px rgba(250, 204, 21, .07); }
+    .leaderboard-profile-section.profile-infernal:not(.profile-master) h2 { color: #fde047; text-shadow: 0 0 12px rgba(250, 204, 21, .72), 0 0 24px rgba(234, 179, 8, .36); }
+    .leaderboard-profile-section.profile-master { border-color: rgba(239, 68, 68, .86); background: radial-gradient(ellipse at 20% 14%, rgba(251, 146, 60, .3), rgba(239, 68, 68, .1) 42%, transparent 74%), #12141a; box-shadow: 0 0 22px rgba(251, 146, 60, .2), 0 0 30px rgba(239, 68, 68, .24), inset 0 0 38px rgba(251, 146, 60, .1); }
+    .leaderboard-profile-section.profile-master h2 { color: #fb923c; text-shadow: 0 0 12px rgba(251, 146, 60, .72), 0 0 24px rgba(239, 68, 68, .44); }
     .leaderboard-profile-card { margin-bottom: 1rem; }
     .stat-card { background: #12141a; border: 1px solid var(--line); border-radius: 1rem; padding: .9rem; }
     .stat-card strong { display: block; margin-top: .25rem; font-size: 1.25rem; }
