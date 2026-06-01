@@ -1392,7 +1392,7 @@ function buildAdminPugEloPreview(match: PugMatchLog, ratings: PugEloRating[], se
           username: match.playerUsernames[userId] ?? rating.username,
           rating: rating.rating,
           first,
-          second: match.teams.length > 2 ? Math.round(first / 2) : undefined,
+          second: match.teams.length > 2 ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(first / 2)) : undefined,
           loss: -calculateAdminPugEloLoss(rating.rating, teamAverage, opponentAverage, first, settings)
         };
       })
@@ -1404,17 +1404,20 @@ function getAdminPugRating(userId: string, ratings: Map<string, PugEloRating>, s
   return ratings.get(userId) ?? { userId, rating: settings.startingRating, updatedAt: '' };
 }
 
+const MINIMUM_PUG_ELO_CHANGE = 200;
+const MAXIMUM_PUG_ELO_GAIN = 2000;
+const MAXIMUM_PUG_ELO_LOSS_MULTIPLIER = 2;
+
 function calculateAdminPugEloGain(playerRating: number, teamAverage: number, opponentAverage: number, settings: PugEloSettings) {
   const teamFactor = Math.exp(((opponentAverage - teamAverage) / settings.startingRating) * settings.strength);
   const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
-  return Math.max(1, Math.min(2000, Math.round(settings.baseChange * teamFactor * playerFactor)));
+  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.min(MAXIMUM_PUG_ELO_GAIN, Math.round(settings.baseChange * teamFactor * playerFactor)));
 }
 
-function calculateAdminPugEloLoss(playerRating: number, teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
-  const teamLossFactor = Math.exp(((teamAverage - opponentAverage) / settings.startingRating) * settings.strength);
-  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
-  const uncappedLoss = Math.max(1, Math.round(settings.baseChange * teamLossFactor * playerFactor));
-  return Math.min(possibleGain * 2, uncappedLoss);
+function calculateAdminPugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, _settings: PugEloSettings) {
+  const opponentRatio = opponentAverage > 0 ? playerRating / opponentAverage : MAXIMUM_PUG_ELO_LOSS_MULTIPLIER;
+  const cappedRatio = Math.min(MAXIMUM_PUG_ELO_LOSS_MULTIPLIER, opponentRatio);
+  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
 }
 
 function pugEloPreviewSummary(preview?: AdminPugEloPreviewTeam[]) {
@@ -1485,7 +1488,7 @@ function leaderboardEntry(rating: LeaderboardRating) {
 function pugEloAdminPanel(ratings: PugEloRating[], settings: PugEloSettings) {
   return `<div class="subsection">
     <h3>ELO formula settings</h3>
-    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. The win cap is always 2,000 ELO, and losses are capped at twice the match's possible gain.</small></p>
+    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Wins and losses have a 200 ELO floor; wins cap at 2,000 ELO, and losses scale by each player's ELO versus opponent average up to twice the win reward.</small></p>
     <form method="post" action="/administrator/pugs/elo/settings" class="inline-form">
       <label>Starting ELO <input name="startingRating" type="number" min="1" value="${settings.startingRating}" /></label>
       <label>Fair-win base <input name="baseChange" type="number" min="1" value="${settings.baseChange}" /></label>

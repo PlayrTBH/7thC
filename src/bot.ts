@@ -615,7 +615,7 @@ export class TeamBot {
   }
 
   private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string) {
-    const map = await this.pickPugMap(match.size);
+    const map = await this.pickPugMap();
     match.teams = teams.map((team) => [...team]);
     match.map = map;
     match.updatedAt = new Date().toISOString();
@@ -645,9 +645,7 @@ export class TeamBot {
     ));
   }
 
-  private async pickPugMap(size: PugQueueSize) {
-    if (size === 6) return 'Random';
-
+  private async pickPugMap() {
     const settings = await this.store.getAdministratorSettings();
     const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
     if (!maps.length) return undefined;
@@ -1466,7 +1464,7 @@ function calculatePugEloChanges(
       const delta = placement === 1
         ? possibleGain
         : placement === 2 && teams.length > 2
-          ? Math.round(possibleGain / 2)
+          ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain / 2))
           : -calculatePugEloLoss(before, teamAverage, opponentAverage, possibleGain, settings);
       return {
         userId,
@@ -1481,17 +1479,20 @@ function calculatePugEloChanges(
   });
 }
 
+const MINIMUM_PUG_ELO_CHANGE = 200;
+const MAXIMUM_PUG_ELO_GAIN = 2000;
+const MAXIMUM_PUG_ELO_LOSS_MULTIPLIER = 2;
+
 function calculatePugEloGain(playerRating: number, teamAverage: number, opponentAverage: number, settings: PugEloSettings) {
   const teamFactor = Math.exp(((opponentAverage - teamAverage) / settings.startingRating) * settings.strength);
   const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
-  return Math.max(1, Math.min(2000, Math.round(settings.baseChange * teamFactor * playerFactor)));
+  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.min(MAXIMUM_PUG_ELO_GAIN, Math.round(settings.baseChange * teamFactor * playerFactor)));
 }
 
-function calculatePugEloLoss(playerRating: number, teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
-  const teamLossFactor = Math.exp(((teamAverage - opponentAverage) / settings.startingRating) * settings.strength);
-  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
-  const uncappedLoss = Math.max(1, Math.round(settings.baseChange * teamLossFactor * playerFactor));
-  return Math.min(possibleGain * 2, uncappedLoss);
+function calculatePugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, _settings: PugEloSettings) {
+  const opponentRatio = opponentAverage > 0 ? playerRating / opponentAverage : MAXIMUM_PUG_ELO_LOSS_MULTIPLIER;
+  const cappedRatio = Math.min(MAXIMUM_PUG_ELO_LOSS_MULTIPLIER, opponentRatio);
+  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
 }
 
 function formatPugEloSummary(changes: PugEloChange[]) {
