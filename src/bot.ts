@@ -903,12 +903,12 @@ export class TeamBot {
     }).catch((error) => console.warn('Unable to refresh PUG captain draft message:', error));
   }
 
-  private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string) {
-    const map = await this.pickPugMap(match.map);
+  private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string, options: { reuseTeamVoiceChannels?: boolean; preserveMap?: boolean } = {}) {
+    const map = options.preserveMap && match.map ? match.map : await this.pickPugMap(match.map);
     match.teams = teams.map((team) => [...team]);
     match.map = map;
     match.updatedAt = new Date().toISOString();
-    await this.createPugTeamVoiceChannels(guild, match, teams);
+    await this.createPugTeamVoiceChannels(guild, match, teams, { reuseExisting: options.reuseTeamVoiceChannels });
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
 
     await text.send({
@@ -918,13 +918,16 @@ export class TeamBot {
     await this.sendPugVotePrompt(text, match, teams.length);
   }
 
-  private async createPugTeamVoiceChannels(guild: Guild, match: PugMatch, teams: string[][]) {
+  private async createPugTeamVoiceChannels(guild: Guild, match: PugMatch, teams: string[][], options: { reuseExisting?: boolean } = {}) {
     const channels = await Promise.all(
-      teams.map((_, index) =>
-        guild.channels.create({ name: `Team ${index + 1}`, type: ChannelType.GuildVoice, parent: match.categoryId, reason: 'PUG team voice channel created' })
-      )
+      teams.map(async (_, index) => {
+        const existingChannelId = options.reuseExisting ? match.teamVoiceChannelIds[index] : undefined;
+        const existingChannel = existingChannelId ? await guild.channels.fetch(existingChannelId).catch(() => null) : null;
+        if (existingChannel?.type === ChannelType.GuildVoice) return existingChannel;
+        return guild.channels.create({ name: `Team ${index + 1}`, type: ChannelType.GuildVoice, parent: match.categoryId, reason: 'PUG team voice channel created' });
+      })
     );
-    match.teamVoiceChannelIds.push(...channels.map((channel) => channel.id));
+    match.teamVoiceChannelIds = channels.map((channel) => channel.id);
 
     await Promise.all(teams.flatMap((team, index) =>
       team.map(async (userId) => {
@@ -1277,11 +1280,10 @@ export class TeamBot {
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
     this.stopPugResultVoteReposter(match);
-    await this.deletePugTeamVoiceChannels(guild, match, 'PUG teams changed by administrator');
     match.selectedMode = 'random';
     match.captainDraft = undefined;
     match.votes.clear();
-    await this.finalizePugTeams(guild, text, match, teams, 'An administrator changed the PUG teams.');
+    await this.finalizePugTeams(guild, text, match, teams, 'An administrator changed the PUG teams.', { reuseTeamVoiceChannels: true, preserveMap: true });
   }
 
   async forcePugCaptains(matchId: string, captainIds: string[]) {
