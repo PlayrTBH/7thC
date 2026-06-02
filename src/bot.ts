@@ -373,6 +373,17 @@ export class TeamBot {
     return { id: member.id, displayName: member.displayName, username: member.user.username };
   }
 
+  private async fetchPugMemberVoiceState(guild: Guild, userId: string) {
+    const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+    const cachedChannelId = member?.voice.channelId ?? null;
+    const voiceState = await guild.voiceStates.fetch(userId, { force: true }).catch((error) => {
+      if (isDiscordNotFoundError(error)) return null;
+      console.warn(`Unable to fetch fresh voice state for PUG player ${userId}; falling back to cache:`, error);
+      return undefined;
+    });
+    return { member, channelId: voiceState === undefined ? cachedChannelId : voiceState?.channelId ?? null };
+  }
+
   async getGuildMemberProfiles(userIds: string[]) {
     const guild = await this.getGuild();
     const uniqueUserIds = [...new Set(userIds)];
@@ -673,8 +684,9 @@ export class TeamBot {
         if (!players.length) this.pugQueues.delete(queueSize);
       }
 
+      const { channelId } = await this.fetchPugMemberVoiceState(guild, member.id);
       const queue = this.pugQueues.get(size) ?? [];
-      queue.push({ userId: member.id, username: member.user.username, voiceChannelId: member.voice.channelId ?? undefined });
+      queue.push({ userId: member.id, username: member.user.username, voiceChannelId: channelId ?? undefined });
       this.pugQueues.set(size, queue);
       for (const queueSize of pugQueueSizes) this.updatePugQueueCountdown(queueSize);
 
@@ -781,8 +793,8 @@ export class TeamBot {
       guild.channels.create({ name: 'pug-match', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites, topic: `PUG match ${matchDisplayId} (${matchId})`, reason: 'PUG match text channel created when queue filled' })
     ]);
 
-    const fetchedPlayers = await Promise.all(playerIds.map(async (playerId) => guild.members.cache.get(playerId) ?? guild.members.fetch(playerId).catch(() => null)));
-    const playerUsernames = new Map(playerIds.map((playerId, index) => [playerId, fetchedPlayers[index]?.user.username ?? players[index].username]));
+    const fetchedPlayers = await Promise.all(playerIds.map(async (playerId) => this.fetchPugMemberVoiceState(guild, playerId)));
+    const playerUsernames = new Map(playerIds.map((playerId, index) => [playerId, fetchedPlayers[index].member?.user.username ?? players[index].username]));
     const playerRanks = await this.buildPugPlayerRanks(guild, playerIds);
     const now = new Date().toISOString();
     const match: PugMatch = { id: matchId, size, playerIds, playerUsernames, playerRankLabels: playerRanks.labels, playerRankRoleIds: playerRanks.roleIds, categoryId: category.id, queueVoiceChannelId: queueVoice.id, textChannelId: text.id, teamVoiceChannelIds: [], modeVotes: new Map(), votes: new Map(), createdAt: now, updatedAt: now };
@@ -792,11 +804,14 @@ export class TeamBot {
     await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after match start:', error));
 
     await Promise.all(players.map(async (player, index) => {
-      const member = fetchedPlayers[index];
+      const { member, channelId } = fetchedPlayers[index];
       if (!member) return;
-      if (player.voiceChannelId && member.voice.channelId) {
-        await member.voice.setChannel(queueVoice, 'PUG queue filled').catch((error) => console.warn(`Unable to move PUG player ${player.userId}:`, error));
-        return;
+      if (channelId) {
+        const moved = await member.voice.setChannel(queueVoice, 'PUG queue filled').then(() => true, (error) => {
+          console.warn(`Unable to move PUG player ${player.userId}:`, error);
+          return false;
+        });
+        if (moved) return;
       }
       await member.send({ content: `Your PUG queue is ready in **${guild.name}**. Join ${queueVoice.toString()} so the match can begin.` }).catch((error) => console.warn(`Unable to DM PUG player ${player.userId}:`, error));
     }));
@@ -835,8 +850,8 @@ export class TeamBot {
     while (this.pugMatches.has(match.id)) {
       const missingPlayerIds: string[] = [];
       for (const userId of match.playerIds) {
-        const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
-        if (member?.voice.channelId !== match.queueVoiceChannelId) missingPlayerIds.push(userId);
+        const { channelId } = await this.fetchPugMemberVoiceState(guild, userId);
+        if (channelId !== match.queueVoiceChannelId) missingPlayerIds.push(userId);
       }
 
       if (!missingPlayerIds.length) return;
@@ -945,11 +960,11 @@ export class TeamBot {
       await channel.permissionOverwrites.edit(replacement.userId, { ViewChannel: true, Connect: true, Speak: true, SendMessages: true, ReadMessageHistory: true }, { type: OverwriteType.Member, reason: 'PUG replacement added' }).catch(() => undefined);
     }));
 
-    const member = guild.members.cache.get(replacement.userId) ?? (await guild.members.fetch(replacement.userId).catch(() => null));
+    const { member, channelId } = await this.fetchPugMemberVoiceState(guild, replacement.userId);
     const queueVoice = await guild.channels.fetch(match.queueVoiceChannelId).catch(() => null);
     if (member && queueVoice?.type === ChannelType.GuildVoice) {
-      if (member.voice.channelId) await member.voice.setChannel(queueVoice, 'PUG replacement added').catch(() => undefined);
-      else await member.send({ content: `You are replacing a player who did not join in time for a PUG match in **${guild.name}**. Join ${queueVoice.toString()} now.` }).catch(() => undefined);
+      const moved = channelId ? await member.voice.setChannel(queueVoice, 'PUG replacement added').then(() => true, () => false) : false;
+      if (!moved) await member.send({ content: `You are replacing a player who did not join in time for a PUG match in **${guild.name}**. Join ${queueVoice.toString()} now.` }).catch(() => undefined);
     }
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (text?.type === ChannelType.GuildText) {
@@ -1109,8 +1124,8 @@ export class TeamBot {
 
     await Promise.all(teams.flatMap((team, index) =>
       team.map(async (userId) => {
-        const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
-        if (member?.voice.channelId) await member.voice.setChannel(channels[index], 'PUG teams assigned').catch(() => undefined);
+        const { member, channelId } = await this.fetchPugMemberVoiceState(guild, userId);
+        if (member && channelId) await member.voice.setChannel(channels[index], 'PUG teams assigned').catch(() => undefined);
       })
     ));
   }
@@ -2716,6 +2731,13 @@ async function assertBotPermissions(guild: Guild) {
   if (!me.permissions.has(needed)) {
     throw new Error('Bot needs Manage Roles, Manage Channels, Move Members, and Create Instant Invite permissions.');
   }
+}
+
+
+function isDiscordNotFoundError(error: unknown) {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { status?: number; code?: number | string };
+  return candidate.status === 404 || candidate.code === 10065 || candidate.code === '10065';
 }
 
 export type TeamBotApi = Pick<
