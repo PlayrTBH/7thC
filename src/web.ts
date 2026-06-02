@@ -26,6 +26,9 @@ type PugPlayerSearchEntry = { userId: string; username?: string; rating: number;
 type PugPlayerModeStats = { mode: PugMatchLog['size'] | 'unknown' | 'all'; label: string; wins: number; seconds: number; losses: number; total: number; winRate: number };
 type PugPlayerRank = PugRankDefinition & { isMaster?: boolean };
 type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats; rank: PugPlayerRank };
+type PugEloGraphRange = '24h' | '7d' | '31d' | 'season';
+type PugEloGraphPoint = { matchId: string; rating: number; before: number; delta: number; occurredAt: string; label: string };
+type PugEloGraphState = { range: PugEloGraphRange; activeSeason: PugSeason; points: PugEloGraphPoint[]; totalSeasonMatches: number; rangeStart: string; rangeEnd: string };
 type PugPlayerSearchState = { query: string; selectedPlayerId?: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[]; selected?: PugPlayerStats };
 type LeaderboardPlayerSearchState = { query: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[] };
 
@@ -580,11 +583,12 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/leaderboard/players/:userId', requireAuth, async (req, res, next) => {
     try {
       const userId = parseRequiredDiscordId(req.params.userId);
-      const [history, ratings, eloSettings, rankSettings, profiles, administratorAccess, badges, selectedBadgeIds] = await Promise.all([
+      const [history, ratings, eloSettings, rankSettings, activeSeason, profiles, administratorAccess, badges, selectedBadgeIds] = await Promise.all([
         store.getPugMatchLogs(),
         store.getPugEloRatings(),
         store.getPugEloSettings(),
         store.getPugRankSettings(),
+        store.getActivePugSeason(),
         bot.getGuildMemberProfiles([userId]),
         bot.getAdministratorAccess(req.session.discordUser!.id),
         store.getPugUserBadges(userId),
@@ -593,7 +597,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
       const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings, rankSettings.masterPlayerCount));
       const profile = profiles[0];
-      res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
+      const eloGraph = buildPugEloGraphState(userId, history, activeSeason, parsePugEloGraphRange(req.query.eloRange));
+      res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds, eloGraph), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
     }
@@ -1648,6 +1653,12 @@ function parseDiscordIds(value: string) {
 type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string; rank: PugPlayerRank };
 
 const CURRENT_LEADERBOARD_LIMIT = 100;
+const ELO_GRAPH_RANGES: { id: PugEloGraphRange; label: string; durationMs?: number }[] = [
+  { id: '24h', label: '24 hours', durationMs: 24 * 60 * 60 * 1000 },
+  { id: '7d', label: '7 days', durationMs: 7 * 24 * 60 * 60 * 1000 },
+  { id: '31d', label: '31 days', durationMs: 31 * 24 * 60 * 60 * 1000 },
+  { id: 'season', label: 'Full season' }
+];
 
 function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank, playerSearch: LeaderboardPlayerSearchState, activeSeason: PugSeason, seasonLeaderboards: PugSeasonLeaderboardEntry[]) {
   return `<section class="card">
@@ -1703,7 +1714,7 @@ function leaderboardRankBadge(rank: PugPlayerRank) {
   return `<span class="rank-badge leaderboard-emblem-only rank-${rankClassId(rank.id)}${rank.isMaster ? ' master-rank' : ''}" title="${escapeHtml(rank.label)}"><img class="rank-icon" src="${escapeHtml(rank.iconDataUrl)}" alt="${escapeHtml(rank.label)}" /></span>`;
 }
 
-function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile: { displayName?: string; username?: string; avatarUrl?: string } | undefined, badges: PugUserBadge[], selectedBadgeIds: string[]) {
+function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile: { displayName?: string; username?: string; avatarUrl?: string } | undefined, badges: PugUserBadge[], selectedBadgeIds: string[], eloGraph: PugEloGraphState) {
   const displayName = profile?.displayName ?? stats.player.username ?? stats.player.userId;
   const profileClasses = ['card', 'leaderboard-profile-section', `profile-${rankClassId(stats.rank.id)}`];
   if (stats.rank.isMaster) profileClasses.push('profile-master');
@@ -1728,7 +1739,138 @@ function leaderboardPlayerProfilePage(stats: PugPlayerStats, profile: { displayN
     </div>
     ${displayedBadgesPanel(badges, selectedBadgeIds)}
     ${pugPlayerStatsTables(stats)}
+  </section>
+  ${pugEloGraphSection(stats, eloGraph)}`;
+}
+
+
+function pugEloGraphSection(stats: PugPlayerStats, graph: PugEloGraphState) {
+  const activeRange = ELO_GRAPH_RANGES.find((range) => range.id === graph.range) ?? ELO_GRAPH_RANGES[ELO_GRAPH_RANGES.length - 1];
+  const rangeLinks = ELO_GRAPH_RANGES.map((range) => {
+    const href = `/leaderboard/players/${encodeURIComponent(stats.player.userId)}?eloRange=${encodeURIComponent(range.id)}`;
+    return `<a class="elo-range-option${range.id === graph.range ? ' active' : ''}" href="${href}">${escapeHtml(range.label)}</a>`;
+  }).join('');
+  const latest = graph.points.at(-1);
+  const first = graph.points[0];
+  const change = latest && first ? latest.rating - first.before : 0;
+  return `<section class="card elo-graph-card">
+    <div class="section-heading-row">
+      <div>
+        <h2>Season ELO graph</h2>
+        <p><small>${escapeHtml(graph.activeSeason.label)} · ${escapeHtml(activeRange.label)} · ${formatDateTime(graph.rangeStart)} to ${formatDateTime(graph.rangeEnd)}</small></p>
+      </div>
+      <nav class="elo-range-selector" aria-label="ELO graph range">${rangeLinks}</nav>
+    </div>
+    ${graph.points.length ? `<div class="elo-graph-summary stat-grid">
+      <div class="stat-card"><small>Visible matches</small><strong>${graph.points.length}</strong></div>
+      <div class="stat-card"><small>Season matches</small><strong>${graph.totalSeasonMatches}</strong></div>
+      <div class="stat-card"><small>Latest shown ELO</small><strong>${formatElo(latest?.rating ?? stats.player.rating)}</strong></div>
+      <div class="stat-card"><small>Range change</small><strong class="${change >= 0 ? 'elo-gain' : 'elo-loss'}">${change >= 0 ? '+' : ''}${change}</strong></div>
+    </div>
+    ${pugEloGraphSvg(graph.points)}` : `<p>No completed matches with ELO changes for this player in the selected ${escapeHtml(activeRange.label.toLowerCase())} window.</p>`}
   </section>`;
+}
+
+function pugEloGraphSvg(points: PugEloGraphPoint[]) {
+  const width = 760;
+  const height = 280;
+  const padding = { top: 24, right: 28, bottom: 48, left: 62 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const ratings = points.flatMap((point) => [point.before, point.rating]);
+  const minRating = Math.min(...ratings);
+  const maxRating = Math.max(...ratings);
+  const yMin = Math.max(0, minRating - Math.max(100, Math.round((maxRating - minRating) * 0.15)));
+  const yMax = maxRating + Math.max(100, Math.round((maxRating - minRating) * 0.15));
+  const ratingSpan = Math.max(1, yMax - yMin);
+  const xFor = (index: number) => padding.left + (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
+  const yFor = (rating: number) => padding.top + plotHeight - ((rating - yMin) / ratingSpan) * plotHeight;
+  const linePoints = points.map((point, index) => `${xFor(index).toFixed(1)},${yFor(point.rating).toFixed(1)}`).join(' ');
+  const areaPoints = `${padding.left},${padding.top + plotHeight} ${linePoints} ${padding.left + plotWidth},${padding.top + plotHeight}`;
+  const yTicks = Array.from({ length: 4 }, (_, index) => Math.round(yMin + (ratingSpan * index) / 3));
+  const xTickIndexes = uniqueNumbers([0, Math.floor((points.length - 1) / 2), points.length - 1]);
+  return `<div class="elo-graph-wrap">
+    <svg class="elo-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Player ELO after each completed match in the selected range">
+      <defs>
+        <linearGradient id="eloGraphFill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="#ef233c" stop-opacity="0.32" />
+          <stop offset="100%" stop-color="#ef233c" stop-opacity="0.03" />
+        </linearGradient>
+      </defs>
+      <rect x="${padding.left}" y="${padding.top}" width="${plotWidth}" height="${plotHeight}" rx="12" class="elo-graph-panel" />
+      ${yTicks.map((tick) => {
+        const y = yFor(tick);
+        return `<line x1="${padding.left}" x2="${padding.left + plotWidth}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" class="elo-graph-grid" /><text x="${padding.left - 10}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="elo-graph-label">${tick}</text>`;
+      }).join('')}
+      <polyline points="${areaPoints}" class="elo-graph-area" />
+      <polyline points="${linePoints}" class="elo-graph-line" />
+      ${points.map((point, index) => {
+        const x = xFor(index);
+        const y = yFor(point.rating);
+        return `<g aria-label="${escapeHtml(point.label)}: ${formatElo(point.rating)} ELO (${point.delta >= 0 ? '+' : ''}${point.delta})"><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.5" class="elo-graph-point ${point.delta >= 0 ? 'gain' : 'loss'}"><title>${escapeHtml(point.label)} · ${formatElo(point.rating)} ELO (${point.delta >= 0 ? '+' : ''}${point.delta})</title></circle></g>`;
+      }).join('')}
+      ${xTickIndexes.map((index) => `<text x="${xFor(index).toFixed(1)}" y="${height - 16}" text-anchor="middle" class="elo-graph-label">${escapeHtml(shortDateLabel(points[index].occurredAt))}</text>`).join('')}
+    </svg>
+  </div>`;
+}
+
+function buildPugEloGraphState(userId: string, history: PugMatchLog[], activeSeason: PugSeason, range: PugEloGraphRange): PugEloGraphState {
+  const seasonStartMs = new Date(activeSeason.startsAt).getTime();
+  const safeSeasonStartMs = Number.isFinite(seasonStartMs) ? seasonStartMs : 0;
+  const nowMs = Date.now();
+  const selectedRange = ELO_GRAPH_RANGES.find((item) => item.id === range);
+  const requestedStartMs = selectedRange?.durationMs ? nowMs - selectedRange.durationMs : safeSeasonStartMs;
+  const rangeStartMs = Math.max(safeSeasonStartMs, requestedStartMs);
+  const seasonMatches = history
+    .filter((match) => match.status === 'completed')
+    .map((match) => ({ match, occurredAt: match.endedAt ?? match.updatedAt ?? match.createdAt }))
+    .filter(({ match, occurredAt }) => {
+      const occurredAtMs = new Date(occurredAt).getTime();
+      return Number.isFinite(occurredAtMs) && occurredAtMs >= safeSeasonStartMs && match.eloChanges?.some((change) => change.userId === userId);
+    })
+    .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+  const points = seasonMatches
+    .filter(({ occurredAt }) => new Date(occurredAt).getTime() >= rangeStartMs)
+    .map(({ match, occurredAt }) => {
+      const change = match.eloChanges!.find((item) => item.userId === userId)!;
+      return {
+        matchId: match.id,
+        rating: change.after,
+        before: change.before,
+        delta: change.delta,
+        occurredAt,
+        label: `${pugQueueLabel(match.size)} match on ${plainDateTime(occurredAt)}`
+      };
+    });
+  return {
+    range,
+    activeSeason,
+    points,
+    totalSeasonMatches: seasonMatches.length,
+    rangeStart: new Date(rangeStartMs).toISOString(),
+    rangeEnd: new Date(nowMs).toISOString()
+  };
+}
+
+function parsePugEloGraphRange(value: unknown): PugEloGraphRange {
+  const raw = typeof value === 'string' ? value : '';
+  return ELO_GRAPH_RANGES.some((range) => range.id === raw) ? raw as PugEloGraphRange : 'season';
+}
+
+function uniqueNumbers(values: number[]) {
+  return [...new Set(values.filter((value) => Number.isInteger(value) && value >= 0))];
+}
+
+function shortDateLabel(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function plainDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 function pugPlayerStatsTables(stats: PugPlayerStats) {
@@ -2889,6 +3031,22 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .pug-player-stats-table { display: grid; gap: .45rem .8rem; align-items: center; }
     .pug-player-stats-table-with-seconds { grid-template-columns: minmax(9rem, 1fr) repeat(4, auto); }
     .pug-player-stats-table-no-seconds { grid-template-columns: minmax(9rem, 1fr) repeat(3, auto); }
+    .elo-graph-card { display: grid; gap: 1rem; }
+    .elo-graph-card h2, .elo-graph-card p { margin: 0; }
+    .elo-range-selector { display: flex; gap: .45rem; flex-wrap: wrap; justify-content: flex-end; }
+    .elo-range-option { border: 1px solid var(--line); border-radius: 999px; padding: .35rem .7rem; background: #12141a; color: var(--text); text-decoration: none; font-size: .86rem; font-weight: 800; }
+    .elo-range-option:hover, .elo-range-option.active { border-color: rgba(239,35,60,.72); background: linear-gradient(135deg, rgba(239,35,60,.22), rgba(18,20,26,.96)); color: #fff; }
+    .elo-graph-summary { margin-top: .2rem; }
+    .elo-graph-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 1rem; background: #0f1116; padding: .5rem; }
+    .elo-graph { display: block; width: 100%; min-width: 34rem; height: auto; }
+    .elo-graph-panel { fill: rgba(255,255,255,.025); stroke: rgba(255,255,255,.05); }
+    .elo-graph-grid { stroke: rgba(255,255,255,.08); stroke-width: 1; }
+    .elo-graph-label { fill: var(--muted); font-size: 12px; font-weight: 700; }
+    .elo-graph-area { fill: url(#eloGraphFill); stroke: none; }
+    .elo-graph-line { fill: none; stroke: #ef233c; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 8px rgba(239,35,60,.45)); }
+    .elo-graph-point { stroke: #fff; stroke-width: 1.5; }
+    .elo-graph-point.gain { fill: #22c55e; }
+    .elo-graph-point.loss { fill: #ef4444; }
     .elo-gain { color: #86efac; }
     .elo-loss { color: #fca5a5; }
     .pug-player { display: block; margin: .2rem 0; }
