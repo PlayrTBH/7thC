@@ -32,7 +32,8 @@ const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
 const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
-const pugLobbyChannelName = 'PUG Lobby';
+const pugLobbyChannelBaseName = 'PUG Lobby';
+const pugLobbyChannelNamePattern = /^PUG Lobby(?: - \d+ in-match)?$/;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = PugCaptainDraftState;
@@ -213,6 +214,9 @@ export class TeamBot {
       this.pugMatches.set(match.id, match);
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
       this.resumePugMatch(guild, match).catch((error) => console.warn(`Unable to resume PUG match ${match.id}:`, error));
+    }
+    if (this.pugMatches.size) {
+      await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after restoring matches:', error));
     }
   }
 
@@ -775,6 +779,7 @@ export class TeamBot {
     await this.applyPugRankRoles(guild, playerRanks.assignments);
     this.pugMatches.set(matchId, match);
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+    await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after match start:', error));
 
     await Promise.all(players.map(async (player, index) => {
       const member = fetchedPlayers[index];
@@ -1281,6 +1286,7 @@ export class TeamBot {
     match.updatedAt = endedAt;
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Canceled as dead match with no ELO changes', endedAt }));
     this.pugMatches.delete(match.id);
+    await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after dead match cancellation:', error));
   }
 
   private async endPugMatch(match: PugMatch, result: string) {
@@ -1321,6 +1327,7 @@ export class TeamBot {
     match.updatedAt = endedAt;
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'completed', result, endedAt, eloChanges: match.eloChanges, teamEloTotals: match.teamEloTotals }));
     this.pugMatches.delete(match.id);
+    await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after match end:', error));
   }
 
 
@@ -1398,6 +1405,7 @@ export class TeamBot {
       const endedAt = new Date().toISOString();
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Deleted by administrator', endedAt }));
       this.pugMatches.delete(matchId);
+      await this.updatePugLobbyChannelName(await this.getGuild()).catch((error) => console.warn('Unable to update PUG lobby in-match count after match deletion:', error));
       return;
     }
     await this.store.removePugMatchLog(matchId);
@@ -1597,13 +1605,32 @@ export class TeamBot {
   private async ensurePugLobbyChannelUnlocked(guild: Guild) {
     const channels = await guild.channels.fetch();
     const existingVoiceChannels = channels.filter((channel): channel is VoiceChannel => channel?.type === ChannelType.GuildVoice);
-    const existingLobby = existingVoiceChannels.find((channel) => channel.name === pugLobbyChannelName);
-    if (existingLobby) return existingLobby;
+    const existingLobby = existingVoiceChannels.find((channel) => pugLobbyChannelNamePattern.test(channel.name));
+    if (existingLobby) return this.renamePugLobbyChannel(existingLobby, 'Persistent PUG lobby in-match count updated');
 
     const splitLobby = existingVoiceChannels.find((channel) => channel.name === 'PUG Lobby 1') ?? existingVoiceChannels.find((channel) => channel.name === 'PUG Lobby 2');
-    if (splitLobby) return splitLobby.setName(pugLobbyChannelName, 'Persistent PUG lobby reverted to a single voice channel').catch(() => splitLobby);
+    if (splitLobby) return this.renamePugLobbyChannel(splitLobby, 'Persistent PUG lobby reverted to a single voice channel');
 
-    return guild.channels.create({ name: pugLobbyChannelName, type: ChannelType.GuildVoice, reason: 'Persistent PUG lobby channel created by queue system' });
+    return guild.channels.create({ name: this.formatPugLobbyChannelName(), type: ChannelType.GuildVoice, reason: 'Persistent PUG lobby channel created by queue system' });
+  }
+
+  private async updatePugLobbyChannelName(guild: Guild) {
+    const lobby = await this.ensurePugLobbyChannel(guild);
+    await this.renamePugLobbyChannel(lobby, 'PUG lobby in-match count updated');
+  }
+
+  private async renamePugLobbyChannel(channel: VoiceChannel, reason: string) {
+    const name = this.formatPugLobbyChannelName();
+    if (channel.name === name) return channel;
+    return channel.setName(name, reason).catch(() => channel);
+  }
+
+  private formatPugLobbyChannelName() {
+    return `${pugLobbyChannelBaseName} - ${this.countPugPlayersInActiveMatches()} in-match`;
+  }
+
+  private countPugPlayersInActiveMatches() {
+    return [...this.pugMatches.values()].reduce((total, match) => total + match.playerIds.length, 0);
   }
 
   async ensureTeamRolesDisplayed() {
