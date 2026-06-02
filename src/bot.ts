@@ -172,11 +172,21 @@ export class TeamBot {
   private async restoreOngoingPugMatches() {
     const guild = await this.getGuild();
     const logs = (await this.store.getPugMatchLogs()).filter((log) => log.status === 'ongoing' || log.status === 'reset');
+    let lobbyCountNeedsRefresh = false;
     for (const log of logs.reverse()) {
       if (this.pugMatches.has(log.id)) continue;
       const channels = await this.resolvePugMatchChannels(guild, log);
       if (!channels) {
-        console.warn(`Unable to restore ongoing PUG match ${log.id}: match channels were not found.`);
+        const endedAt = new Date().toISOString();
+        console.warn(`Unable to restore ongoing PUG match ${log.id}: match channels were not found. Marking it deleted so it is not restored again.`);
+        await this.store.upsertPugMatchLog({
+          ...log,
+          status: 'deleted',
+          result: 'Canceled during startup because match channels were missing',
+          endedAt,
+          updatedAt: endedAt
+        });
+        lobbyCountNeedsRefresh = true;
         continue;
       }
 
@@ -215,7 +225,7 @@ export class TeamBot {
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
       this.resumePugMatch(guild, match).catch((error) => console.warn(`Unable to resume PUG match ${match.id}:`, error));
     }
-    if (this.pugMatches.size) {
+    if (this.pugMatches.size || lobbyCountNeedsRefresh) {
       await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after restoring matches:', error));
     }
   }
@@ -1281,12 +1291,12 @@ export class TeamBot {
       await text.send('This PUG match has been open for more than 60 minutes without a completed vote. Canceling it as dead with no ELO changes or penalties.').catch(() => undefined);
     }
     this.stopPugVoteTimers(match);
-    await this.cleanupPugMatchChannels(match, 'PUG match canceled after 60 minutes without a result vote');
     const endedAt = new Date().toISOString();
     match.updatedAt = endedAt;
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Canceled as dead match with no ELO changes', endedAt }));
     this.pugMatches.delete(match.id);
     await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after dead match cancellation:', error));
+    await this.cleanupPugMatchChannels(match, 'PUG match canceled after 60 minutes without a result vote');
   }
 
   private async endPugMatch(match: PugMatch, result: string) {
@@ -1316,18 +1326,18 @@ export class TeamBot {
       await this.refreshPugResultVoteMessage(match);
       await text.send(`PUG match ended. Result: ${result}. ${formatPugEloSummary(eloResult.changes)} Cleaning up channels now.`).catch(() => undefined);
     }
-    await this.sendPugEloResultDms(guild, match, result, eloResult);
-
-    await this.movePugVoiceChannelMembersToLobby(guild, match, 'PUG match ended');
-
-    for (const channelId of [...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
-      await guild.channels.delete(channelId, 'PUG match ended').catch(() => undefined);
-    }
     const endedAt = new Date().toISOString();
     match.updatedAt = endedAt;
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'completed', result, endedAt, eloChanges: match.eloChanges, teamEloTotals: match.teamEloTotals }));
     this.pugMatches.delete(match.id);
     await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after match end:', error));
+
+    await this.sendPugEloResultDms(guild, match, result, eloResult);
+    await this.movePugVoiceChannelMembersToLobby(guild, match, 'PUG match ended').catch((error) => console.warn('Unable to move PUG players back to lobby after match end:', error));
+
+    for (const channelId of [...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
+      await guild.channels.delete(channelId, 'PUG match ended').catch(() => undefined);
+    }
   }
 
 
@@ -1401,11 +1411,12 @@ export class TeamBot {
     const match = this.pugMatches.get(matchId);
     if (match) {
       this.stopPugVoteTimers(match);
-      await this.cleanupPugMatchChannels(match, 'PUG match deleted by administrator');
       const endedAt = new Date().toISOString();
+      match.updatedAt = endedAt;
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Deleted by administrator', endedAt }));
       this.pugMatches.delete(matchId);
       await this.updatePugLobbyChannelName(await this.getGuild()).catch((error) => console.warn('Unable to update PUG lobby in-match count after match deletion:', error));
+      await this.cleanupPugMatchChannels(match, 'PUG match deleted by administrator');
       return;
     }
     await this.store.removePugMatchLog(matchId);
@@ -1996,7 +2007,7 @@ export class TeamBot {
         if (!existingRole.managed) {
           const needsStyleUpdate = existingRole.hexColor.toLowerCase() !== String(color).toLowerCase() || existingRole.hoist || existingRole.icon !== (definition.rank.iconDataUrl ? existingRole.icon : null);
           if (needsStyleUpdate || definition.rank.iconDataUrl) {
-            await existingRole.edit({ color, hoist: false, icon: definition.rank.iconDataUrl ?? null, reason: 'PUG rank role style synchronized by 7th Circle Team Hub' }).catch((error) => {
+            await existingRole.edit({ colors: { primaryColor: color }, hoist: false, icon: definition.rank.iconDataUrl ?? null, reason: 'PUG rank role style synchronized by 7th Circle Team Hub' }).catch((error) => {
               console.warn(`Unable to update PUG rank role ${existingRole.id}:`, error);
             });
           }
@@ -2007,7 +2018,7 @@ export class TeamBot {
 
       const createdRole = await guild.roles.create({
         name,
-        color,
+        colors: { primaryColor: color },
         hoist: false,
         icon: definition.rank.iconDataUrl,
         permissions: [],
@@ -2016,7 +2027,7 @@ export class TeamBot {
         console.warn(`Unable to create PUG rank role with icon for ${definition.rank.id}; retrying without icon:`, error);
         return guild.roles.create({
           name,
-          color,
+          colors: { primaryColor: color },
           hoist: false,
           permissions: [],
           reason: 'PUG rank role created by 7th Circle Team Hub'
@@ -2257,7 +2268,7 @@ export class TeamBot {
       const existingRole = existingRoles.find((item) => item.name === settings.name);
       if (existingRole) {
         if (!existingRole.managed && (existingRole.hexColor.toLowerCase() !== String(settings.color).toLowerCase() || existingRole.hoist)) {
-          await existingRole.edit({ color: settings.color, hoist: false, reason: 'Team organization role style normalized by 7th Circle Team Hub' });
+          await existingRole.edit({ colors: { primaryColor: settings.color }, hoist: false, reason: 'Team organization role style normalized by 7th Circle Team Hub' });
         }
         roleIds.set(role, existingRole.id);
         continue;
@@ -2265,7 +2276,7 @@ export class TeamBot {
 
       const createdRole = await guild.roles.create({
         name: settings.name,
-        color: settings.color,
+        colors: { primaryColor: settings.color },
         hoist: false,
         permissions: [],
         reason: 'Generic team organization role created by 7th Circle Team Hub'
