@@ -132,7 +132,7 @@ Discord user ID `743956656429203535` has access to a dedicated **Developer** lin
 - runtime bot presence configuration for status and activity text/type;
 - an in-memory web log viewer for recent console output, with a clear-log action.
 
-The developer presence settings are stored in the JSON data file and reapplied when the bot starts. Environment-backed settings such as Discord credentials, public URL, host, port, guild ID, and data file path stay read-only in the web UI and should still be changed from the server shell.
+The developer presence settings are stored in the JSON data file and reapplied when the bot starts. The Developer panel also lets the configured developer update the active PUG season label, manually backdate the season start date for seasons that began before this system existed, set an optional scheduled end date, and configure badge rewards. Environment-backed settings such as Discord credentials, public URL, host, port, guild ID, and data file path stay read-only in the web UI and should still be changed from the server shell.
 
 ## Change the managed Discord server
 

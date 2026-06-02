@@ -275,12 +275,13 @@ export class JsonStore {
     });
   }
 
-  async updatePugSeason(seasonId: string, updates: Pick<PugSeason, 'label' | 'endsAt' | 'badgeRewards'>) {
+  async updatePugSeason(seasonId: string, updates: Pick<PugSeason, 'label' | 'startsAt' | 'endsAt' | 'badgeRewards'>) {
     await this.update((data) => {
       const season = data.settings.pugs?.seasons?.find((item) => item.id === seasonId);
       if (!season) throw new Error('PUG season not found.');
       if (season.status !== 'active') throw new Error('Only the active season can be configured.');
       season.label = updates.label;
+      season.startsAt = updates.startsAt;
       season.endsAt = updates.endsAt;
       season.badgeRewards = updates.badgeRewards;
       return data;

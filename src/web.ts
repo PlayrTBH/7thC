@@ -627,9 +627,11 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const seasonId = String(req.body.seasonId ?? '').trim();
       const label = String(req.body.label ?? '').trim().slice(0, 32) || seasonId.toUpperCase();
-      const endsAt = parseOptionalDateTime(req.body.endsAt);
+      const startsAt = parseDateTimeInput(req.body.startsAt, 'Season start date');
+      const endsAt = parseOptionalSeasonEndDateTime(req.body.endsAt);
+      if (endsAt && new Date(endsAt).getTime() <= new Date(startsAt).getTime()) throw new Error('Season end date must be after the start date.');
       const badgeRewards = parsePugSeasonBadgeRewards(req.body);
-      await store.updatePugSeason(seasonId, { label, endsAt, badgeRewards });
+      await store.updatePugSeason(seasonId, { label, startsAt, endsAt, badgeRewards });
       res.redirect('/developer#seasons');
     } catch (error) {
       next(error);
@@ -2422,7 +2424,7 @@ function developerSeasonsPanel(seasons: PugSeason[], rankSettings: PugRankSettin
   const rewards = completeWebSeasonRewards(active, rankSettings);
   return `<section class="card" id="seasons">
     <h2>PUG seasons</h2>
-    <p><small>Only the configured developer can change seasons. Seasons do not end unless you end them here; the optional end date is a planning label for staff.</small></p>
+    <p><small>Only the configured developer can change seasons. You can backdate the active season start if PUGs began before this system tracked seasons. Seasons do not end unless you end them here; the optional end date is a planning label for staff.</small></p>
     <div class="stat-grid">
       <div class="stat-card"><small>Active season</small><strong>${escapeHtml(active.label)}</strong></div>
       <div class="stat-card"><small>Started</small><strong>${formatDateTime(active.startsAt)}</strong></div>
@@ -2432,6 +2434,7 @@ function developerSeasonsPanel(seasons: PugSeason[], rankSettings: PugRankSettin
       <input type="hidden" name="seasonId" value="${escapeHtml(active.id)}" />
       <div class="rank-editor-row">
         <label>Season label <input name="label" maxlength="32" value="${escapeHtml(active.label)}" required /></label>
+        <label>Start date <input name="startsAt" type="datetime-local" value="${escapeHtml(toDateTimeLocal(active.startsAt))}" required /></label>
         <label>End date <input name="endsAt" type="datetime-local" value="${escapeHtml(toDateTimeLocal(active.endsAt))}" /></label>
       </div>
       <h3>Badge rewards</h3>
@@ -2479,7 +2482,7 @@ function toDateTimeLocal(value?: string) {
   return date.toISOString().slice(0, 16);
 }
 
-function parseOptionalDateTime(value: unknown) {
+function parseOptionalSeasonEndDateTime(value: unknown) {
   const raw = String(value ?? '').trim();
   if (!raw) return undefined;
   const date = new Date(raw);
