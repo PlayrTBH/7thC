@@ -17,6 +17,7 @@ declare module 'express-session' {
 }
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const TEST_EVENT_DURATION_MS = 24 * 60 * 60 * 1000;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
 type AdminPugEloPreviewPlayer = { userId: string; username?: string; rating: number; first: number; second?: number; loss: number };
@@ -400,7 +401,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.post('/event-management/events', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const now = new Date().toISOString();
-      const event = parseEventForm(req.body);
+      const event = parseEventForm(req.body, { now });
       const newEvent = { id: crypto.randomUUID(), ...event, createdBy: req.session.discordUser!.id, createdAt: now, updatedAt: now };
       if (event.isTestEvent) {
         const testData = buildTestEventRegistrations(newEvent, now);
@@ -431,7 +432,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = await store.getEvent(req.params.eventId);
       if (!existing) throw new Error('Event not found.');
-      const parsed = parseEventForm(req.body);
+      const parsed = parseEventForm(req.body, { forceTestEvent: Boolean(existing.isTestEvent), testSchedule: existing.isTestEvent ? existing : undefined });
       await store.updateEvent(existing.id, { ...parsed, isTestEvent: existing.isTestEvent });
       res.redirect('/event-management');
     } catch (error) {
@@ -1295,20 +1296,23 @@ function managedEventRow(event: Event, registrationCount: number) {
 }
 
 function eventForm(action: string, event?: Event) {
-  return `<form method="post" action="${escapeHtml(action)}" class="stacked-form">
+  const isTestEvent = Boolean(event?.isTestEvent);
+  const scheduleDisabled = isTestEvent ? ' disabled' : '';
+  return `<form method="post" action="${escapeHtml(action)}" class="stacked-form" data-event-form>
     <label>Title <input name="title" required maxlength="120" value="${escapeHtml(event?.title ?? '')}" /></label>
     <label>Description <textarea name="description" required rows="4" maxlength="2000">${escapeHtml(event?.description ?? '')}</textarea></label>
-    <div class="form-grid">
+    ${eventTestFields(event)}
+    <div class="form-grid" data-event-schedule-fields>
       <label>Team registration limit <input name="teamLimit" type="number" min="1" required value="${event?.teamLimit ?? 8}" /></label>
       <label>Main players required <input name="requiredMainPlayers" type="number" min="0" required value="${event?.requiredMainPlayers ?? 5}" /></label>
       <label>Substitutes required <input name="requiredSubstitutes" type="number" min="0" required value="${event?.requiredSubstitutes ?? 0}" /></label>
-      <label>Event starts <input name="startsAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.startsAt))}" /></label>
-      <label>Event ends <input name="endsAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.endsAt))}" /></label>
-      <label>Registration opens <input name="registrationOpensAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationOpensAt))}" /></label>
-      <label>Registration closes <input name="registrationClosesAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
+      <label data-event-date-field>Event starts <input name="startsAt" type="datetime-local" required${scheduleDisabled} value="${escapeHtml(toDateTimeLocalValue(event?.startsAt))}" /></label>
+      <label data-event-date-field>Event ends <input name="endsAt" type="datetime-local" required${scheduleDisabled} value="${escapeHtml(toDateTimeLocalValue(event?.endsAt))}" /></label>
+      <label data-event-date-field>Registration opens <input name="registrationOpensAt" type="datetime-local" required${scheduleDisabled} value="${escapeHtml(toDateTimeLocalValue(event?.registrationOpensAt))}" /></label>
+      <label data-event-date-field>Registration closes <input name="registrationClosesAt" type="datetime-local" required${scheduleDisabled} value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
     </div>
+    <p class="timezone-note" data-event-test-schedule-note${isTestEvent ? '' : ' hidden'}>Test events start immediately, auto-register fake teams, and use a 24-hour test window.</p>
     ${eventBracketFields(event)}
-    ${eventTestFields(event)}
     ${eventPhotoField(event)}
     <button type="submit">${event ? 'Save event' : 'Create event'}</button>
   </form>`;
@@ -1337,8 +1341,8 @@ function eventTestFields(event?: Event) {
   const disabled = event ? ' disabled' : '';
   return `<section class="nested-card">
     <h3>Testing</h3>
-    <label class="checkbox-row"><input type="checkbox" name="isTestEvent" value="1"${checked}${disabled} /> Create as test event</label>
-    <small>Test events auto-register random fake teams that do not exist on the Discord server. When a Cashout Cup test event finishes every finals map, the event, registrations, and bracket are deleted automatically.</small>
+    <label class="checkbox-row"><input type="checkbox" name="isTestEvent" value="1" data-event-test-toggle${checked}${disabled} /> Create as test event</label>
+    <small>Test events start immediately and auto-register random fake teams that do not exist on the Discord server. When a Cashout Cup test event finishes every finals map, the event, registrations, and bracket are deleted automatically.</small>
   </section>`;
 }
 
@@ -1370,20 +1374,35 @@ function eventMeta(label: string, value: string) {
   return `<div class="stat-card"><small>${escapeHtml(label)}</small><strong>${value}</strong></div>`;
 }
 
-function parseEventForm(body: Request['body']): EventFormFields {
+function parseEventForm(body: Request['body'], options: { forceTestEvent?: boolean; now?: string; testSchedule?: Pick<Event, 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt'> } = {}): EventFormFields {
   const title = String(body.title ?? '').trim().slice(0, 120);
   const description = String(body.description ?? '').trim().slice(0, 2000);
   const teamLimit = parsePositiveInteger(body.teamLimit, 'Team registration limit', 1);
   const requiredMainPlayers = parsePositiveInteger(body.requiredMainPlayers, 'Main players required', 0);
   const requiredSubstitutes = parsePositiveInteger(body.requiredSubstitutes, 'Substitutes required', 0);
-  const startsAt = parseDateTimeInput(body.startsAt, 'Event start date');
-  const endsAt = parseDateTimeInput(body.endsAt, 'Event end date');
-  const registrationOpensAt = parseDateTimeInput(body.registrationOpensAt, 'Registration open date');
-  const registrationClosesAt = parseDateTimeInput(body.registrationClosesAt, 'Registration close date');
   const backgroundImageDataUrl = parseEventPhotoDataUrl(body.backgroundImageDataUrl);
   const bracketType = parseEventBracketType(body.bracketType);
   const bracketMapPool = parseMapPool(body.bracketMapPool);
-  const isTestEvent = body.isTestEvent === '1' || body.isTestEvent === 'on';
+  const isTestEvent = options.forceTestEvent ?? (body.isTestEvent === '1' || body.isTestEvent === 'on');
+
+  let startsAt: string;
+  let endsAt: string;
+  let registrationOpensAt: string;
+  let registrationClosesAt: string;
+
+  if (isTestEvent) {
+    const testStart = options.now ?? new Date().toISOString();
+    const testEnd = new Date(new Date(testStart).getTime() + TEST_EVENT_DURATION_MS).toISOString();
+    startsAt = options.testSchedule?.startsAt ?? testStart;
+    endsAt = options.testSchedule?.endsAt ?? testEnd;
+    registrationOpensAt = options.testSchedule?.registrationOpensAt ?? testStart;
+    registrationClosesAt = options.testSchedule?.registrationClosesAt ?? testEnd;
+  } else {
+    startsAt = parseDateTimeInput(body.startsAt, 'Event start date');
+    endsAt = parseDateTimeInput(body.endsAt, 'Event end date');
+    registrationOpensAt = parseDateTimeInput(body.registrationOpensAt, 'Registration open date');
+    registrationClosesAt = parseDateTimeInput(body.registrationClosesAt, 'Registration close date');
+  }
 
   if (!title) throw new Error('Event title is required.');
   if (!description) throw new Error('Event description is required.');
@@ -3520,6 +3539,23 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
       const value = element.getAttribute('datetime');
       const date = value ? new Date(value) : undefined;
       if (date && !Number.isNaN(date.getTime())) element.textContent = dateFormatter.format(date);
+    });
+
+    document.querySelectorAll('[data-event-form]').forEach((form) => {
+      const testToggle = form.querySelector('[data-event-test-toggle]');
+      const dateFields = [...form.querySelectorAll('[data-event-date-field] input')];
+      const note = form.querySelector('[data-event-test-schedule-note]');
+      if (!(testToggle instanceof HTMLInputElement)) return;
+
+      const syncTestScheduleFields = () => {
+        dateFields.forEach((input) => {
+          if (input instanceof HTMLInputElement) input.disabled = testToggle.checked;
+        });
+        if (note instanceof HTMLElement) note.hidden = !testToggle.checked;
+      };
+
+      testToggle.addEventListener('change', syncTestScheduleFields);
+      syncTestScheduleFields();
     });
 
     document.querySelectorAll('[data-event-photo-field]').forEach((field) => {
