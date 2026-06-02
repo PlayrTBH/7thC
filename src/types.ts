@@ -108,6 +108,8 @@ export type PugSettings = {
   queueChannelId?: string;
   mapPool: string[];
   queueMessageId?: string;
+  leaderboardChannelId?: string;
+  leaderboardMessageId?: string;
   elo?: PugEloSettings;
   abandons?: PugAbandonSettings;
   ranks?: PugRankSettings;

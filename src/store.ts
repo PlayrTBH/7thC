@@ -871,6 +871,8 @@ function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSe
     queueChannelId: typeof settings?.queueChannelId === 'string' ? settings.queueChannelId : undefined,
     mapPool: Array.isArray(settings?.mapPool) ? settings.mapPool.filter((map): map is string => typeof map === 'string') : [],
     queueMessageId: typeof settings?.queueMessageId === 'string' ? settings.queueMessageId : undefined,
+    leaderboardChannelId: typeof settings?.leaderboardChannelId === 'string' ? settings.leaderboardChannelId : undefined,
+    leaderboardMessageId: typeof settings?.leaderboardMessageId === 'string' ? settings.leaderboardMessageId : undefined,
     elo: normalizePugEloSettings(settings?.elo),
     abandons: normalizePugAbandonSettings(settings?.abandons),
     ranks: normalizePugRankSettings(settings?.ranks),

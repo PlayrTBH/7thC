@@ -18,6 +18,7 @@ import {
   GuildMember,
   ActivityType,
   type PresenceStatusData,
+  type TextChannel,
   type VoiceChannel
 } from 'discord.js';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
@@ -32,6 +33,9 @@ const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
 const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
+const PUG_LEADERBOARD_REFRESH_MS = 3 * 60 * 60 * 1000;
+const pugCategoryName = 'Pugs';
+const pugLeaderboardChannelName = 'leaderboard';
 const pugLobbyChannelBaseName = 'PUG Lobby';
 const pugLobbyChannelNamePattern = /^PUG Lobby(?: - \d+ in-match)?$/;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
@@ -74,6 +78,8 @@ export class TeamBot {
   private pugQueueMessageRefreshAgain = false;
   private pugLobbyEnsureOperation?: Promise<VoiceChannel>;
   private pugLobbyReturnOperation: Promise<void> = Promise.resolve();
+  private pugLeaderboardRefresh?: NodeJS.Timeout;
+  private pugLeaderboardRefreshInFlight?: Promise<string>;
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
   private restartOperation?: Promise<void>;
 
@@ -150,6 +156,8 @@ export class TeamBot {
     await this.registerPugCommands();
     await this.restoreOngoingPugMatches();
     await this.applyDeveloperSettings(await this.store.getDeveloperSettings());
+    await this.publishPugLeaderboardMessage().catch((error) => console.warn('Unable to publish PUG leaderboard message:', error));
+    this.schedulePugLeaderboardRefresh(PUG_LEADERBOARD_REFRESH_MS);
     console.log(`Discord bot ready as ${this.client.user?.tag}`);
   }
 
@@ -521,6 +529,135 @@ export class TeamBot {
     const message = await channel.send(payload);
     await this.store.updatePugSettings({ ...pugs, queueMessageId: message.id });
     return message.id;
+  }
+
+  async publishPugLeaderboardMessage() {
+    if (this.pugLeaderboardRefreshInFlight) return this.pugLeaderboardRefreshInFlight;
+    this.pugLeaderboardRefreshInFlight = this.publishPugLeaderboardMessageUnlocked().finally(() => {
+      this.pugLeaderboardRefreshInFlight = undefined;
+    });
+    return this.pugLeaderboardRefreshInFlight;
+  }
+
+  private async publishPugLeaderboardMessageUnlocked() {
+    const guild = await this.getGuild();
+    await assertBotPermissions(guild);
+    const channel = await this.ensurePugLeaderboardChannel(guild);
+    const settings = await this.store.getAdministratorSettings();
+    const pugs = settings.pugs;
+    const payload = await this.buildPugLeaderboardMessage(guild);
+
+    if (pugs?.leaderboardMessageId) {
+      const existing = await channel.messages.fetch(pugs.leaderboardMessageId).catch(() => null);
+      if (existing) {
+        await existing.edit(payload);
+        return existing.id;
+      }
+    }
+
+    const message = await channel.send(payload);
+    await this.store.updatePugSettings({ ...(pugs ?? { mapPool: [] }), leaderboardChannelId: channel.id, leaderboardMessageId: message.id });
+    return message.id;
+  }
+
+  private schedulePugLeaderboardRefresh(delayMs: number) {
+    if (this.pugLeaderboardRefresh) clearTimeout(this.pugLeaderboardRefresh);
+    this.pugLeaderboardRefresh = setTimeout(() => {
+      this.pugLeaderboardRefresh = undefined;
+      this.publishPugLeaderboardMessage()
+        .catch((error) => console.warn('Unable to refresh PUG leaderboard message:', error))
+        .finally(() => this.schedulePugLeaderboardRefresh(PUG_LEADERBOARD_REFRESH_MS));
+    }, delayMs);
+  }
+
+  private async ensurePugLeaderboardChannel(guild: Guild): Promise<TextChannel> {
+    const channels = await guild.channels.fetch();
+    const me = await guild.members.fetchMe();
+    const settings = await this.store.getAdministratorSettings();
+    const pugs = settings.pugs;
+
+    const category = channels.find((channel) => channel?.type === ChannelType.GuildCategory && channel.name.toLowerCase() === pugCategoryName.toLowerCase())
+      ?? await guild.channels.create({ name: pugCategoryName, type: ChannelType.GuildCategory, reason: 'PUG category created for leaderboard channel' });
+
+    const storedChannel = pugs?.leaderboardChannelId ? await guild.channels.fetch(pugs.leaderboardChannelId).catch(() => null) : null;
+    if (storedChannel?.type === ChannelType.GuildText) {
+      if (storedChannel.parentId !== category.id) {
+        await storedChannel.setParent(category.id, { reason: 'PUG leaderboard channel belongs under the Pugs category' }).catch((error) => console.warn('Unable to move PUG leaderboard channel under Pugs category:', error));
+      }
+      await this.applyPugLeaderboardChannelPermissions(storedChannel, me.id);
+      return storedChannel;
+    }
+
+    const existing = channels.find((channel) => channel?.type === ChannelType.GuildText && channel.parentId === category.id && channel.name === pugLeaderboardChannelName);
+    const channel = existing?.type === ChannelType.GuildText
+      ? existing
+      : await guild.channels.create({ name: pugLeaderboardChannelName, type: ChannelType.GuildText, parent: category.id, reason: 'PUG leaderboard channel created by 7th Circle Team Hub' });
+
+    await this.applyPugLeaderboardChannelPermissions(channel, me.id);
+    await this.store.updatePugSettings({ ...(pugs ?? { mapPool: [] }), leaderboardChannelId: channel.id, leaderboardMessageId: pugs?.leaderboardMessageId });
+    return channel;
+  }
+
+  private async applyPugLeaderboardChannelPermissions(channel: TextChannel, botUserId: string) {
+    await channel.permissionOverwrites.edit(channel.guild.roles.everyone.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      SendMessagesInThreads: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      AddReactions: false
+    }, { type: OverwriteType.Role, reason: 'PUG leaderboard is visible to everyone but bot-only for posting' }).catch((error) => console.warn('Unable to update PUG leaderboard @everyone permissions:', error));
+    await channel.permissionOverwrites.edit(botUserId, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: true,
+      EmbedLinks: true,
+      AttachFiles: true,
+      ManageMessages: true
+    }, { type: OverwriteType.Member, reason: 'PUG leaderboard bot posting permissions' }).catch((error) => console.warn('Unable to update PUG leaderboard bot permissions:', error));
+  }
+
+  private async buildPugLeaderboardMessage(guild: Guild) {
+    const [leaderboard, allRatings, rankSettings] = await Promise.all([
+      this.store.getPugEloLeaderboard(10),
+      this.store.getPugEloRatings(),
+      this.store.getPugRankSettings()
+    ]);
+    const [profiles, rankEmojis] = await Promise.all([
+      this.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId)),
+      this.ensurePugRankEmojis(guild)
+    ]);
+    const profilesByUserId = new Map(profiles.map((profile) => [profile.userId, profile]));
+    const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterPlayerCount);
+    const updatedAt = Math.floor(Date.now() / 1000);
+    const embed = new EmbedBuilder()
+      .setTitle('PUG ELO Leaderboard')
+      .setColor(0xc90820)
+      .setDescription(leaderboard.length ? 'Top 10 players by current PUG ELO.' : 'No PUG ELO ratings have been recorded yet.')
+      .setFooter({ text: 'Updates automatically every few hours' })
+      .setTimestamp(new Date());
+
+    const topProfile = leaderboard[0] ? profilesByUserId.get(leaderboard[0].userId) : undefined;
+    if (topProfile?.avatarUrl) embed.setThumbnail(topProfile.avatarUrl);
+
+    embed.addFields(
+      leaderboard.map((rating, index) => {
+        const profile = profilesByUserId.get(rating.userId);
+        const displayName = profile?.displayName ?? rating.username ?? rating.userId;
+        const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
+        const rankEmblem = rankEmojis.get(rank.id) ?? rank.abbreviation ?? rank.label;
+        const avatar = profile?.avatarUrl ? ` • [Profile picture](${profile.avatarUrl})` : '';
+        return {
+          name: `#${index + 1} ${rankEmblem} ${displayName}`.slice(0, 256),
+          value: `<@${rating.userId}>${avatar}\nRank: **${rank.label}** • ELO: **${formatElo(rating.rating)}**`,
+          inline: false
+        };
+      })
+    );
+    embed.addFields({ name: 'Last updated', value: `<t:${updatedAt}:R>`, inline: false });
+
+    return { embeds: [embed], allowedMentions: { parse: [] } };
   }
 
   private buildPugQueueMessage() {

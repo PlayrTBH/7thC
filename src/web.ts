@@ -418,6 +418,8 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const pugs: PugSettings = {
         queueChannelId: String(req.body.queueChannelId ?? '').trim() || undefined,
         queueMessageId: existing?.queueMessageId,
+        leaderboardChannelId: existing?.leaderboardChannelId,
+        leaderboardMessageId: existing?.leaderboardMessageId,
         mapPool: String(req.body.mapPool ?? '')
           .split(/\r?\n|,/)
           .map((map) => map.trim())
@@ -510,7 +512,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const elo = parsePugEloSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo, abandons: existing?.abandons, ranks: existing?.ranks, seasons: existing?.seasons });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, leaderboardChannelId: existing?.leaderboardChannelId, leaderboardMessageId: existing?.leaderboardMessageId, mapPool: existing?.mapPool ?? [], elo, abandons: existing?.abandons, ranks: existing?.ranks, seasons: existing?.seasons });
       res.redirect('/administrator/pugs#elo');
     } catch (error) {
       next(error);
@@ -572,7 +574,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const ranks = parsePugRankSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, abandons: existing?.abandons, ranks, seasons: existing?.seasons });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, leaderboardChannelId: existing?.leaderboardChannelId, leaderboardMessageId: existing?.leaderboardMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, abandons: existing?.abandons, ranks, seasons: existing?.seasons });
       await bot.syncPugRankRoles();
       res.redirect('/administrator/ranks');
     } catch (error) {
@@ -1458,6 +1460,8 @@ function administratorPugSettingsForm(settings?: PugSettings) {
       <button type="submit">Publish queue message</button>
     </form>
     ${settings?.queueMessageId ? `<p><small>Current queue message ID: <code>${escapeHtml(settings.queueMessageId)}</code></small></p>` : ''}
+    ${settings?.leaderboardChannelId ? `<p><small>Leaderboard channel ID: <code>${escapeHtml(settings.leaderboardChannelId)}</code></small></p>` : ''}
+    ${settings?.leaderboardMessageId ? `<p><small>Leaderboard message ID: <code>${escapeHtml(settings.leaderboardMessageId)}</code></small></p>` : ''}
   </div>`;
 }
 
