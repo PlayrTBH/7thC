@@ -286,7 +286,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         registrations.map(async (registration) => ({
           registration,
           team: await store.getTeam(registration.teamId),
-          members: await bot.getTeamMemberDetails(registration.teamId)
+          members: event.isTestEvent ? buildTestEventMemberDetails(registration, event) : await bot.getTeamMemberDetails(registration.teamId)
         }))
       );
       res.send(layout(`${event.title} registrations`, eventRegistrationsPage(event, details, administratorAccess.isAdmin), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
@@ -319,7 +319,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       if (Date.now() < new Date(event.startsAt).getTime()) throw new Error('The bracket opens when the event goes live.');
       const bracket = await ensureCashoutCupBracket(event);
       const teams = await store.getTeams();
-      const teamNames = new Map(teams.map((team) => [team.id, team.name]));
+      const teamNames = new Map([...teams.map((team) => [team.id, team.name] as const), ...Object.entries(event.testTeamNames ?? {})]);
       res.send(layout(`${event.title} bracket`, cashoutCupBracketPage(event, bracket, teamNames, administratorAccess.isAdmin), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
     } catch (error) {
       next(error);
@@ -346,6 +346,12 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       await ensureCashoutCupBracket(event);
       const mapIndex = parsePositiveInteger(req.params.mapIndex, 'Map number', 1);
       await store.updateEventBracket(event.id, (bracket) => recordCashoutFinalsPlacements(bracket, mapIndex, req.body));
+      const bracket = await store.getEventBracket(event.id);
+      if (event.isTestEvent && bracket && isCashoutCupComplete(bracket)) {
+        await store.removeEvent(event.id);
+        res.redirect('/event-management');
+        return;
+      }
       res.redirect(`/events/${encodeURIComponent(event.id)}/bracket#cashout-finals`);
     } catch (error) {
       next(error);
@@ -395,7 +401,13 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const now = new Date().toISOString();
       const event = parseEventForm(req.body);
-      await store.addEvent({ id: crypto.randomUUID(), ...event, createdBy: req.session.discordUser!.id, createdAt: now, updatedAt: now });
+      const newEvent = { id: crypto.randomUUID(), ...event, createdBy: req.session.discordUser!.id, createdAt: now, updatedAt: now };
+      if (event.isTestEvent) {
+        const testData = buildTestEventRegistrations(newEvent, now);
+        await store.addEventWithRegistrations({ ...newEvent, testTeamNames: testData.teamNames }, testData.registrations);
+      } else {
+        await store.addEvent(newEvent);
+      }
       res.redirect('/event-management');
     } catch (error) {
       next(error);
@@ -420,7 +432,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const existing = await store.getEvent(req.params.eventId);
       if (!existing) throw new Error('Event not found.');
       const parsed = parseEventForm(req.body);
-      await store.updateEvent(existing.id, parsed);
+      await store.updateEvent(existing.id, { ...parsed, isTestEvent: existing.isTestEvent });
       res.redirect('/event-management');
     } catch (error) {
       next(error);
@@ -1108,7 +1120,7 @@ function settingsPage(user: DiscordUser, badges: PugUserBadge[], selectedBadgeId
 }
 
 
-type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool'>;
+type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool' | 'isTestEvent'>;
 
 type EventRegistrationDetail = {
   registration: EventRegistration;
@@ -1141,7 +1153,7 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
   return `<section class="card event-card${event.backgroundImageDataUrl ? ' event-card-with-photo' : ''}"${event.backgroundImageDataUrl ? ` style="--event-photo: url('${escapeCssUrl(event.backgroundImageDataUrl)}');"` : ''}>
     <div class="section-heading-row">
       <div>
-        <p class="eyebrow">${eventStateLabel(state)}</p>
+        <p class="eyebrow">${event.isTestEvent ? 'Test event · ' : ''}${eventStateLabel(state)}</p>
         <h2>${escapeHtml(event.title)}</h2>
       </div>
       <span class="event-capacity">${registrationCount}/${event.teamLimit} teams</span>
@@ -1228,15 +1240,16 @@ function eventRegistrationsPage(event: Event, details: EventRegistrationDetail[]
 
 function eventRegistrationCard(detail: EventRegistrationDetail, index: number, event: Event, isAdmin: boolean) {
   const memberNames = new Map(detail.members.map((member) => [member.userId, member.displayName]));
+  const teamName = detail.team?.name ?? event.testTeamNames?.[detail.registration.teamId] ?? detail.registration.teamId;
   const listNames = (ids: string[]) => ids.map((id) => escapeHtml(memberNames.get(id) ?? id)).join(', ') || 'None selected';
   return `<div class="admin-team-row">
     <div>
-      <strong>${index}. ${escapeHtml(detail.team?.name ?? detail.registration.teamId)}</strong><br />
+      <strong>${index}. ${escapeHtml(teamName)}</strong>${event.isTestEvent ? ' <span class="pill">Test team</span>' : ''}<br />
       <small>Registered ${formatDateTime(detail.registration.createdAt)}</small><br />
       <small>Main: ${listNames(detail.registration.mainPlayerIds)}</small><br />
       <small>Subs: ${listNames(detail.registration.substitutePlayerIds)}</small>
     </div>
-    ${isAdmin ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/registrations/${encodeURIComponent(detail.registration.teamId)}/delete" onsubmit="return confirm('Force un-register ${escapeJsString(detail.team?.name ?? detail.registration.teamId)} from ${escapeJsString(event.title)}?');"><button class="danger" type="submit">Force un-register</button></form>` : ''}
+    ${isAdmin ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/registrations/${encodeURIComponent(detail.registration.teamId)}/delete" onsubmit="return confirm('Force un-register ${escapeJsString(teamName)} from ${escapeJsString(event.title)}?');"><button class="danger" type="submit">Force un-register</button></form>` : ''}
   </div>`;
 }
 
@@ -1270,7 +1283,7 @@ function eventEditPage(event: Event, registrationCount: number) {
 function managedEventRow(event: Event, registrationCount: number) {
   return `<div class="admin-team-row">
     <div>
-      <strong>${escapeHtml(event.title)}</strong> <span class="pill">${eventStateLabel(eventState(event))}</span><br />
+      <strong>${escapeHtml(event.title)}</strong> ${event.isTestEvent ? '<span class="pill">Test event</span> ' : ''}<span class="pill">${eventStateLabel(eventState(event))}</span><br />
       <small>${formatDateTime(event.startsAt)} · ${registrationCount}/${event.teamLimit} teams · registration ${escapeHtml(eventRegistrationStateLabel(eventRegistrationState(event, registrationCount)))}</small>
     </div>
     <div class="admin-team-actions">
@@ -1295,6 +1308,7 @@ function eventForm(action: string, event?: Event) {
       <label>Registration closes <input name="registrationClosesAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
     </div>
     ${eventBracketFields(event)}
+    ${eventTestFields(event)}
     ${eventPhotoField(event)}
     <button type="submit">${event ? 'Save event' : 'Create event'}</button>
   </form>`;
@@ -1315,6 +1329,16 @@ function eventBracketFields(event?: Event) {
       <textarea name="bracketMapPool" rows="4" placeholder="One map per line or comma separated">${escapeHtml((event?.bracketMapPool ?? []).join('\n'))}</textarea>
     </label>
     <small>Qualifying rounds each use one random map. Finals use 9 maps randomly picked from this same pool.</small>
+  </section>`;
+}
+
+function eventTestFields(event?: Event) {
+  const checked = event?.isTestEvent ? ' checked' : '';
+  const disabled = event ? ' disabled' : '';
+  return `<section class="nested-card">
+    <h3>Testing</h3>
+    <label class="checkbox-row"><input type="checkbox" name="isTestEvent" value="1"${checked}${disabled} /> Create as test event</label>
+    <small>Test events auto-register random fake teams that do not exist on the Discord server. When a Cashout Cup test event finishes every finals map, the event, registrations, and bracket are deleted automatically.</small>
   </section>`;
 }
 
@@ -1359,6 +1383,7 @@ function parseEventForm(body: Request['body']): EventFormFields {
   const backgroundImageDataUrl = parseEventPhotoDataUrl(body.backgroundImageDataUrl);
   const bracketType = parseEventBracketType(body.bracketType);
   const bracketMapPool = parseMapPool(body.bracketMapPool);
+  const isTestEvent = body.isTestEvent === '1' || body.isTestEvent === 'on';
 
   if (!title) throw new Error('Event title is required.');
   if (!description) throw new Error('Event description is required.');
@@ -1366,8 +1391,77 @@ function parseEventForm(body: Request['body']): EventFormFields {
   if (new Date(registrationClosesAt).getTime() <= new Date(registrationOpensAt).getTime()) throw new Error('Registration close date must be after the open date.');
 
   if (bracketType === 'cashout-cup' && !bracketMapPool.length) throw new Error('Cashout Cup needs at least one map in the map pool.');
+  if (isTestEvent && bracketType === 'cashout-cup' && teamLimit < 4) throw new Error('Cashout Cup test events need at least 4 fake teams.');
 
-  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt, backgroundImageDataUrl, bracketType, bracketMapPool };
+  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt, backgroundImageDataUrl, bracketType, bracketMapPool, isTestEvent };
+}
+
+const TEST_TEAM_ADJECTIVES = ['Phantom', 'Synthetic', 'Practice', 'Sandbox', 'Mock', 'Ghost', 'Trial', 'Demo', 'Fictional', 'Simulated'];
+const TEST_TEAM_NOUNS = ['Vultures', 'Sentinels', 'Reapers', 'Wardens', 'Marauders', 'Drifters', 'Specters', 'Titans', 'Cobras', 'Wolves'];
+
+type TestEventRegistrationBundle = {
+  registrations: EventRegistration[];
+  teamNames: Record<string, string>;
+};
+
+function buildTestEventRegistrations(event: Event, now: string): TestEventRegistrationBundle {
+  const registrations: EventRegistration[] = [];
+  const teamNames: Record<string, string> = {};
+  const usedNames = new Set<string>();
+  for (let index = 0; index < event.teamLimit; index += 1) {
+    const teamId = `test-team-${event.id}-${index + 1}-${crypto.randomUUID()}`;
+    const name = randomTestTeamName(usedNames);
+    teamNames[teamId] = name;
+    registrations.push({
+      id: crypto.randomUUID(),
+      eventId: event.id,
+      teamId,
+      captainId: `${teamId}-captain`,
+      mainPlayerIds: Array.from({ length: event.requiredMainPlayers }, (_, playerIndex) => `${teamId}-main-${playerIndex + 1}`),
+      substitutePlayerIds: Array.from({ length: event.requiredSubstitutes }, (_, playerIndex) => `${teamId}-sub-${playerIndex + 1}`),
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+  return { registrations, teamNames };
+}
+
+function randomTestTeamName(usedNames: Set<string>) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const adjective = TEST_TEAM_ADJECTIVES[crypto.randomInt(TEST_TEAM_ADJECTIVES.length)];
+    const noun = TEST_TEAM_NOUNS[crypto.randomInt(TEST_TEAM_NOUNS.length)];
+    const suffix = crypto.randomInt(100, 1000);
+    const name = `${adjective} ${noun} ${suffix}`;
+    if (!usedNames.has(name)) {
+      usedNames.add(name);
+      return name;
+    }
+  }
+  const fallback = `Test Team ${usedNames.size + 1}`;
+  usedNames.add(fallback);
+  return fallback;
+}
+
+function buildTestEventMemberDetails(registration: EventRegistration, event: Event): EventRegistrationDetail['members'] {
+  const teamName = event.testTeamNames?.[registration.teamId] ?? 'Test Team';
+  const fakeProfile = (userId: string, label: string) => ({
+    teamId: registration.teamId,
+    userId,
+    displayName: `${teamName} ${label}`,
+    username: userId,
+    avatarUrl: '',
+    isOwner: userId === registration.captainId,
+    role: 'main' as TeamMemberRole,
+    joinedAt: registration.createdAt
+  });
+  return [
+    ...registration.mainPlayerIds.map((userId, index) => fakeProfile(userId, `Main ${index + 1}`)),
+    ...registration.substitutePlayerIds.map((userId, index) => ({ ...fakeProfile(userId, `Sub ${index + 1}`), role: 'sub' as TeamMemberRole }))
+  ];
+}
+
+function isCashoutCupComplete(bracket: EventBracket) {
+  return Boolean(bracket.finals?.maps.length && bracket.finals.maps.every((map) => map.status === 'finished'));
 }
 
 function parseEventBracketType(value: unknown) {

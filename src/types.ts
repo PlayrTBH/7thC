@@ -54,6 +54,8 @@ export type Event = {
   backgroundImageDataUrl?: string;
   bracketType?: EventBracketType;
   bracketMapPool?: string[];
+  isTestEvent?: boolean;
+  testTeamNames?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
   createdBy: string;
