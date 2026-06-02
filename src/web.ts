@@ -28,7 +28,7 @@ type PugPlayerRank = PugRankDefinition & { isMaster?: boolean };
 type PugPlayerStats = { player: PugPlayerSearchEntry; modes: PugPlayerModeStats[]; totals: PugPlayerModeStats; rank: PugPlayerRank };
 type PugEloGraphRange = '24h' | '7d' | '31d' | 'season';
 type PugEloGraphPoint = { matchId: string; rating: number; before: number; delta: number; occurredAt: string; label: string };
-type PugEloGraphState = { range: PugEloGraphRange; activeSeason: PugSeason; points: PugEloGraphPoint[]; totalSeasonMatches: number; rangeStart: string; rangeEnd: string };
+type PugEloGraphState = { range: PugEloGraphRange; activeSeason: PugSeason; points: PugEloGraphPoint[]; totalSeasonMatches: number; rangeStart: string; rangeEnd: string; rankStartRatings: number[] };
 type PugPlayerSearchState = { query: string; selectedPlayerId?: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[]; selected?: PugPlayerStats };
 type LeaderboardPlayerSearchState = { query: string; players: PugPlayerSearchEntry[]; matches: PugPlayerSearchEntry[] };
 
@@ -597,7 +597,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
       const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings, rankSettings.masterPlayerCount));
       const profile = profiles[0];
-      const eloGraph = buildPugEloGraphState(userId, history, activeSeason, parsePugEloGraphRange(req.query.eloRange));
+      const eloGraph = buildPugEloGraphState(userId, history, activeSeason, rankSettings, parsePugEloGraphRange(req.query.eloRange));
       res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds, eloGraph), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
       next(error);
@@ -1767,11 +1767,11 @@ function pugEloGraphSection(stats: PugPlayerStats, graph: PugEloGraphState) {
       <div class="stat-card"><small>Latest shown ELO</small><strong>${formatElo(latest?.rating ?? stats.player.rating)}</strong></div>
       <div class="stat-card"><small>Range change</small><strong class="${change >= 0 ? 'elo-gain' : 'elo-loss'}">${change >= 0 ? '+' : ''}${change}</strong></div>
     </div>
-    ${pugEloGraphSvg(graph.points)}` : `<p>No completed matches with ELO changes for this player in the selected ${escapeHtml(activeRange.label.toLowerCase())} window.</p>`}
+    ${pugEloGraphSvg(graph.points, graph.rankStartRatings)}` : `<p>No completed matches with ELO changes for this player in the selected ${escapeHtml(activeRange.label.toLowerCase())} window.</p>`}
   </section>`;
 }
 
-function pugEloGraphSvg(points: PugEloGraphPoint[]) {
+function pugEloGraphSvg(points: PugEloGraphPoint[], rankStartRatings: number[]) {
   const width = 760;
   const height = 280;
   const padding = { top: 24, right: 28, bottom: 48, left: 62 };
@@ -1780,14 +1780,18 @@ function pugEloGraphSvg(points: PugEloGraphPoint[]) {
   const ratings = points.flatMap((point) => [point.before, point.rating]);
   const minRating = Math.min(...ratings);
   const maxRating = Math.max(...ratings);
-  const yMin = Math.max(0, minRating - Math.max(100, Math.round((maxRating - minRating) * 0.15)));
-  const yMax = maxRating + Math.max(100, Math.round((maxRating - minRating) * 0.15));
+  const rankTicks = getEloGraphRankTicks(rankStartRatings, minRating, maxRating);
+  const graphMinRating = Math.min(minRating, ...rankTicks);
+  const graphMaxRating = Math.max(maxRating, ...rankTicks);
+  const graphRatingSpan = graphMaxRating - graphMinRating;
+  const graphPadding = Math.max(100, Math.round(graphRatingSpan * 0.08));
+  const yMin = Math.max(0, graphMinRating - graphPadding);
+  const yMax = graphMaxRating + graphPadding;
   const ratingSpan = Math.max(1, yMax - yMin);
   const xFor = (index: number) => padding.left + (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
   const yFor = (rating: number) => padding.top + plotHeight - ((rating - yMin) / ratingSpan) * plotHeight;
   const linePoints = points.map((point, index) => `${xFor(index).toFixed(1)},${yFor(point.rating).toFixed(1)}`).join(' ');
   const areaPoints = `${padding.left},${padding.top + plotHeight} ${linePoints} ${padding.left + plotWidth},${padding.top + plotHeight}`;
-  const yTicks = Array.from({ length: 4 }, (_, index) => Math.round(yMin + (ratingSpan * index) / 3));
   const xTickIndexes = uniqueNumbers([0, Math.floor((points.length - 1) / 2), points.length - 1]);
   return `<div class="elo-graph-wrap">
     <svg class="elo-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Player ELO after each completed match in the selected range">
@@ -1798,9 +1802,9 @@ function pugEloGraphSvg(points: PugEloGraphPoint[]) {
         </linearGradient>
       </defs>
       <rect x="${padding.left}" y="${padding.top}" width="${plotWidth}" height="${plotHeight}" rx="12" class="elo-graph-panel" />
-      ${yTicks.map((tick) => {
+      ${rankTicks.map((tick) => {
         const y = yFor(tick);
-        return `<line x1="${padding.left}" x2="${padding.left + plotWidth}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" class="elo-graph-grid" /><text x="${padding.left - 10}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="elo-graph-label">${tick}</text>`;
+        return `<line x1="${padding.left}" x2="${padding.left + plotWidth}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" class="elo-graph-grid" /><text x="${padding.left - 10}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="elo-graph-label">${formatElo(tick)}</text>`;
       }).join('')}
       <polyline points="${areaPoints}" class="elo-graph-area" />
       <polyline points="${linePoints}" class="elo-graph-line" />
@@ -1814,7 +1818,7 @@ function pugEloGraphSvg(points: PugEloGraphPoint[]) {
   </div>`;
 }
 
-function buildPugEloGraphState(userId: string, history: PugMatchLog[], activeSeason: PugSeason, range: PugEloGraphRange): PugEloGraphState {
+function buildPugEloGraphState(userId: string, history: PugMatchLog[], activeSeason: PugSeason, rankSettings: PugRankSettings, range: PugEloGraphRange): PugEloGraphState {
   const seasonStartMs = new Date(activeSeason.startsAt).getTime();
   const safeSeasonStartMs = Number.isFinite(seasonStartMs) ? seasonStartMs : 0;
   const nowMs = Date.now();
@@ -1848,8 +1852,36 @@ function buildPugEloGraphState(userId: string, history: PugMatchLog[], activeSea
     points,
     totalSeasonMatches: seasonMatches.length,
     rangeStart: new Date(rangeStartMs).toISOString(),
-    rangeEnd: new Date(nowMs).toISOString()
+    rangeEnd: new Date(nowMs).toISOString(),
+    rankStartRatings: getRankStartRatings(rankSettings)
   };
+}
+
+
+function getRankStartRatings(settings: PugRankSettings) {
+  return uniqueNumbers(settings.ranks.map((rank) => rank.minRating)).filter((rating) => rating > 0).sort((a, b) => a - b);
+}
+
+function getEloGraphRankTicks(rankStartRatings: number[], minRating: number, maxRating: number) {
+  const sortedStarts = uniqueNumbers(rankStartRatings).sort((a, b) => a - b);
+  if (!sortedStarts.length) return uniqueNumbers([Math.round(minRating), Math.round(maxRating)]).sort((a, b) => a - b);
+  const lowerBoundIndex = findLastRatingIndexAtOrBelow(sortedStarts, minRating);
+  const upperBoundIndex = sortedStarts.findIndex((rating) => rating >= maxRating);
+  let startIndex = lowerBoundIndex >= 0 ? lowerBoundIndex : 0;
+  let endIndex = upperBoundIndex >= 0 ? upperBoundIndex : sortedStarts.length - 1;
+  while (endIndex - startIndex + 1 < 4 && (startIndex > 0 || endIndex < sortedStarts.length - 1)) {
+    if (endIndex < sortedStarts.length - 1) endIndex += 1;
+    if (endIndex - startIndex + 1 >= 4) break;
+    if (startIndex > 0) startIndex -= 1;
+  }
+  return sortedStarts.slice(startIndex, endIndex + 1);
+}
+
+function findLastRatingIndexAtOrBelow(ratings: number[], target: number) {
+  for (let index = ratings.length - 1; index >= 0; index -= 1) {
+    if (ratings[index] <= target) return index;
+  }
+  return -1;
 }
 
 function parsePugEloGraphRange(value: unknown): PugEloGraphRange {
