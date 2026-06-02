@@ -294,7 +294,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   app.get('/leaderboard', requireAuth, async (req, res, next) => {
     try {
       const [leaderboard, ownRating, administratorAccess, rankSettings, allRatings, history, eloSettings, activeSeason, seasonLeaderboards] = await Promise.all([
-        store.getPugEloLeaderboard(10),
+        store.getPugEloLeaderboard(CURRENT_LEADERBOARD_LIMIT),
         store.getPugEloRating(req.session.discordUser!.id),
         bot.getAdministratorAccess(req.session.discordUser!.id),
         store.getPugRankSettings(),
@@ -1636,11 +1636,13 @@ function parseDiscordIds(value: string) {
 
 type LeaderboardRating = PugEloRating & { displayName: string; username?: string; avatarUrl: string; rank: PugPlayerRank };
 
+const CURRENT_LEADERBOARD_LIMIT = 100;
+
 function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRating, ownRank: PugPlayerRank, playerSearch: LeaderboardPlayerSearchState, activeSeason: PugSeason, seasonLeaderboards: PugSeasonLeaderboardEntry[]) {
   return `<section class="card">
-    <h2>Top 10 7th Circle players</h2>
+    <h2>Top ${CURRENT_LEADERBOARD_LIMIT} 7th Circle players</h2>
     <p><small>Active season: ${escapeHtml(activeSeason.label)}${activeSeason.endsAt ? ` · scheduled end ${formatDateTime(activeSeason.endsAt)}` : ' · no scheduled end date'}</small></p>
-    ${leaderboard.length ? `<ol class="leaderboard-list">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
+    ${leaderboard.length ? `<ol class="leaderboard-list leaderboard-list-scroll">${leaderboard.map((rating) => leaderboardEntry(rating)).join('')}</ol>` : '<p>No PUG ELO ratings have been recorded yet.</p>'}
     ${leaderboardPlayerSearchPanel(playerSearch)}
   </section>
   ${previousSeasonLeaderboardsSection(seasonLeaderboards)}
@@ -1654,7 +1656,7 @@ function leaderboardPage(leaderboard: LeaderboardRating[], ownRating: PugEloRati
 function leaderboardPlayerSearchPanel(search: LeaderboardPlayerSearchState) {
   return `<div class="leaderboard-player-search">
     <h3>Find another player</h3>
-    <p><small>Search for PUG players who are not currently in the top 10.</small></p>
+    <p><small>Search for PUG players who are not currently in the top ${CURRENT_LEADERBOARD_LIMIT}.</small></p>
     <form method="get" action="/leaderboard" class="inline-form leaderboard-player-search-form">
       <label>Search players <input name="q" value="${escapeHtml(search.query)}" placeholder="Username or Discord user ID" list="leaderboard-player-options" /></label>
       <button type="submit">Search</button>
@@ -1666,9 +1668,9 @@ function leaderboardPlayerSearchPanel(search: LeaderboardPlayerSearchState) {
 }
 
 function leaderboardPlayerSearchResults(search: LeaderboardPlayerSearchState) {
-  if (!search.query) return '<p><small>Enter a name or Discord user ID to look up players outside the top 10.</small></p>';
-  if (!search.players.length) return '<p><small>No players outside the top 10 have been tracked yet.</small></p>';
-  if (!search.matches.length) return '<p><small>No non-top-10 players matched that search.</small></p>';
+  if (!search.query) return `<p><small>Enter a name or Discord user ID to look up players outside the top ${CURRENT_LEADERBOARD_LIMIT}.</small></p>`;
+  if (!search.players.length) return `<p><small>No players outside the top ${CURRENT_LEADERBOARD_LIMIT} have been tracked yet.</small></p>`;
+  if (!search.matches.length) return `<p><small>No non-top-${CURRENT_LEADERBOARD_LIMIT} players matched that search.</small></p>`;
   return `<div class="pug-player-search-results">${search.matches.map((player) => `<a class="pug-player-result" href="/leaderboard/players/${encodeURIComponent(player.userId)}"><strong>${escapeHtml(player.username ?? player.userId)}</strong><small><code>${escapeHtml(player.userId)}</code> · ${formatElo(player.rating)} ELO</small></a>`).join('')}</div>`;
 }
 
@@ -2780,6 +2782,8 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .checkbox-user strong, .checkbox-user small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; }
     .leaderboard-list { position: relative; counter-reset: leaderboard-rank; display: grid; gap: .65rem; padding: .7rem; list-style: none; border: 1px solid rgba(251, 146, 60, .42); border-radius: 1.25rem; background: linear-gradient(#0f1116, #0f1116) padding-box, linear-gradient(120deg, #ef4444, #f97316, #facc15, #f97316, #ef4444) border-box; box-shadow: 0 0 18px rgba(239, 68, 68, .24), 0 0 28px rgba(249, 115, 22, .18), 0 0 38px rgba(250, 204, 21, .12), inset 0 0 24px rgba(249, 115, 22, .06); animation: leaderboard-outline-glow 3.6s ease-in-out infinite, leaderboard-outline-flow 8s linear infinite; background-size: 100% 100%, 300% 300%; }
+    .leaderboard-list-scroll { --leaderboard-row-height: 4.55rem; max-height: calc((var(--leaderboard-row-height) * 10) + (.65rem * 9) + 1.4rem); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+    .leaderboard-list-scroll .leaderboard-entry { min-height: var(--leaderboard-row-height); }
     .leaderboard-list li, .leaderboard-player { display: flex; align-items: center; gap: .75rem; }
     .leaderboard-list li { position: relative; z-index: 1; counter-increment: leaderboard-rank; justify-content: space-between; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; padding: .75rem .85rem; }
     .leaderboard-list li::before { content: counter(leaderboard-rank); display: grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 999px; background: var(--red-soft); color: var(--red-strong); font-weight: 900; flex: 0 0 auto; }
