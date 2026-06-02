@@ -30,6 +30,7 @@ const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
 const PUG_QUEUE_COUNTDOWN_MS = 30 * 1000;
 const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
+const PUG_INSUFFICIENT_PLAYERS_CANCEL_MS = 5 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
 const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
@@ -1003,6 +1004,7 @@ export class TeamBot {
   private async waitForPugPlayersInQueue(guild: Guild, match: PugMatch) {
     const firstMissingAt = new Map<string, number>();
     const abandonedMissingPlayerIds = new Set<string>();
+    const cancelAt = new Date(match.createdAt).getTime() + PUG_INSUFFICIENT_PLAYERS_CANCEL_MS;
 
     while (this.pugMatches.has(match.id)) {
       const missingPlayerIds: string[] = [];
@@ -1014,6 +1016,11 @@ export class TeamBot {
       if (!missingPlayerIds.length) return;
 
       const now = Date.now();
+      if (now >= cancelAt) {
+        await this.cancelPugMatchForInsufficientPlayers(guild, match, missingPlayerIds);
+        return;
+      }
+
       for (const userId of missingPlayerIds) {
         if (abandonedMissingPlayerIds.has(userId)) {
           const replacement = await this.pullPugReplacement(match);
@@ -1064,6 +1071,22 @@ export class TeamBot {
       this.schedulePugQueueMessageRefresh(0);
       return undefined;
     });
+  }
+
+  private async cancelPugMatchForInsufficientPlayers(guild: Guild, match: PugMatch, missingPlayerIds: string[]) {
+    if (!this.pugMatches.has(match.id)) return;
+    this.stopPugVoteTimers(match);
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    const missingList = missingPlayerIds.map((userId) => `<@${userId}>`).join(', ');
+    if (text?.type === ChannelType.GuildText) {
+      await text.send(`This PUG match did not have enough players in the queue voice channel after 5 minutes${missingList ? ` (${missingList})` : ''}. Canceling the match with no ELO changes.`).catch(() => undefined);
+    }
+    const endedAt = new Date().toISOString();
+    match.updatedAt = endedAt;
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Canceled after 5 minutes without enough players', endedAt }));
+    this.pugMatches.delete(match.id);
+    await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after insufficient-player cancellation:', error));
+    await this.cleanupPugMatchChannels(match, 'PUG match canceled after 5 minutes without enough players');
   }
 
   private async recordPugAbandon(guild: Guild, match: PugMatch, userId: string, replacement?: PugQueuedPlayer) {
@@ -1582,13 +1605,16 @@ export class TeamBot {
   async deletePugMatch(matchId: string) {
     const match = this.pugMatches.get(matchId);
     if (match) {
+      const reason = 'PUG match deleted by administrator';
       this.stopPugVoteTimers(match);
+      const guild = await this.getGuild();
+      await this.movePugVoiceChannelMembersToLobby(guild, match, reason).catch((error) => console.warn('Unable to move PUG players back to lobby before match deletion:', error));
       const endedAt = new Date().toISOString();
       match.updatedAt = endedAt;
       await this.store.upsertPugMatchLog(this.toPugMatchLog(match, { status: 'deleted', result: 'Deleted by administrator', endedAt }));
       this.pugMatches.delete(matchId);
-      await this.updatePugLobbyChannelName(await this.getGuild()).catch((error) => console.warn('Unable to update PUG lobby in-match count after match deletion:', error));
-      await this.cleanupPugMatchChannels(match, 'PUG match deleted by administrator');
+      await this.updatePugLobbyChannelName(guild).catch((error) => console.warn('Unable to update PUG lobby in-match count after match deletion:', error));
+      await this.deletePugMatchChannels(guild, match, reason);
       return;
     }
     await this.store.removePugMatchLog(matchId);
@@ -1725,6 +1751,10 @@ export class TeamBot {
   private async cleanupPugMatchChannels(match: PugMatch, reason: string) {
     const guild = await this.getGuild();
     await this.movePugVoiceChannelMembersToLobby(guild, match, reason);
+    await this.deletePugMatchChannels(guild, match, reason);
+  }
+
+  private async deletePugMatchChannels(guild: Guild, match: PugMatch, reason: string) {
     await this.deletePugTeamVoiceChannels(guild, match, reason);
     for (const channelId of [match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
       await guild.channels.delete(channelId, reason).catch(() => undefined);
