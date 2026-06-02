@@ -546,6 +546,16 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     }
   });
 
+  app.post('/administrator/pugs/elo/recalculate-history', requireAuth, requireGuildAdministrator(bot), async (_req, res, next) => {
+    try {
+      await store.recalculatePugEloHistory();
+      await bot.syncPugRankRoles();
+      res.redirect('/administrator/pugs#elo');
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/administrator/ranks', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
     try {
       const settings = await store.getPugRankSettings();
@@ -1821,6 +1831,9 @@ function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, pl
     <h3>Player search</h3>
     <p><small>Search tracked PUG players, select one, review their current results by PUG mode, and adjust their ELO from the selected player card. First-place and second-place finishes are based on completed match placements. Cashout seconds are listed separately and count toward winrate.</small></p>
     ${pugPlayerSearchPanel(playerSearch, settings)}
+    <form method="post" action="/administrator/pugs/elo/recalculate-history" onsubmit="return confirm('Recalculate every completed PUG and abandon penalty with the current ELO settings? This rewrites stored match gains/losses and current player ELO as if these settings existed from the beginning.');">
+      <button type="submit">Recalculate all historical ELO</button>
+    </form>
     <form method="post" action="/administrator/pugs/elo/reset-all" onsubmit="return confirm('Reset every tracked player to the current starting ELO?');">
       <button class="danger" type="submit">Reset all player ELO</button>
     </form>
