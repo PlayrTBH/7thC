@@ -93,7 +93,15 @@ export class JsonStore {
     });
   }
 
-  async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool'>) {
+  async addEventWithRegistrations(event: Event, registrations: EventRegistration[]) {
+    await this.update((data) => {
+      data.events.push(event);
+      data.eventRegistrations.push(...registrations);
+      return data;
+    });
+  }
+
+  async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool' | 'isTestEvent'>) {
     await this.update((data) => {
       const event = data.events.find((item) => item.id === eventId);
       if (!event) throw new Error('Event not found.');
