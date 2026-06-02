@@ -1311,7 +1311,7 @@ function eventBracketFields(event?: Event) {
         <option value="cashout-cup"${bracketType === 'cashout-cup' ? ' selected' : ''}>Cashout Cup</option>
       </select>
     </label>
-    <label>Cashout Cup map pool
+    <label>Map pool
       <textarea name="bracketMapPool" rows="4" placeholder="One map per line or comma separated">${escapeHtml((event?.bracketMapPool ?? []).join('\n'))}</textarea>
     </label>
     <small>Qualifying rounds each use one random map. Finals use 9 maps randomly picked from this same pool.</small>
