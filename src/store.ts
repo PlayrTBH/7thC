@@ -863,12 +863,14 @@ function isImageDataUrl(value: unknown): value is string {
 function normalizePugEloSettings(settings: Partial<PugEloSettings> | undefined): PugEloSettings {
   const startingRating = typeof settings?.startingRating === 'number' && Number.isFinite(settings.startingRating) ? settings.startingRating : 20000;
   const baseChange = typeof settings?.baseChange === 'number' && Number.isFinite(settings.baseChange) ? settings.baseChange : 1000;
+  const fairLossPercentage = typeof settings?.fairLossPercentage === 'number' && Number.isFinite(settings.fairLossPercentage) ? settings.fairLossPercentage : 100;
   const strength = typeof settings?.strength === 'number' && Number.isFinite(settings.strength) ? settings.strength : 1;
   const finalRoundMultiplier = typeof settings?.finalRoundMultiplier === 'number' && Number.isFinite(settings.finalRoundMultiplier) ? settings.finalRoundMultiplier : 1;
   const cashoutMultiplier = typeof settings?.cashoutMultiplier === 'number' && Number.isFinite(settings.cashoutMultiplier) ? settings.cashoutMultiplier : 1.25;
   return {
     startingRating: Math.max(1, Math.round(startingRating)),
     baseChange: Math.max(1, Math.round(baseChange)),
+    fairLossPercentage: Math.min(500, Math.max(0, fairLossPercentage)),
     strength: Math.min(5, Math.max(0.1, strength)),
     finalRoundMultiplier: Math.min(5, Math.max(0, finalRoundMultiplier)),
     cashoutMultiplier: Math.min(5, Math.max(0, cashoutMultiplier))

@@ -2366,10 +2366,11 @@ function calculatePugEloGain(playerRating: number, teamAverage: number, opponent
   return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.min(MAXIMUM_PUG_ELO_GAIN, Math.round(settings.baseChange * teamFactor * playerFactor)));
 }
 
-function calculatePugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, _settings: PugEloSettings) {
+function calculatePugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
   const opponentRatio = opponentAverage > 0 ? playerRating / opponentAverage : MAXIMUM_PUG_ELO_LOSS_MULTIPLIER;
   const cappedRatio = Math.min(MAXIMUM_PUG_ELO_LOSS_MULTIPLIER, opponentRatio);
-  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
+  const baseLoss = Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
+  return Math.round(baseLoss * (settings.fairLossPercentage / 100));
 }
 
 function formatPugEloSummary(changes: PugEloChange[]) {
