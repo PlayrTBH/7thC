@@ -101,6 +101,19 @@ export class JsonStore {
     });
   }
 
+  async addTestEventRegistrations(eventId: string, registrations: EventRegistration[], teamNames: Record<string, string>) {
+    await this.update((data) => {
+      const event = data.events.find((item) => item.id === eventId);
+      if (!event) throw new Error('Event not found.');
+      if (!event.isTestEvent) throw new Error('Only test events can receive generated registrations.');
+      const existingTeamIds = new Set(data.eventRegistrations.filter((registration) => registration.eventId === eventId).map((registration) => registration.teamId));
+      data.eventRegistrations.push(...registrations.filter((registration) => !existingTeamIds.has(registration.teamId)));
+      event.testTeamNames = { ...(event.testTeamNames ?? {}), ...teamNames };
+      event.updatedAt = new Date().toISOString();
+      return data;
+    });
+  }
+
   async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool' | 'isTestEvent'>) {
     await this.update((data) => {
       const event = data.events.find((item) => item.id === eventId);

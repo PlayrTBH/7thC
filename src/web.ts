@@ -18,6 +18,7 @@ declare module 'express-session' {
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const TEST_EVENT_DURATION_MS = 24 * 60 * 60 * 1000;
+const CASHOUT_CUP_MIN_TEAMS = 4;
 const requestLayoutContext = new AsyncLocalStorage<{ currentTeam?: Team }>();
 
 type AdminPugEloPreviewPlayer = { userId: string; username?: string; rating: number; first: number; second?: number; loss: number };
@@ -36,12 +37,30 @@ type LeaderboardPlayerSearchState = { query: string; players: PugPlayerSearchEnt
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
 
+  const ensureTestEventRegistrations = async (event: Event) => {
+    const registrations = await store.getEventRegistrations(event.id);
+    if (!event.isTestEvent) return registrations;
+
+    let minimumRegistrationCount = event.teamLimit;
+    if (event.bracketType === 'cashout-cup') minimumRegistrationCount = Math.max(minimumRegistrationCount, CASHOUT_CUP_MIN_TEAMS);
+    if (registrations.length >= minimumRegistrationCount) return registrations;
+
+    const now = new Date().toISOString();
+    const testData = buildTestEventRegistrations(event, now, {
+      count: minimumRegistrationCount - registrations.length,
+      existingTeamCount: registrations.length
+    });
+    await store.addTestEventRegistrations(event.id, testData.registrations, testData.teamNames);
+    event.testTeamNames = { ...(event.testTeamNames ?? {}), ...testData.teamNames };
+    return store.getEventRegistrations(event.id);
+  };
+
   const ensureCashoutCupBracket = async (event: Event) => {
     const existing = await store.getEventBracket(event.id);
     if (existing) return existing;
-    const registrations = await store.getEventRegistrations(event.id);
+    const registrations = await ensureTestEventRegistrations(event);
     const teams = registrations.map((registration) => registration.teamId);
-    if (teams.length < 4) throw new Error('Cashout Cup requires at least 4 registered teams to create a bracket.');
+    if (teams.length < CASHOUT_CUP_MIN_TEAMS) throw new Error('Cashout Cup requires at least 4 registered teams to create a bracket.');
     const now = new Date().toISOString();
     const bracket = buildCashoutCupBracket(event, teams, now);
     await store.upsertEventBracket(bracket);
@@ -282,7 +301,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         res.status(404).send(layout('Event not found', '<p>That event does not exist.</p><p><a href="/events">Back to events</a></p>', { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
         return;
       }
-      const registrations = await store.getEventRegistrations(event.id);
+      const registrations = await ensureTestEventRegistrations(event);
       const details = await Promise.all(
         registrations.map(async (registration) => ({
           registration,
@@ -1423,12 +1442,15 @@ type TestEventRegistrationBundle = {
   teamNames: Record<string, string>;
 };
 
-function buildTestEventRegistrations(event: Event, now: string): TestEventRegistrationBundle {
+function buildTestEventRegistrations(event: Event, now: string, options: { count?: number; existingTeamCount?: number } = {}): TestEventRegistrationBundle {
   const registrations: EventRegistration[] = [];
   const teamNames: Record<string, string> = {};
-  const usedNames = new Set<string>();
-  for (let index = 0; index < event.teamLimit; index += 1) {
-    const teamId = `test-team-${event.id}-${index + 1}-${crypto.randomUUID()}`;
+  const usedNames = new Set(Object.values(event.testTeamNames ?? {}));
+  const count = options.count ?? event.teamLimit;
+  const existingTeamCount = options.existingTeamCount ?? 0;
+  for (let index = 0; index < count; index += 1) {
+    const displayIndex = existingTeamCount + index + 1;
+    const teamId = `test-team-${event.id}-${displayIndex}-${crypto.randomUUID()}`;
     const name = randomTestTeamName(usedNames);
     teamNames[teamId] = name;
     registrations.push({
