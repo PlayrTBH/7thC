@@ -38,6 +38,8 @@ export type TeamInvite = {
   respondedAt?: string;
 };
 
+export type EventBracketType = 'none' | 'cashout-cup';
+
 export type Event = {
   id: string;
   title: string;
@@ -50,9 +52,49 @@ export type Event = {
   registrationOpensAt: string;
   registrationClosesAt: string;
   backgroundImageDataUrl?: string;
+  bracketType?: EventBracketType;
+  bracketMapPool?: string[];
   createdAt: string;
   updatedAt: string;
   createdBy: string;
+};
+
+export type CashoutCupQualifyingBracket = {
+  id: string;
+  teamIds: string[];
+};
+
+export type CashoutCupQualifyingRound = {
+  index: number;
+  map: string;
+  brackets: CashoutCupQualifyingBracket[];
+  sitOutTeamIds: string[];
+  cashResults?: Record<string, number>;
+  status: 'pending' | 'finished';
+  finishedAt?: string;
+};
+
+export type CashoutCupFinalMap = {
+  index: number;
+  map: string;
+  placements?: Record<string, number>;
+  status: 'pending' | 'finished';
+  finishedAt?: string;
+};
+
+export type CashoutCupFinals = {
+  teamIds: string[];
+  maps: CashoutCupFinalMap[];
+};
+
+export type EventBracket = {
+  eventId: string;
+  type: 'cashout-cup';
+  mapPool: string[];
+  qualifyingRounds: CashoutCupQualifyingRound[];
+  finals?: CashoutCupFinals;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type EventRegistration = {
@@ -256,6 +298,7 @@ export type StoreShape = {
   invites: TeamInvite[];
   events: Event[];
   eventRegistrations: EventRegistration[];
+  eventBrackets: EventBracket[];
   pugMatchLogs: PugMatchLog[];
   pugAbandonLogs: PugAbandonLog[];
   pugEloRatings: PugEloRating[];

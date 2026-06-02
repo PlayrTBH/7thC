@@ -7,7 +7,7 @@ import type { TeamBotApi } from './bot.js';
 import type { JsonStore } from './store.js';
 import { clearLogs, getRecentLogs, type CapturedLog } from './logger.js';
 import { JsonSessionStore } from './session-store.js';
-import type { BotActivityType, BotStatus, DiscordUser, Event, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugAbandonLog, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge } from './types.js';
+import type { BotActivityType, BotStatus, DiscordUser, Event, EventBracket, EventRegistration, Team, TeamInvite, TeamMember, TeamMemberRole, PugAbandonLog, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge } from './types.js';
 
 declare module 'express-session' {
   interface SessionData {
@@ -34,6 +34,18 @@ type LeaderboardPlayerSearchState = { query: string; players: PugPlayerSearchEnt
 
 export function createWebApp(bot: TeamBotApi, store: JsonStore) {
   const app = express();
+
+  const ensureCashoutCupBracket = async (event: Event) => {
+    const existing = await store.getEventBracket(event.id);
+    if (existing) return existing;
+    const registrations = await store.getEventRegistrations(event.id);
+    const teams = registrations.map((registration) => registration.teamId);
+    if (teams.length < 4) throw new Error('Cashout Cup requires at least 4 registered teams to create a bracket.');
+    const now = new Date().toISOString();
+    const bracket = buildCashoutCupBracket(event, teams, now);
+    await store.upsertEventBracket(bracket);
+    return bracket;
+  };
 
   app.set('trust proxy', 1);
   app.use(express.urlencoded({ extended: false, limit: '6mb' }));
@@ -289,6 +301,52 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
       if (!event) throw new Error('Event not found.');
       await store.removeEventRegistration(event.id, req.params.teamId);
       res.redirect(`/events/${encodeURIComponent(event.id)}/registrations`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+
+  app.get('/events/:eventId/bracket', requireAuth, async (req, res, next) => {
+    try {
+      const user = req.session.discordUser!;
+      const [event, administratorAccess] = await Promise.all([store.getEvent(req.params.eventId), bot.getAdministratorAccess(user.id)]);
+      if (!event) {
+        res.status(404).send(layout('Event not found', '<p>That event does not exist.</p><p><a href="/events">Back to events</a></p>', { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+        return;
+      }
+      if (event.bracketType !== 'cashout-cup') throw new Error('This event does not have a bracket enabled.');
+      if (Date.now() < new Date(event.startsAt).getTime()) throw new Error('The bracket opens when the event goes live.');
+      const bracket = await ensureCashoutCupBracket(event);
+      const teams = await store.getTeams();
+      const teamNames = new Map(teams.map((team) => [team.id, team.name]));
+      res.send(layout(`${event.title} bracket`, cashoutCupBracketPage(event, bracket, teamNames, administratorAccess.isAdmin), { user, isAdmin: administratorAccess.isAdmin, active: 'events' }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/events/:eventId/bracket/qualifying/:roundIndex', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const event = await store.getEvent(req.params.eventId);
+      if (!event || event.bracketType !== 'cashout-cup') throw new Error('Cashout Cup event not found.');
+      await ensureCashoutCupBracket(event);
+      const roundIndex = parsePositiveInteger(req.params.roundIndex, 'Round number', 1);
+      await store.updateEventBracket(event.id, (bracket) => recordCashoutQualifyingResults(bracket, roundIndex, req.body));
+      res.redirect(`/events/${encodeURIComponent(event.id)}/bracket`);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/events/:eventId/bracket/finals/:mapIndex', requireAuth, requireGuildAdministrator(bot), async (req, res, next) => {
+    try {
+      const event = await store.getEvent(req.params.eventId);
+      if (!event || event.bracketType !== 'cashout-cup') throw new Error('Cashout Cup event not found.');
+      await ensureCashoutCupBracket(event);
+      const mapIndex = parsePositiveInteger(req.params.mapIndex, 'Map number', 1);
+      await store.updateEventBracket(event.id, (bracket) => recordCashoutFinalsPlacements(bracket, mapIndex, req.body));
+      res.redirect(`/events/${encodeURIComponent(event.id)}/bracket#cashout-finals`);
     } catch (error) {
       next(error);
     }
@@ -1050,7 +1108,7 @@ function settingsPage(user: DiscordUser, badges: PugUserBadge[], selectedBadgeId
 }
 
 
-type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl'>;
+type EventFormFields = Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool'>;
 
 type EventRegistrationDetail = {
   registration: EventRegistration;
@@ -1095,9 +1153,11 @@ function eventCard(event: Event, registrationCount: number, currentTeam: Team | 
       ${eventMeta('Event ends', formatDateTime(event.endsAt))}
       ${eventMeta('Registration', eventRegistrationDateSummary(event))}
       ${eventMeta('Roster required', `${event.requiredMainPlayers} main, ${event.requiredSubstitutes} sub${event.requiredSubstitutes === 1 ? '' : 's'}`)}
+      ${event.bracketType === 'cashout-cup' ? eventMeta('Bracket', 'Cashout Cup') : ''}
     </div>
     <div class="event-actions">
       <a class="button secondary" href="/events/${encodeURIComponent(event.id)}/registrations">Registered teams</a>
+      ${state === 'live' && event.bracketType === 'cashout-cup' ? `<a class="button bracket-button" href="/events/${encodeURIComponent(event.id)}/bracket">🏆 Bracket</a>` : ''}
       ${registrationState === 'full' ? '<span class="pill">Full</span>' : ''}
       ${registrationState === 'not-open' ? '<span class="pill">Registration not open</span>' : ''}
       ${registrationState === 'closed' ? '<span class="pill">Registration closed</span>' : ''}
@@ -1234,9 +1294,28 @@ function eventForm(action: string, event?: Event) {
       <label>Registration opens <input name="registrationOpensAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationOpensAt))}" /></label>
       <label>Registration closes <input name="registrationClosesAt" type="datetime-local" required value="${escapeHtml(toDateTimeLocalValue(event?.registrationClosesAt))}" /></label>
     </div>
+    ${eventBracketFields(event)}
     ${eventPhotoField(event)}
     <button type="submit">${event ? 'Save event' : 'Create event'}</button>
   </form>`;
+}
+
+function eventBracketFields(event?: Event) {
+  const bracketType = event?.bracketType ?? 'none';
+  return `<section class="nested-card">
+    <h3>Bracket type</h3>
+    <p><small>Cashout Cup opens a visible bracket button automatically when the event start time is reached.</small></p>
+    <label>Bracket
+      <select name="bracketType">
+        <option value="none"${bracketType === 'none' ? ' selected' : ''}>No bracket</option>
+        <option value="cashout-cup"${bracketType === 'cashout-cup' ? ' selected' : ''}>Cashout Cup</option>
+      </select>
+    </label>
+    <label>Cashout Cup map pool
+      <textarea name="bracketMapPool" rows="4" placeholder="One map per line or comma separated">${escapeHtml((event?.bracketMapPool ?? []).join('\n'))}</textarea>
+    </label>
+    <small>Qualifying rounds each use one random map. Finals use 9 maps randomly picked from this same pool.</small>
+  </section>`;
 }
 
 function eventPhotoField(event?: Event) {
@@ -1278,13 +1357,29 @@ function parseEventForm(body: Request['body']): EventFormFields {
   const registrationOpensAt = parseDateTimeInput(body.registrationOpensAt, 'Registration open date');
   const registrationClosesAt = parseDateTimeInput(body.registrationClosesAt, 'Registration close date');
   const backgroundImageDataUrl = parseEventPhotoDataUrl(body.backgroundImageDataUrl);
+  const bracketType = parseEventBracketType(body.bracketType);
+  const bracketMapPool = parseMapPool(body.bracketMapPool);
 
   if (!title) throw new Error('Event title is required.');
   if (!description) throw new Error('Event description is required.');
   if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) throw new Error('Event end date must be after the start date.');
   if (new Date(registrationClosesAt).getTime() <= new Date(registrationOpensAt).getTime()) throw new Error('Registration close date must be after the open date.');
 
-  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt, backgroundImageDataUrl };
+  if (bracketType === 'cashout-cup' && !bracketMapPool.length) throw new Error('Cashout Cup needs at least one map in the map pool.');
+
+  return { title, description, teamLimit, requiredMainPlayers, requiredSubstitutes, startsAt, endsAt, registrationOpensAt, registrationClosesAt, backgroundImageDataUrl, bracketType, bracketMapPool };
+}
+
+function parseEventBracketType(value: unknown) {
+  return value === 'cashout-cup' ? 'cashout-cup' : 'none';
+}
+
+function parseMapPool(value: unknown) {
+  return String(value ?? '')
+    .split(/\r?\n|,/)
+    .map((map) => map.trim())
+    .filter(Boolean)
+    .slice(0, 50);
 }
 
 function parseEventPhotoDataUrl(value: unknown) {
@@ -1309,6 +1404,199 @@ function parseDateTimeInput(value: unknown, label: string) {
   if (!raw || Number.isNaN(date.getTime())) throw new Error(`${label} is required.`);
   return date.toISOString();
 }
+
+function buildCashoutCupBracket(event: Event, teamIds: string[], now: string): EventBracket {
+  const maps = event.bracketMapPool?.length ? event.bracketMapPool : ['Map TBD'];
+  const rounds = Array.from({ length: 4 }, (_, index) => buildCashoutQualifyingRound(index + 1, pickCashoutMap(maps), teamIds));
+  return {
+    eventId: event.id,
+    type: 'cashout-cup',
+    mapPool: maps,
+    qualifyingRounds: rounds,
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function pickCashoutMap(pool: string[]) {
+  return pool[crypto.randomInt(pool.length)] ?? 'Map TBD';
+}
+
+function buildCashoutQualifyingRound(index: number, map: string, teamIds: string[]) {
+  const remainder = teamIds.length % 4;
+  const sitOutCount = remainder === 0 ? 0 : remainder;
+  const rotated = rotateArray(teamIds, index - 1);
+  const sitOutTeamIds = sitOutCount ? rotated.slice(-sitOutCount) : [];
+  const playingTeams = rotated.filter((teamId) => !sitOutTeamIds.includes(teamId));
+  const brackets = [];
+  for (let i = 0; i < playingTeams.length; i += 4) {
+    brackets.push({ id: `round-${index}-bracket-${Math.floor(i / 4) + 1}`, teamIds: playingTeams.slice(i, i + 4) });
+  }
+  return { index, map, brackets, sitOutTeamIds, status: 'pending' as const };
+}
+
+function rotateArray<T>(items: T[], count: number) {
+  if (!items.length) return [];
+  const offset = count % items.length;
+  return [...items.slice(offset), ...items.slice(0, offset)];
+}
+
+function recordCashoutQualifyingResults(bracket: EventBracket, roundIndex: number, body: Request['body']) {
+  const round = bracket.qualifyingRounds.find((item) => item.index === roundIndex);
+  if (!round) throw new Error('Qualifying round not found.');
+  const teamIds = round.brackets.flatMap((group) => group.teamIds);
+  const cashResults: Record<string, number> = {};
+  for (const teamId of teamIds) {
+    const value = Number(body[`cash_${teamId}`]);
+    if (!Number.isFinite(value) || value < 0) throw new Error('Cash earned values must be zero or greater.');
+    cashResults[teamId] = Math.round(value);
+  }
+  round.cashResults = cashResults;
+  round.status = 'finished';
+  round.finishedAt = new Date().toISOString();
+  if (bracket.qualifyingRounds.every((item) => item.status === 'finished')) {
+    const standings = calculateCashoutQualifyingStandings(bracket);
+    const finalistIds = standings.slice(0, 4).map((standing) => standing.teamId);
+    const finalsStarted = bracket.finals?.maps.some((map) => map.status === 'finished');
+    if (!bracket.finals || !finalsStarted) {
+      bracket.finals = {
+        teamIds: finalistIds,
+        maps: bracket.finals?.maps ?? selectCashoutFinalMaps(bracket)
+      };
+    }
+  }
+  return bracket;
+}
+
+function selectCashoutFinalMaps(bracket: EventBracket) {
+  const pool = bracket.mapPool?.length ? bracket.mapPool : ['Map TBD'];
+  return Array.from({ length: 9 }, (_, index) => ({
+    index: index + 1,
+    map: pickCashoutMap(pool),
+    status: 'pending' as const
+  }));
+}
+
+function recordCashoutFinalsPlacements(bracket: EventBracket, mapIndex: number, body: Request['body']) {
+  const finalMap = bracket.finals?.maps.find((item) => item.index === mapIndex);
+  if (!bracket.finals || !finalMap) throw new Error('Cashout Cup Finals map not found.');
+  const placements: Record<string, number> = {};
+  const usedPlacements = new Set<number>();
+  for (const teamId of bracket.finals.teamIds) {
+    const placement = parsePositiveInteger(body[`place_${teamId}`], 'Finishing position', 1);
+    if (placement > 4) throw new Error('Finals finishing positions must be between 1 and 4.');
+    if (usedPlacements.has(placement)) throw new Error('Each finals finishing position can only be used once per map.');
+    usedPlacements.add(placement);
+    placements[teamId] = placement;
+  }
+  finalMap.placements = placements;
+  finalMap.status = 'finished';
+  finalMap.finishedAt = new Date().toISOString();
+  return bracket;
+}
+
+function calculateCashoutQualifyingStandings(bracket: EventBracket) {
+  const totals = new Map<string, number>();
+  for (const round of bracket.qualifyingRounds) {
+    for (const group of round.brackets) for (const teamId of group.teamIds) totals.set(teamId, totals.get(teamId) ?? 0);
+    for (const [teamId, cash] of Object.entries(round.cashResults ?? {})) totals.set(teamId, (totals.get(teamId) ?? 0) + cash);
+  }
+  return [...totals.entries()]
+    .map(([teamId, cash]) => ({ teamId, cash, status: 'Knocked Out' as 'Qualified' | 'Knocked Out' }))
+    .sort((a, b) => b.cash - a.cash || a.teamId.localeCompare(b.teamId))
+    .map((standing, index) => ({ ...standing, status: index < 4 ? 'Qualified' as const : 'Knocked Out' as const }));
+}
+
+function calculateCashoutFinalsStandings(bracket: EventBracket) {
+  const teamIds = bracket.finals?.teamIds ?? [];
+  const stats = new Map(teamIds.map((teamId) => [teamId, { teamId, points: 0, firsts: 0, seconds: 0, thirds: 0, fourths: 0 }]));
+  for (const map of bracket.finals?.maps ?? []) {
+    if (map.status !== 'finished' || !map.placements) continue;
+    for (const [teamId, placement] of Object.entries(map.placements)) {
+      const stat = stats.get(teamId);
+      if (!stat) continue;
+      if (placement === 1) { stat.points += 2; stat.firsts += 1; }
+      if (placement === 2) { stat.points += 1; stat.seconds += 1; }
+      if (placement === 3) { stat.points = Math.max(0, stat.points - 1); stat.thirds += 1; }
+      if (placement === 4) { stat.points = Math.max(0, stat.points - 2); stat.fourths += 1; }
+    }
+  }
+  return [...stats.values()].sort((a, b) => b.points - a.points || b.firsts - a.firsts || b.seconds - a.seconds || a.teamId.localeCompare(b.teamId));
+}
+
+function cashoutCupBracketPage(event: Event, bracket: EventBracket, teamNames: Map<string, string>, isAdmin: boolean) {
+  const qualifyingStandings = calculateCashoutQualifyingStandings(bracket);
+  const finalsStandings = calculateCashoutFinalsStandings(bracket);
+  const currentRound = bracket.qualifyingRounds.find((round) => round.status !== 'finished');
+  const currentFinalMap = bracket.finals?.maps.find((map) => map.status !== 'finished');
+  return `<p><a href="/events">← Back to events</a></p>
+    <section class="card bracket-hero">
+      <p class="eyebrow">Live bracket</p>
+      <h2>${escapeHtml(event.title)} · Cashout Cup</h2>
+      <p>Four qualifying rounds group teams into brackets of four. The top 4 cash earners qualify for the Cashout Cup Finals.</p>
+      <div class="event-actions">
+        ${currentRound ? `<span class="pill">Now reporting qualifying round ${currentRound.index}</span>` : currentFinalMap ? `<span class="pill">Now reporting finals map ${currentFinalMap.index}</span>` : '<span class="pill">Bracket complete</span>'}
+      </div>
+    </section>
+    <section class="card bracket-flow">
+      <div class="section-heading-row"><div><p class="eyebrow">Qualifying</p><h2>Cashout Cup rounds</h2></div></div>
+      <div class="cashout-rounds">${bracket.qualifyingRounds.map((round) => cashoutQualifyingRoundCard(event, round, teamNames, isAdmin)).join('')}</div>
+    </section>
+    <section class="card">
+      <div class="section-heading-row"><div><p class="eyebrow">Totals</p><h2>Cash earned standings</h2></div></div>
+      ${cashoutQualifyingStandingsTable(qualifyingStandings, teamNames)}
+    </section>
+    ${bracket.finals ? `<section class="card" id="cashout-finals">
+      <div class="section-heading-row"><div><p class="eyebrow">Cashout Cup Finals</p><h2>Current points tower</h2></div></div>
+      ${cashoutFinalsStandingsTower(finalsStandings, teamNames)}
+      <div class="cashout-finals-maps">${bracket.finals.maps.map((map) => cashoutFinalMapCard(event, bracket, map, teamNames, isAdmin)).join('')}</div>
+    </section>` : '<section class="card"><h2>Cashout Cup Finals locked</h2><p>Enter all four qualifying round cash reports to qualify the top 4 teams.</p></section>'}`;
+}
+
+function cashoutQualifyingRoundCard(event: Event, round: EventBracket['qualifyingRounds'][number], teamNames: Map<string, string>, isAdmin: boolean) {
+  const teamIds = round.brackets.flatMap((group) => group.teamIds);
+  return `<article class="cashout-round ${round.status === 'finished' ? 'is-finished' : ''}">
+    <p class="eyebrow">Round ${round.index}</p>
+    <h3>${escapeHtml(round.map)}</h3>
+    ${round.brackets.map((group, index) => `<div class="cashout-group"><strong>Bracket ${index + 1}</strong>${group.teamIds.map((teamId) => `<span>${escapeHtml(teamNames.get(teamId) ?? teamId)}${round.cashResults ? ` · $${formatInteger(round.cashResults[teamId] ?? 0)}` : ''}</span>`).join('')}</div>`).join('')}
+    ${round.sitOutTeamIds.length ? `<p><small>Sitting out: ${round.sitOutTeamIds.map((teamId) => escapeHtml(teamNames.get(teamId) ?? teamId)).join(', ')}</small></p>` : ''}
+    ${isAdmin ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/bracket/qualifying/${round.index}" class="cashout-report-form">
+      <h4>Admin cash report</h4>
+      ${teamIds.map((teamId) => `<label>${escapeHtml(teamNames.get(teamId) ?? teamId)} <input name="cash_${escapeHtml(teamId)}" type="number" min="0" required value="${round.cashResults?.[teamId] ?? ''}" /></label>`).join('')}
+      <button type="submit">${round.status === 'finished' ? 'Update round' : 'Finish round'}</button>
+    </form>` : ''}
+  </article>`;
+}
+
+function cashoutQualifyingStandingsTable(standings: ReturnType<typeof calculateCashoutQualifyingStandings>, teamNames: Map<string, string>) {
+  return `<div class="cashout-table"><span>Place</span><span>Team</span><span>Cash</span><span>Status</span>${standings.map((standing, index) => `<strong>${index + 1}</strong><strong>${escapeHtml(teamNames.get(standing.teamId) ?? standing.teamId)}</strong><strong>$${formatInteger(standing.cash)}</strong><span class="pill">${standing.status}</span>`).join('')}</div>`;
+}
+
+function cashoutFinalsStandingsTower(standings: ReturnType<typeof calculateCashoutFinalsStandings>, teamNames: Map<string, string>) {
+  return `<div class="cashout-tower">${standings.map((standing, index) => `<div class="tower-step" style="--tower-rank:${index + 1}"><span>#${index + 1}</span><strong>${escapeHtml(teamNames.get(standing.teamId) ?? standing.teamId)}</strong><b>${standing.points} pts</b><small>1st: ${standing.firsts} · 2nd: ${standing.seconds}</small></div>`).join('')}</div>`;
+}
+
+function cashoutFinalMapCard(event: Event, bracket: EventBracket, map: NonNullable<EventBracket['finals']>['maps'][number], teamNames: Map<string, string>, isAdmin: boolean) {
+  const teamIds = bracket.finals?.teamIds ?? [];
+  return `<article class="cashout-final-map ${map.status === 'finished' ? 'is-finished' : ''}">
+    <div><p class="eyebrow">Finals map ${map.index}</p><h3>${escapeHtml(map.map)}</h3></div>
+    ${map.placements ? `<p>${teamIds.map((teamId) => `${escapeHtml(teamNames.get(teamId) ?? teamId)}: ${ordinal(map.placements?.[teamId] ?? 0)}`).join(' · ')}</p>` : '<p><small>Awaiting finishing positions.</small></p>'}
+    ${isAdmin ? `<form method="post" action="/events/${encodeURIComponent(event.id)}/bracket/finals/${map.index}" class="cashout-report-form compact">
+      ${teamIds.map((teamId) => `<label>${escapeHtml(teamNames.get(teamId) ?? teamId)} <select name="place_${escapeHtml(teamId)}" required>${[1,2,3,4].map((place) => `<option value="${place}"${map.placements?.[teamId] === place ? ' selected' : ''}>${ordinal(place)}</option>`).join('')}</select></label>`).join('')}
+      <button type="submit">${map.status === 'finished' ? 'Update map' : 'Finish map'}</button>
+    </form>` : ''}
+  </article>`;
+}
+
+function formatInteger(value: number) {
+  return Math.round(value).toLocaleString('en-US');
+}
+
+function ordinal(value: number) {
+  const labels: Record<number, string> = { 1: '1st', 2: '2nd', 3: '3rd', 4: '4th' };
+  return labels[value] ?? String(value);
+}
+
 
 function validateEventRegistration(event: Event, members: TeamMember[], mainPlayerIds: string[], substitutePlayerIds: string[], registrationCount: number, isExistingRegistration = false) {
   const registrationState = eventRegistrationState(event, registrationCount);
@@ -2952,6 +3240,31 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .management-list, .event-list { display: grid; gap: .75rem; }
     .event-card { position: relative; overflow: hidden; border-color: rgba(239,35,60,.2); }
     .event-card > * { position: relative; z-index: 1; }
+
+    .bracket-button { background: linear-gradient(135deg, #facc15, #f97316); color: #1f1300; box-shadow: 0 14px 34px rgba(250,204,21,.22); text-transform: uppercase; letter-spacing: .08em; }
+    .bracket-button:hover { color: #1f1300; }
+    .nested-card { display: grid; gap: .75rem; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: rgba(255,255,255,.025); }
+    .nested-card h3 { margin: 0; }
+    .nested-card label { display: grid; gap: .4rem; }
+    .nested-card input, .nested-card select, .nested-card textarea { margin-left: 0; }
+    .bracket-hero { background: radial-gradient(circle at top left, rgba(250,204,21,.16), transparent 24rem), linear-gradient(145deg, rgba(32,35,43,.96), rgba(12,13,17,.96)); }
+    .cashout-rounds { display: grid; grid-template-columns: repeat(4, minmax(15rem, 1fr)); gap: 1rem; overflow-x: auto; padding-bottom: .4rem; }
+    .cashout-round, .cashout-final-map { display: grid; gap: .75rem; min-width: 15rem; border: 1px solid var(--line); border-radius: 1rem; padding: 1rem; background: #12141a; }
+    .cashout-round.is-finished, .cashout-final-map.is-finished { border-color: rgba(34,197,94,.42); }
+    .cashout-round h3, .cashout-final-map h3 { margin: 0; }
+    .cashout-group { display: grid; gap: .35rem; padding: .7rem; border: 1px solid rgba(255,255,255,.08); border-radius: .8rem; background: rgba(255,255,255,.025); }
+    .cashout-group span { color: var(--muted); }
+    .cashout-report-form { display: grid; gap: .6rem; padding-top: .75rem; border-top: 1px solid var(--line); }
+    .cashout-report-form label { display: grid; gap: .35rem; }
+    .cashout-report-form input, .cashout-report-form select { margin-left: 0; width: 100%; }
+    .cashout-report-form.compact { grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); align-items: end; }
+    .cashout-table { display: grid; grid-template-columns: auto minmax(10rem, 1fr) auto auto; gap: .6rem .8rem; align-items: center; }
+    .cashout-table > span:nth-child(-n+4) { color: var(--muted); font-weight: 800; }
+    .cashout-tower { display: grid; gap: .65rem; margin-bottom: 1rem; }
+    .tower-step { display: grid; grid-template-columns: auto minmax(9rem, 1fr) auto auto; gap: .75rem; align-items: center; padding: calc(1rem - (var(--tower-rank) * .04rem)); border: 1px solid rgba(250,204,21,.22); border-radius: 1rem; background: linear-gradient(135deg, rgba(250,204,21,.14), rgba(18,20,26,.96)); }
+    .tower-step span { color: #facc15; font-weight: 900; }
+    .tower-step small { color: var(--muted); }
+    .cashout-finals-maps { display: grid; gap: .85rem; }
     .event-card-with-photo::before { content: ""; position: absolute; inset: 0; z-index: 0; background-image: linear-gradient(90deg, rgba(23,25,31,.95), rgba(23,25,31,.78)), var(--event-photo); background-size: cover; background-position: center; filter: saturate(.9); }
     .timezone-note { margin: .85rem 0 -.35rem; color: var(--muted); font-size: .82rem; font-weight: 800; }
     .event-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }

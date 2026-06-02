@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugAbandonLog, PugAbandonSettings, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventBracket, EventRegistration, PugAbandonLog, PugAbandonSettings, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 import { DEVELOPER_DISCORD_USER_ID } from './config.js';
 
@@ -10,6 +10,7 @@ const initialStore: StoreShape = {
   invites: [],
   events: [],
   eventRegistrations: [],
+  eventBrackets: [],
   pugMatchLogs: [],
   pugAbandonLogs: [],
   pugEloRatings: [],
@@ -29,6 +30,7 @@ export class JsonStore {
     await withFileLock(this.filePath, async () => {
       try {
         const data = await this.readUnlocked();
+        data.eventBrackets ??= [];
         data.pugAbandonLogs ??= [];
         await this.writeUnlocked(data);
       } catch {
@@ -91,7 +93,7 @@ export class JsonStore {
     });
   }
 
-  async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl'>) {
+  async updateEvent(eventId: string, updates: Pick<Event, 'title' | 'description' | 'teamLimit' | 'requiredMainPlayers' | 'requiredSubstitutes' | 'startsAt' | 'endsAt' | 'registrationOpensAt' | 'registrationClosesAt' | 'backgroundImageDataUrl' | 'bracketType' | 'bracketMapPool'>) {
     await this.update((data) => {
       const event = data.events.find((item) => item.id === eventId);
       if (!event) throw new Error('Event not found.');
@@ -139,6 +141,31 @@ export class JsonStore {
       data.events = data.events.filter((event) => event.id !== eventId);
       if (data.events.length === before) throw new Error('Event not found.');
       data.eventRegistrations = data.eventRegistrations.filter((registration) => registration.eventId !== eventId);
+      data.eventBrackets = data.eventBrackets.filter((bracket) => bracket.eventId !== eventId);
+      return data;
+    });
+  }
+
+  async getEventBracket(eventId: string) {
+    const data = await this.read();
+    return data.eventBrackets.find((bracket) => bracket.eventId === eventId);
+  }
+
+  async upsertEventBracket(bracket: EventBracket) {
+    await this.update((data) => {
+      const index = data.eventBrackets.findIndex((item) => item.eventId === bracket.eventId);
+      if (index >= 0) data.eventBrackets[index] = bracket;
+      else data.eventBrackets.push(bracket);
+      return data;
+    });
+  }
+
+  async updateEventBracket(eventId: string, mutator: (bracket: EventBracket) => EventBracket) {
+    await this.update((data) => {
+      const index = data.eventBrackets.findIndex((item) => item.eventId === eventId);
+      if (index < 0) throw new Error('Event bracket not found.');
+      data.eventBrackets[index] = mutator(data.eventBrackets[index]);
+      data.eventBrackets[index].updatedAt = new Date().toISOString();
       return data;
     });
   }
@@ -731,6 +758,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
     invites: data.invites ?? [],
     events: data.events ?? [],
     eventRegistrations: data.eventRegistrations ?? [],
+    eventBrackets: data.eventBrackets ?? [],
     pugMatchLogs: Array.isArray(data.pugMatchLogs) ? data.pugMatchLogs.map(normalizePugMatchLog) : [],
     pugAbandonLogs: Array.isArray(data.pugAbandonLogs) ? data.pugAbandonLogs.map(normalizePugAbandonLog).filter(Boolean) as PugAbandonLog[] : [],
     pugEloRatings: Array.isArray(data.pugEloRatings) ? data.pugEloRatings.map(normalizePugEloRating).filter(Boolean) as PugEloRating[] : [],
@@ -768,6 +796,7 @@ function normalizeStore(data: Partial<StoreShape>): StoreShape {
   normalized.eventRegistrations = normalized.eventRegistrations.filter(
     (registration) => teamIds.has(registration.teamId) && eventIds.has(registration.eventId)
   );
+  normalized.eventBrackets = normalized.eventBrackets.filter((bracket) => eventIds.has(bracket.eventId));
 
   for (const team of normalized.teams) {
     const owner = normalized.members.find((member) => member.teamId === team.id && member.userId === team.ownerId);
