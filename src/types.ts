@@ -199,11 +199,31 @@ export type PugAbandonLog = {
   createdAt: string;
 };
 
+export type PugCaptainDraftState = {
+  captainIds: string[];
+  teams: string[][];
+  availablePlayerIds: string[];
+  currentCaptainIndex: number;
+  picksThisTurn: number;
+  messageId?: string;
+};
+
 export type PugMatchLog = {
   id: string;
   size: PugQueueSize;
   playerIds: string[];
   playerUsernames: Record<string, string>;
+  categoryId?: string;
+  queueVoiceChannelId?: string;
+  textChannelId?: string;
+  teamVoiceChannelIds?: string[];
+  playerRankLabels?: Record<string, string>;
+  playerRankRoleIds?: Record<string, string>;
+  modeVotes?: Record<string, PugTeamMode>;
+  modeVoteMessageId?: string;
+  captainDraft?: PugCaptainDraftState;
+  voteMessageId?: string;
+  voteStartedAt?: string;
   teams: string[][];
   captainIds: string[];
   mode?: PugTeamMode;

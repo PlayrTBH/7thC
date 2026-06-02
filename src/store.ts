@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugAbandonLog, PugAbandonSettings, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventRegistration, PugAbandonLog, PugAbandonSettings, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 import { DEVELOPER_DISCORD_USER_ID } from './config.js';
 
@@ -733,7 +733,18 @@ function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
     id: typeof match.id === 'string' ? match.id : cryptoRandomFallback(),
     size: match.size === 12 ? 12 : 6,
     playerIds: Array.isArray(match.playerIds) ? match.playerIds.filter((id): id is string => typeof id === 'string') : [],
-    playerUsernames: match.playerUsernames && typeof match.playerUsernames === 'object' && !Array.isArray(match.playerUsernames) ? Object.fromEntries(Object.entries(match.playerUsernames).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {},
+    playerUsernames: normalizeStringRecord(match.playerUsernames),
+    categoryId: typeof match.categoryId === 'string' ? match.categoryId : undefined,
+    queueVoiceChannelId: typeof match.queueVoiceChannelId === 'string' ? match.queueVoiceChannelId : undefined,
+    textChannelId: typeof match.textChannelId === 'string' ? match.textChannelId : undefined,
+    teamVoiceChannelIds: Array.isArray(match.teamVoiceChannelIds) ? match.teamVoiceChannelIds.filter((id): id is string => typeof id === 'string') : undefined,
+    playerRankLabels: normalizeStringRecord(match.playerRankLabels),
+    playerRankRoleIds: normalizeStringRecord(match.playerRankRoleIds),
+    modeVotes: normalizePugModeVotes(match.modeVotes),
+    modeVoteMessageId: typeof match.modeVoteMessageId === 'string' ? match.modeVoteMessageId : undefined,
+    captainDraft: normalizePugCaptainDraft(match.captainDraft),
+    voteMessageId: typeof match.voteMessageId === 'string' ? match.voteMessageId : undefined,
+    voteStartedAt: typeof match.voteStartedAt === 'string' ? match.voteStartedAt : undefined,
     teams: Array.isArray(match.teams) ? match.teams.map((team) => Array.isArray(team) ? team.filter((id): id is string => typeof id === 'string') : []) : [],
     captainIds: Array.isArray(match.captainIds) ? match.captainIds.filter((id): id is string => typeof id === 'string') : [],
     mode: match.mode === 'captains' || match.mode === 'random' ? match.mode : undefined,
@@ -747,6 +758,36 @@ function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
     createdAt: typeof match.createdAt === 'string' ? match.createdAt : now,
     updatedAt: typeof match.updatedAt === 'string' ? match.updatedAt : now,
     endedAt: typeof match.endedAt === 'string' ? match.endedAt : undefined
+  };
+}
+
+
+function normalizeStringRecord(value: unknown): Record<string, string> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+    : {};
+}
+
+function normalizePugModeVotes(value: unknown): Record<string, 'random' | 'captains'> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, 'random' | 'captains'] => entry[1] === 'random' || entry[1] === 'captains'))
+    : {};
+}
+
+function normalizePugCaptainDraft(value: unknown): PugCaptainDraftState | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const draft = value as Partial<PugCaptainDraftState>;
+  const captainIds = Array.isArray(draft.captainIds) ? draft.captainIds.filter((id): id is string => typeof id === 'string') : [];
+  const teams = Array.isArray(draft.teams) ? draft.teams.map((team) => Array.isArray(team) ? team.filter((id): id is string => typeof id === 'string') : []) : [];
+  const availablePlayerIds = Array.isArray(draft.availablePlayerIds) ? draft.availablePlayerIds.filter((id): id is string => typeof id === 'string') : [];
+  if (!captainIds.length && !teams.length && !availablePlayerIds.length) return undefined;
+  return {
+    captainIds,
+    teams,
+    availablePlayerIds,
+    currentCaptainIndex: typeof draft.currentCaptainIndex === 'number' && Number.isFinite(draft.currentCaptainIndex) ? Math.max(0, Math.round(draft.currentCaptainIndex)) : 0,
+    picksThisTurn: typeof draft.picksThisTurn === 'number' && Number.isFinite(draft.picksThisTurn) ? Math.max(0, Math.round(draft.picksThisTurn)) : 0,
+    messageId: typeof draft.messageId === 'string' ? draft.messageId : undefined
   };
 }
 
