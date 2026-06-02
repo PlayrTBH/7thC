@@ -32,7 +32,7 @@ const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
 const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
-const pugLobbyChannelNames = ['PUG Lobby 1', 'PUG Lobby 2'] as const;
+const pugLobbyChannelName = 'PUG Lobby';
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = { captainIds: string[]; teams: string[][]; availablePlayerIds: string[]; currentCaptainIndex: number; picksThisTurn: number; messageId?: string };
@@ -71,7 +71,7 @@ export class TeamBot {
   private pugQueueCountdownRefresh?: NodeJS.Timeout;
   private pugQueueMessageRefreshInFlight?: Promise<void>;
   private pugQueueMessageRefreshAgain = false;
-  private pugLobbyEnsureOperation?: Promise<VoiceChannel[]>;
+  private pugLobbyEnsureOperation?: Promise<VoiceChannel>;
   private pugLobbyReturnOperation: Promise<void> = Promise.resolve();
   private readonly teamCreationLocks = new Map<string, Promise<{ team: Team; invites: TeamInvite[] }>>();
   private restartOperation?: Promise<void>;
@@ -1406,8 +1406,7 @@ export class TeamBot {
   }
 
   private async selectPugReturnLobby(guild: Guild) {
-    const lobbies = await this.ensurePugLobbyChannels(guild);
-    return lobbies.reduce((leastPopulated, lobby) => (lobby.members.size < leastPopulated.members.size ? lobby : leastPopulated), lobbies[0]);
+    return this.ensurePugLobbyChannels(guild);
   }
 
   private async ensurePugLobbyChannels(guild: Guild) {
@@ -1421,24 +1420,13 @@ export class TeamBot {
   private async ensurePugLobbyChannelsUnlocked(guild: Guild) {
     const channels = await guild.channels.fetch();
     const existingVoiceChannels = channels.filter((channel): channel is VoiceChannel => channel?.type === ChannelType.GuildVoice);
-    const existingLobbies = new Map(pugLobbyChannelNames.map((name) => [name, existingVoiceChannels.find((channel) => channel.name === name)]));
-    const legacyLobby = existingVoiceChannels.find((channel) => channel.name === 'PUG Lobby');
+    const existingLobby = existingVoiceChannels.find((channel) => channel.name === pugLobbyChannelName);
+    if (existingLobby) return existingLobby;
 
-    if (!existingLobbies.get('PUG Lobby 1') && legacyLobby) {
-      const renamedLobby = await legacyLobby.setName('PUG Lobby 1', 'Persistent PUG lobby split into two voice channels').catch(() => legacyLobby);
-      existingLobbies.set('PUG Lobby 1', renamedLobby);
-    }
+    const splitLobby = existingVoiceChannels.find((channel) => channel.name === 'PUG Lobby 1') ?? existingVoiceChannels.find((channel) => channel.name === 'PUG Lobby 2');
+    if (splitLobby) return splitLobby.setName(pugLobbyChannelName, 'Persistent PUG lobby reverted to a single voice channel').catch(() => splitLobby);
 
-    const lobbies: VoiceChannel[] = [];
-    for (const name of pugLobbyChannelNames) {
-      const existingLobby = existingLobbies.get(name);
-      if (existingLobby) {
-        lobbies.push(existingLobby);
-        continue;
-      }
-      lobbies.push(await guild.channels.create({ name, type: ChannelType.GuildVoice, reason: 'Persistent PUG lobby channel created by queue system' }));
-    }
-    return lobbies;
+    return guild.channels.create({ name: pugLobbyChannelName, type: ChannelType.GuildVoice, reason: 'Persistent PUG lobby channel created by queue system' });
   }
 
   async ensureTeamRolesDisplayed() {
