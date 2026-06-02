@@ -78,6 +78,7 @@ export type DeveloperSettings = {
 export type PugEloSettings = {
   startingRating: number;
   baseChange: number;
+  fairLossPercentage: number;
   strength: number;
   finalRoundMultiplier: number;
   cashoutMultiplier: number;

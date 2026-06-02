@@ -1588,10 +1588,11 @@ function calculateAdminPugEloGain(playerRating: number, teamAverage: number, opp
   return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.min(MAXIMUM_PUG_ELO_GAIN, Math.round(settings.baseChange * teamFactor * playerFactor)));
 }
 
-function calculateAdminPugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, _settings: PugEloSettings) {
+function calculateAdminPugEloLoss(playerRating: number, _teamAverage: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
   const opponentRatio = opponentAverage > 0 ? playerRating / opponentAverage : MAXIMUM_PUG_ELO_LOSS_MULTIPLIER;
   const cappedRatio = Math.min(MAXIMUM_PUG_ELO_LOSS_MULTIPLIER, opponentRatio);
-  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
+  const baseLoss = Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
+  return Math.round(baseLoss * (settings.fairLossPercentage / 100));
 }
 
 function pugEloPreviewSummary(preview?: AdminPugEloPreviewTeam[]) {
@@ -1805,10 +1806,11 @@ function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, setting
 function pugEloAdminPanel(_ratings: PugEloRating[], settings: PugEloSettings, playerSearch: PugPlayerSearchState) {
   return `<div class="subsection">
     <h3>ELO formula settings</h3>
-    <p><small>Base gain controls the fair-match win reward; strength controls how quickly rewards shrink for favorites and grow for underdogs. Mode values then scale ELO impact, letting admins make Final Round or Cashout worth more or less. Cashout defaults to 1.25 and applies its 25% boost only to first-place and second-place rewards, not losses.</small></p>
+    <p><small>Base gain controls the fair-match win reward; fair-loss percentage controls how much of that value a fair-match loser loses; strength controls how quickly rewards shrink for favorites and grow for underdogs. Mode values then scale ELO impact, letting admins make Final Round or Cashout worth more or less. Cashout defaults to 1.25 and applies its 25% boost only to first-place and second-place rewards, not losses.</small></p>
     <form method="post" action="/administrator/pugs/elo/settings" class="inline-form">
       <label>Starting ELO <input name="startingRating" type="number" min="1" value="${settings.startingRating}" /></label>
       <label>Fair-win base <input name="baseChange" type="number" min="1" value="${settings.baseChange}" /></label>
+      <label>Fair-loss % <input name="fairLossPercentage" type="number" min="0" max="500" step="1" value="${formatMultiplierInput(settings.fairLossPercentage)}" /></label>
       <label>Strength <input name="strength" type="number" min="0.1" max="5" step="0.1" value="${settings.strength}" /></label>
       <label>Final Round value <input name="finalRoundMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings.finalRoundMultiplier)}" /></label>
       <label>Cashout value <input name="cashoutMultiplier" type="number" min="0" max="5" step="0.05" value="${formatMultiplierInput(settings.cashoutMultiplier)}" /></label>
@@ -2121,6 +2123,7 @@ function parsePugEloSettings(body: Record<string, unknown>): PugEloSettings {
   return {
     startingRating: parsePositiveInteger(body.startingRating, 'Starting ELO', 1),
     baseChange: parsePositiveInteger(body.baseChange, 'Base ELO gain', 1),
+    fairLossPercentage: parseDecimalInRange(body.fairLossPercentage, 'Fair-loss percentage', 0, 500),
     strength: parseDecimalInRange(body.strength, 'ELO strength', 0.1, 5),
     finalRoundMultiplier: parseDecimalInRange(body.finalRoundMultiplier, 'Final Round ELO value', 0, 5),
     cashoutMultiplier: parseDecimalInRange(body.cashoutMultiplier, 'Cashout ELO value', 0, 5)
