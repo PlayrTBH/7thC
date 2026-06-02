@@ -304,7 +304,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getActivePugSeason(),
         store.getPugSeasonLeaderboards()
       ]);
-      const topMasterUserIds = getTopMasterUserIds(allRatings);
+      const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterPlayerCount);
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
       const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
       const decoratedLeaderboard = leaderboard.map((rating) => {
@@ -559,7 +559,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
     try {
       const existing = (await store.getAdministratorSettings()).pugs;
       const ranks = parsePugRankSettings(req.body);
-      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, ranks, seasons: existing?.seasons });
+      await store.updatePugSettings({ queueChannelId: existing?.queueChannelId, queueMessageId: existing?.queueMessageId, mapPool: existing?.mapPool ?? [], elo: existing?.elo, abandons: existing?.abandons, ranks, seasons: existing?.seasons });
       await bot.syncPugRankRoles();
       res.redirect('/administrator/ranks');
     } catch (error) {
@@ -581,7 +581,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getPugUserBadgeSelection(userId)
       ]);
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
-      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings));
+      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings, rankSettings.masterPlayerCount));
       const profile = profiles[0];
       res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
     } catch (error) {
@@ -1790,8 +1790,8 @@ function isDeveloperAccount(userId: string) {
   return userId === DEVELOPER_DISCORD_USER_ID;
 }
 
-function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[]) {
-  return new Set(ratings.filter((rating) => !isDeveloperAccount(rating.userId)).slice(0, 3).map((rating) => rating.userId));
+function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[], count: number) {
+  return new Set(ratings.filter((rating) => !isDeveloperAccount(rating.userId)).slice(0, Math.max(0, count)).map((rating) => rating.userId));
 }
 
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugPlayerRank {
@@ -1914,7 +1914,7 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
     total: modes.reduce((sum, mode) => sum + mode.total, 0),
     winRate: 0
   });
-  const fallbackRanks: PugRankSettings = { ranks: [{ id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 }] };
+  const fallbackRanks: PugRankSettings = { ranks: [{ id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 }], masterPlayerCount: 3 };
   return { player, modes, totals, rank: resolvePugRank(player, rankSettings ?? fallbackRanks, topMasterUserIds) };
 }
 
@@ -2038,7 +2038,7 @@ function administratorRanksPage(settings: PugRankSettings) {
   return `<p><a href="/administrator">← Back to administrator</a></p>
   <section class="card">
     <h2>Rank values and icons</h2>
-    <p><small>Adjust ELO ranges and upload optional rank icons. Leave an icon blank to show an empty placeholder. Master Infernal (M1) is always assigned dynamically to the current top three leaderboard players.</small></p>
+    <p><small>Adjust ELO ranges and upload optional rank icons. Leave an icon blank to show an empty placeholder. Master Infernal (M1) is assigned dynamically to the configured number of top leaderboard players.</small></p>
     <form method="post" action="/administrator/ranks" class="rank-admin-form">
       <div class="rank-admin-list">
         ${settings.ranks.map((rank, index) => rankEditorRow(rank, index)).join('')}
@@ -2046,7 +2046,8 @@ function administratorRanksPage(settings: PugRankSettings) {
       <div class="rank-editor-row master-rank-editor" data-rank-icon-field>
         <div>
           <h3>Master Infernal <span class="pill">M1</span></h3>
-          <p><small>Dynamic rank for the top 3 players on the leaderboard. Its ELO range is not editable.</small></p>
+          <p><small>Dynamic rank for the top N players on the leaderboard. Its ELO range is not editable.</small></p>
+          <label>Top players <input name="masterPlayerCount" type="number" min="0" step="1" required value="${settings.masterPlayerCount}" /></label>
         </div>
         <div class="rank-icon-editor">
           <input type="hidden" name="masterIconDataUrl" value="${escapeHtml(settings.masterIconDataUrl ?? '')}" data-rank-icon-data />
@@ -2099,7 +2100,8 @@ function parsePugRankSettings(body: Record<string, unknown>): PugRankSettings {
   });
   if (!ranks.length) throw new Error('At least one rank is required.');
   const masterIconDataUrl = parseOptionalRankIcon(String(body.masterIconDataUrl ?? ''));
-  return { ranks, masterIconDataUrl };
+  const masterPlayerCount = parsePositiveInteger(body.masterPlayerCount, 'Master Infernal top players', 0);
+  return { ranks, masterIconDataUrl, masterPlayerCount };
 }
 
 function formArray(value: unknown) {
