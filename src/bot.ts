@@ -631,33 +631,40 @@ export class TeamBot {
     const profilesByUserId = new Map(profiles.map((profile) => [profile.userId, profile]));
     const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterPlayerCount);
     const updatedAt = Math.floor(Date.now() / 1000);
-    const embed = new EmbedBuilder()
-      .setTitle('PUG ELO Leaderboard')
-      .setColor(0xc90820)
-      .setDescription(leaderboard.length ? 'Top 10 players by current PUG ELO.' : 'No PUG ELO ratings have been recorded yet.')
-      .setFooter({ text: 'Updates automatically every few hours' })
-      .setTimestamp(new Date());
+    if (!leaderboard.length) {
+      const emptyEmbed = new EmbedBuilder()
+        .setTitle('PUG ELO Leaderboard')
+        .setColor(0xc90820)
+        .setDescription('No PUG ELO ratings have been recorded yet.')
+        .setFooter({ text: 'Updates automatically every few hours' })
+        .setTimestamp(new Date());
+      return { embeds: [emptyEmbed], allowedMentions: { parse: [] } };
+    }
 
-    const topProfile = leaderboard[0] ? profilesByUserId.get(leaderboard[0].userId) : undefined;
-    if (topProfile?.avatarUrl) embed.setThumbnail(topProfile.avatarUrl);
-
-    embed.addFields(
-      leaderboard.map((rating, index) => {
-        const profile = profilesByUserId.get(rating.userId);
-        const displayName = profile?.displayName ?? rating.username ?? rating.userId;
-        const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
-        const rankEmblem = rankEmojis.get(rank.id) ?? rank.abbreviation ?? rank.label;
-        const avatar = profile?.avatarUrl ? ` • [Profile picture](${profile.avatarUrl})` : '';
-        return {
+    const embeds = leaderboard.map((rating, index) => {
+      const profile = profilesByUserId.get(rating.userId);
+      const displayName = profile?.displayName ?? rating.username ?? rating.userId;
+      const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
+      const rankEmblem = rankEmojis.get(rank.id) ?? rank.abbreviation ?? rank.label;
+      const embed = new EmbedBuilder()
+        .setColor(0xc90820)
+        .setAuthor({
           name: `#${index + 1} ${rankEmblem} ${displayName}`.slice(0, 256),
-          value: `<@${rating.userId}>${avatar}\nRank: **${rank.label}** • ELO: **${formatElo(rating.rating)}**`,
-          inline: false
-        };
-      })
-    );
-    embed.addFields({ name: 'Last updated', value: `<t:${updatedAt}:R>`, inline: false });
+          iconURL: profile?.avatarUrl || undefined
+        })
+        .setDescription(`<@${rating.userId}> • ${rank.label} • **${formatElo(rating.rating)} ELO**`);
 
-    return { embeds: [embed], allowedMentions: { parse: [] } };
+      if (index === 0) {
+        embed
+          .setTitle('PUG ELO Leaderboard')
+          .setFooter({ text: `Top 10 • Last updated <t:${updatedAt}:R> • Updates automatically every few hours` })
+          .setTimestamp(new Date());
+      }
+
+      return embed;
+    });
+
+    return { embeds, allowedMentions: { parse: [] } };
   }
 
   private buildPugQueueMessage() {
