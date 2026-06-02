@@ -36,6 +36,8 @@ const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 const PUG_LEADERBOARD_REFRESH_MS = 3 * 60 * 60 * 1000;
 const pugCategoryName = 'Pugs';
 const pugLeaderboardChannelName = 'leaderboard';
+const pugRankRoleBelowRoleId = '1511123747992506419';
+const pugRankRoleAboveRoleId = '1509280792474419230';
 const pugLobbyChannelBaseName = 'PUG Lobby';
 const pugLobbyChannelNamePattern = /^PUG Lobby(?: - \d+ in-match)?$/;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
@@ -2261,11 +2263,20 @@ export class TeamBot {
     const highestManageablePosition = me.roles.highest.position - 1;
     if (highestManageablePosition < 1) return;
 
+    const belowRole = roles.get(pugRankRoleBelowRoleId);
+    const aboveRole = roles.get(pugRankRoleAboveRoleId);
     const teamRoles = teamRoleIds.map((roleId) => roles.get(roleId)).filter((role): role is Role => Boolean(role));
     const highestTeamRolePosition = teamRoles.length ? Math.max(...teamRoles.map((role) => role.position)) : 0;
-    const lowestDesiredPosition = Math.max(1, highestTeamRolePosition + 1);
-    const highestFittingStartPosition = Math.max(1, highestManageablePosition - editableRankRoles.length + 1);
+    const lowestDesiredPosition = Math.max(1, highestTeamRolePosition + 1, aboveRole ? aboveRole.position + 1 : 1);
+    const highestDesiredPosition = Math.min(highestManageablePosition, belowRole ? belowRole.position - 1 : highestManageablePosition);
+    const highestFittingStartPosition = Math.max(1, highestDesiredPosition - editableRankRoles.length + 1);
     const startPosition = Math.min(lowestDesiredPosition, highestFittingStartPosition);
+
+    if (!belowRole) console.warn(`Unable to find configured PUG rank upper boundary role ${pugRankRoleBelowRoleId}; rank roles will be placed as high as the bot can manage.`);
+    if (!aboveRole) console.warn(`Unable to find configured PUG rank lower boundary role ${pugRankRoleAboveRoleId}; rank roles will only use team role placement as their lower bound.`);
+    if (lowestDesiredPosition > highestDesiredPosition) {
+      console.warn('Configured PUG rank role boundaries do not leave enough manageable space; placing rank roles as close to the requested range as possible.');
+    }
 
     await Promise.all(editableRankRoles.map((role) => role.hoist
       ? role.setHoist(false, 'PUG rank roles are not displayed separately by 7th Circle Team Hub')
