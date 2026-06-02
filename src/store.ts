@@ -808,7 +808,10 @@ function normalizePugSettings(settings: Partial<PugSettings> | undefined): PugSe
 }
 
 
+const DEFAULT_MASTER_PLAYER_COUNT = 3;
+
 const defaultPugRanks: PugRankSettings = {
+  masterPlayerCount: DEFAULT_MASTER_PLAYER_COUNT,
   ranks: [
     { id: 'bronze', label: 'Bronze', abbreviation: 'B', minRating: 0, maxRating: 14999 },
     { id: 'silver', label: 'Silver', abbreviation: 'S', minRating: 15000, maxRating: 19999 },
@@ -829,9 +832,13 @@ function normalizePugAbandonSettings(settings: Partial<PugAbandonSettings> | und
 function normalizePugRankSettings(settings: Partial<PugRankSettings> | undefined): PugRankSettings {
   const ranks = Array.isArray(settings?.ranks) ? settings.ranks.map(normalizePugRankDefinition).filter(Boolean) as PugRankSettings['ranks'] : [];
   const safeRanks = (ranks.length ? ranks : defaultPugRanks.ranks).sort((a, b) => a.minRating - b.minRating || a.label.localeCompare(b.label));
+  const masterPlayerCount = typeof settings?.masterPlayerCount === 'number' && Number.isFinite(settings.masterPlayerCount)
+    ? Math.max(0, Math.round(settings.masterPlayerCount))
+    : DEFAULT_MASTER_PLAYER_COUNT;
   return {
     ranks: safeRanks,
-    masterIconDataUrl: isImageDataUrl(settings?.masterIconDataUrl) ? settings.masterIconDataUrl : undefined
+    masterIconDataUrl: isImageDataUrl(settings?.masterIconDataUrl) ? settings.masterIconDataUrl : undefined,
+    masterPlayerCount
   };
 }
 
@@ -1002,7 +1009,7 @@ function finalizeActivePugSeason(data: StoreShape, endedAt: string, nextSeasonLa
   const eloSettings = normalizePugEloSettings(data.settings.pugs?.elo);
   const sortedRatings = [...data.pugEloRatings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
   const publicSortedRatings = sortedRatings.filter((rating) => !isDeveloperAccount(rating.userId));
-  const masterUserIds = new Set(publicSortedRatings.slice(0, 3).map((rating) => rating.userId));
+  const masterUserIds = new Set(publicSortedRatings.slice(0, rankSettings.masterPlayerCount).map((rating) => rating.userId));
   const rewards = completeSeasonBadgeRewards(activeSeason, rankSettings);
 
   data.pugSeasonLeaderboards = data.pugSeasonLeaderboards.filter((entry) => entry.seasonId !== activeSeason.id);

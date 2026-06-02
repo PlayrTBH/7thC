@@ -100,6 +100,7 @@ export type PugRankDefinition = {
 export type PugRankSettings = {
   ranks: PugRankDefinition[];
   masterIconDataUrl?: string;
+  masterPlayerCount: number;
 };
 
 export type PugSettings = {
