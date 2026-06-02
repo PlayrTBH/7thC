@@ -641,30 +641,25 @@ export class TeamBot {
       return { embeds: [emptyEmbed], allowedMentions: { parse: [] } };
     }
 
-    const embeds = leaderboard.map((rating, index) => {
+    const lines = leaderboard.map((rating, index) => {
       const profile = profilesByUserId.get(rating.userId);
       const displayName = profile?.displayName ?? rating.username ?? rating.userId;
       const rank = resolvePugRank(rating, rankSettings, topMasterUserIds);
       const rankEmblem = rankEmojis.get(rank.id) ?? rank.abbreviation ?? rank.label;
-      const embed = new EmbedBuilder()
-        .setColor(0xc90820)
-        .setAuthor({
-          name: `#${index + 1} ${rankEmblem} ${displayName}`.slice(0, 256),
-          iconURL: profile?.avatarUrl || undefined
-        })
-        .setDescription(`<@${rating.userId}> • ${rank.label} • **${formatElo(rating.rating)} ELO**`);
-
-      if (index === 0) {
-        embed
-          .setTitle('PUG ELO Leaderboard')
-          .setFooter({ text: `Top 10 • Last updated <t:${updatedAt}:R> • Updates automatically every few hours` })
-          .setTimestamp(new Date());
-      }
-
-      return embed;
+      return `**#${index + 1}** ${rankEmblem} <@${rating.userId}> — ${escapeDiscordMarkdown(displayName)}\n${rank.label} • **${formatElo(rating.rating)} ELO**`;
     });
 
-    return { embeds, allowedMentions: { parse: [] } };
+    const embed = new EmbedBuilder()
+      .setTitle('PUG ELO Leaderboard')
+      .setColor(0xc90820)
+      .setDescription(`${lines.join('\n\n')}\n\n_Last updated <t:${updatedAt}:R>._`)
+      .setFooter({ text: 'Top 10 • Updates automatically every few hours' })
+      .setTimestamp(new Date());
+
+    const leaderProfile = profilesByUserId.get(leaderboard[0]?.userId);
+    if (leaderProfile?.avatarUrl) embed.setThumbnail(leaderProfile.avatarUrl);
+
+    return { embeds: [embed], allowedMentions: { parse: [] } };
   }
 
   private buildPugQueueMessage() {
@@ -2541,6 +2536,9 @@ function formatElo(rating: number) {
   return Math.round(rating).toLocaleString('en-US');
 }
 
+function escapeDiscordMarkdown(value: string) {
+  return value.replace(/([\\*_~`|])/g, '\\$1');
+}
 
 function formatPugRankTransition(transition?: PugRankTransition) {
   if (!transition) return undefined;
