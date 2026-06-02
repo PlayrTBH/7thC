@@ -76,6 +76,8 @@ export class TeamBot {
   private pugQueueCountdownRefresh?: NodeJS.Timeout;
   private pugQueueMessageRefreshInFlight?: Promise<void>;
   private pugQueueMessageRefreshAgain = false;
+  private pugQueueMessageRefreshRequested = false;
+  private pugQueueMessageRefreshRequestedMessage?: import('discord.js').Message;
   private pugLobbyEnsureOperation?: Promise<VoiceChannel>;
   private pugLobbyReturnOperation: Promise<void> = Promise.resolve();
   private pugLeaderboardRefresh?: NodeJS.Timeout;
@@ -730,10 +732,21 @@ export class TeamBot {
     }, PUG_QUEUE_COUNTDOWN_REFRESH_MS);
   }
 
+  private requestPugQueueMessageRefresh(message?: import('discord.js').Message) {
+    if (message) this.pugQueueMessageRefreshRequestedMessage = message;
+    if (this.pugQueueMessageRefreshRequested) return;
+    this.pugQueueMessageRefreshRequested = true;
+    queueMicrotask(() => {
+      this.pugQueueMessageRefreshRequested = false;
+      const requestedMessage = this.pugQueueMessageRefreshRequestedMessage;
+      this.pugQueueMessageRefreshRequestedMessage = undefined;
+      this.refreshPugQueueMessage(requestedMessage).catch((error) => console.warn('Unable to refresh PUG queue message:', error));
+    });
+  }
+
   private async refreshPugQueueMessage(message?: import('discord.js').Message) {
     if (this.pugQueueMessageRefreshInFlight) {
       this.pugQueueMessageRefreshAgain = true;
-      await this.pugQueueMessageRefreshInFlight;
       return;
     }
 
@@ -811,7 +824,10 @@ export class TeamBot {
       ? interaction.member
       : guild.members.cache.get(interaction.user.id) ?? (await guild.members.fetch(interaction.user.id).catch(() => null));
     if (!member || member.user.bot) throw new Error('Only server members can join the PUG queue.');
-    const activeBlock = await this.store.getPugActiveAbandonBlock(member.id);
+    const [activeBlock, voiceState] = await Promise.all([
+      this.store.getPugActiveAbandonBlock(member.id),
+      this.fetchPugMemberVoiceState(guild, member.id)
+    ]);
     if (activeBlock?.blockedUntil) {
       throw new Error(`You are temporarily blocked from PUG queues until ${new Date(activeBlock.blockedUntil).toLocaleString('en-US', { timeZone: 'UTC' })} UTC because of a recent abandon.`);
     }
@@ -823,15 +839,14 @@ export class TeamBot {
         if (!players.length) this.pugQueues.delete(queueSize);
       }
 
-      const { channelId } = await this.fetchPugMemberVoiceState(guild, member.id);
       const queue = this.pugQueues.get(size) ?? [];
-      queue.push({ userId: member.id, username: member.user.username, voiceChannelId: channelId ?? undefined });
+      queue.push({ userId: member.id, username: member.user.username, voiceChannelId: voiceState.channelId ?? undefined });
       this.pugQueues.set(size, queue);
       for (const queueSize of pugQueueSizes) this.updatePugQueueCountdown(queueSize);
 
     });
 
-    await this.refreshPugQueueMessage(interaction.message);
+    this.requestPugQueueMessageRefresh(interaction.message);
   }
 
   private async leavePugQueue(interaction: import('discord.js').ButtonInteraction, size: PugQueueSize) {
@@ -842,7 +857,7 @@ export class TeamBot {
       else this.pugQueues.delete(size);
       this.updatePugQueueCountdown(size);
     });
-    await this.refreshPugQueueMessage(interaction.message);
+    this.requestPugQueueMessageRefresh(interaction.message);
   }
 
   private updatePugQueueCountdown(size: PugQueueSize) {
@@ -870,7 +885,7 @@ export class TeamBot {
 
   private async finishPugQueueCountdown(size: PugQueueSize) {
     const guild = await this.getGuild();
-    const matchesToStart = await this.withPugQueueLock(async () => {
+    const countdownResult = await this.withPugQueueLock(async () => {
       const countdown = this.pugQueueCountdowns.get(size);
       if (countdown) {
         clearTimeout(countdown.timer);
@@ -882,16 +897,19 @@ export class TeamBot {
       const matchCount = Math.floor(queue.length / size);
       if (matchCount <= 0) {
         this.updatePugQueueCountdown(size);
-        return [] as PugQueuedPlayer[][];
+        return { playersForMatches: [] as PugQueuedPlayer[], matchCount: 0 };
       }
 
       const playersForMatches = queue.splice(0, matchCount * size);
       if (queue.length) this.pugQueues.set(size, queue);
       else this.pugQueues.delete(size);
-      const balancedMatches = await this.createEloBalancedPugMatches(playersForMatches, size, matchCount);
       this.updatePugQueueCountdown(size);
-      return balancedMatches;
+      return { playersForMatches, matchCount };
     });
+
+    const matchesToStart = countdownResult.playersForMatches.length
+      ? await this.createEloBalancedPugMatches(countdownResult.playersForMatches, size, countdownResult.matchCount)
+      : [];
 
     this.schedulePugQueueMessageRefresh(0);
     for (const players of matchesToStart) {
