@@ -359,6 +359,76 @@ export class JsonStore {
     });
   }
 
+  async recalculatePugEloHistory() {
+    await this.update((data) => {
+      const settings = normalizePugEloSettings(data.settings.pugs?.elo);
+      const now = new Date().toISOString();
+      const seasonId = getActivePugSeason(data).id;
+      const ratings = new Map<string, PugEloRating>(data.pugEloRatings.map((rating) => [rating.userId, { ...rating, rating: settings.startingRating, peakRating: settings.startingRating, seasonId, updatedAt: now }]));
+
+      const ensureRating = (userId: string, username?: string, updatedAt = now) => {
+        const existing = ratings.get(userId);
+        if (existing) {
+          if (username) existing.username = username;
+          return existing;
+        }
+        const rating: PugEloRating = { userId, username, rating: settings.startingRating, peakRating: settings.startingRating, seasonId, updatedAt };
+        ratings.set(userId, rating);
+        return rating;
+      };
+
+      const events = [
+        ...data.pugMatchLogs.map((match) => ({ type: 'match' as const, createdAt: match.endedAt ?? match.updatedAt ?? match.createdAt, match })),
+        ...(data.pugAbandonLogs ?? []).map((log) => ({ type: 'abandon' as const, createdAt: log.createdAt, log }))
+      ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+      for (const event of events) {
+        if (event.type === 'abandon') {
+          const log = event.log;
+          if (log.eloPenalty <= 0) {
+            log.ratingBefore = undefined;
+            log.ratingAfter = undefined;
+            continue;
+          }
+          const rating = ensureRating(log.userId, log.username, log.createdAt);
+          const before = rating.rating;
+          const after = Math.max(0, Math.round(before - log.eloPenalty));
+          rating.rating = after;
+          rating.peakRating = Math.max(rating.peakRating ?? settings.startingRating, before, after);
+          rating.updatedAt = now;
+          log.ratingBefore = before;
+          log.ratingAfter = after;
+          continue;
+        }
+
+        const match = event.match;
+        if (match.status !== 'completed') continue;
+        if (!match.teams.length || !match.result) continue;
+        for (const userId of match.playerIds) ensureRating(userId, match.playerUsernames[userId], match.createdAt);
+        for (const team of match.teams) for (const userId of team) ensureRating(userId, match.playerUsernames[userId], match.createdAt);
+
+        const placements = parsePugResultPlacements(match.result, match.teams.length);
+        const teamTotals = match.teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
+        const changes = calculatePugEloChanges(match.teams, placements, ratings, match.playerUsernames, settings, match.size);
+        match.teamEloTotals = teamTotals;
+        match.eloChanges = changes;
+        match.updatedAt = now;
+
+        for (const change of changes) {
+          const rating = ensureRating(change.userId, change.username, now);
+          rating.rating = change.after;
+          rating.peakRating = Math.max(rating.peakRating ?? change.before, change.before, change.after);
+          rating.seasonId = seasonId;
+          if (change.username) rating.username = change.username;
+          rating.updatedAt = now;
+        }
+      }
+
+      data.pugEloRatings = [...ratings.values()].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
+      return data;
+    });
+  }
+
   async applyPugEloChanges(changes: PugEloChange[]) {
     await this.update((data) => {
       const now = new Date().toISOString();
@@ -858,6 +928,75 @@ function normalizePugRankDefinition(rank: Partial<PugRankSettings['ranks'][numbe
 
 function isImageDataUrl(value: unknown): value is string {
   return typeof value === 'string' && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(value) && value.length <= 1_000_000;
+}
+
+function parsePugResultPlacements(result: string, teamCount: number) {
+  const placements = Array.from({ length: teamCount }, () => teamCount);
+  const indexes = [...result.matchAll(/Team\s+(\d+)/gi)].map((match) => Number(match[1]) - 1).filter((index) => Number.isInteger(index) && index >= 0 && index < teamCount);
+  if (indexes[0] !== undefined) placements[indexes[0]] = 1;
+  if (teamCount > 2 && indexes[1] !== undefined && indexes[1] !== indexes[0]) placements[indexes[1]] = 2;
+  for (const [index] of placements.entries()) {
+    if (placements[index] === teamCount) placements[index] = teamCount === 2 ? 2 : 3;
+  }
+  return placements;
+}
+
+function calculatePugEloChanges(
+  teams: string[][],
+  placements: number[],
+  ratings: Map<string, PugEloRating>,
+  playerUsernames: Record<string, string>,
+  settings: PugEloSettings,
+  size: PugMatchLog['size']
+): PugEloChange[] {
+  const teamTotals = teams.map((team) => team.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0));
+  return teams.flatMap((team, teamIndex) => {
+    const teamAverage = teamTotals[teamIndex] / Math.max(1, team.length);
+    const opponents = teams.flatMap((otherTeam, otherIndex) => otherIndex === teamIndex ? [] : otherTeam);
+    const opponentAverage = opponents.reduce((sum, userId) => sum + (ratings.get(userId)?.rating ?? settings.startingRating), 0) / Math.max(1, opponents.length);
+    const placement = placements[teamIndex] ?? teams.length;
+    return team.map((userId) => {
+      const before = ratings.get(userId)?.rating ?? settings.startingRating;
+      const possibleGain = calculatePugEloGain(before, teamAverage, opponentAverage, settings);
+      const baseDelta = placement === 1
+        ? possibleGain
+        : placement === 2 && teams.length > 2
+          ? Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain / 2))
+          : -calculatePugEloLoss(before, opponentAverage, possibleGain, settings);
+      const delta = Math.round(baseDelta * getPugEloValueMultiplier(settings, size, baseDelta));
+      return {
+        userId,
+        username: playerUsernames[userId] ?? ratings.get(userId)?.username,
+        teamIndex,
+        placement,
+        before,
+        after: Math.max(0, before + delta),
+        delta
+      };
+    });
+  });
+}
+
+function getPugEloValueMultiplier(settings: PugEloSettings, size: PugMatchLog['size'], delta: number) {
+  if (size === 12 && delta <= 0) return 1;
+  return size === 12 ? settings.cashoutMultiplier : settings.finalRoundMultiplier;
+}
+
+const MINIMUM_PUG_ELO_CHANGE = 200;
+const MAXIMUM_PUG_ELO_GAIN = 2000;
+const MAXIMUM_PUG_ELO_LOSS_MULTIPLIER = 2;
+
+function calculatePugEloGain(playerRating: number, teamAverage: number, opponentAverage: number, settings: PugEloSettings) {
+  const teamFactor = Math.exp(((opponentAverage - teamAverage) / settings.startingRating) * settings.strength);
+  const playerFactor = Math.exp(((teamAverage - playerRating) / (settings.startingRating * 2)) * settings.strength);
+  return Math.max(MINIMUM_PUG_ELO_CHANGE, Math.min(MAXIMUM_PUG_ELO_GAIN, Math.round(settings.baseChange * teamFactor * playerFactor)));
+}
+
+function calculatePugEloLoss(playerRating: number, opponentAverage: number, possibleGain: number, settings: PugEloSettings) {
+  const opponentRatio = opponentAverage > 0 ? playerRating / opponentAverage : MAXIMUM_PUG_ELO_LOSS_MULTIPLIER;
+  const cappedRatio = Math.min(MAXIMUM_PUG_ELO_LOSS_MULTIPLIER, opponentRatio);
+  const baseLoss = Math.max(MINIMUM_PUG_ELO_CHANGE, Math.round(possibleGain * cappedRatio));
+  return Math.round(baseLoss * (settings.fairLossPercentage / 100));
 }
 
 function normalizePugEloSettings(settings: Partial<PugEloSettings> | undefined): PugEloSettings {
