@@ -634,7 +634,7 @@ export class TeamBot {
       this.ensurePugRankEmojis(guild)
     ]);
     const profilesByUserId = new Map(profiles.map((profile) => [profile.userId, profile]));
-    const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterPlayerCount);
+    const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
     const updatedAt = Math.floor(Date.now() / 1000);
     if (!leaderboard.length) {
       const emptyEmbed = new EmbedBuilder()
@@ -984,7 +984,7 @@ export class TeamBot {
 
   private async buildPugPlayerRanks(guild: Guild, playerIds: string[]) {
     const [ratings, rankSettings, rankRoles, rankEmojis] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings(), this.ensurePugRankRoles(guild), this.ensurePugRankEmojis(guild)]);
-    const topMasterUserIds = getTopMasterUserIds(ratings, rankSettings.masterPlayerCount);
+    const topMasterUserIds = getTopMasterUserIds(ratings, rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const labels = new Map<string, string>();
     const roleIds = new Map<string, string>();
@@ -1574,8 +1574,8 @@ export class TeamBot {
       afterRatings.set(change.userId, { ...afterRatings.get(change.userId), userId: change.userId, username, rating: change.after, updatedAt: afterRatings.get(change.userId)?.updatedAt ?? new Date().toISOString() });
     }
 
-    const beforeTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...beforeRatings.values()]), rankSettings.masterPlayerCount);
-    const afterTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...afterRatings.values()]), rankSettings.masterPlayerCount);
+    const beforeTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...beforeRatings.values()]), rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
+    const afterTopMasterUserIds = getTopMasterUserIds(sortPugRatingsForRankResolution([...afterRatings.values()]), rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
     const transitions = new Map<string, PugRankTransition>();
     for (const change of changes) {
       transitions.set(change.userId, {
@@ -2328,7 +2328,7 @@ export class TeamBot {
     const guild = await this.getGuild();
     const rankRoles = await this.ensurePugRankRoles(guild);
     const [ratings, rankSettings] = await Promise.all([this.store.getPugEloRatings(), this.store.getPugRankSettings()]);
-    const topMasterUserIds = getTopMasterUserIds(ratings, rankSettings.masterPlayerCount);
+    const topMasterUserIds = getTopMasterUserIds(ratings, rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
     const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating]));
     const assignments = new Map<string, string>();
     for (const userId of new Set(userIds)) {
@@ -2691,7 +2691,7 @@ function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[], count: num
 }
 
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugRankDefinition {
-  if (!isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl };
+  if (settings.masterEnabled && !isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: 0, iconDataUrl: settings.masterIconDataUrl };
   const ranks = settings.ranks.length ? settings.ranks : [];
   return [...ranks].reverse().find((item) => rating.rating >= item.minRating && (item.maxRating === undefined || rating.rating <= item.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
 }

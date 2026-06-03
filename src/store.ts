@@ -935,6 +935,7 @@ const DEFAULT_MASTER_PLAYER_COUNT = 3;
 
 const defaultPugRanks: PugRankSettings = {
   masterPlayerCount: DEFAULT_MASTER_PLAYER_COUNT,
+  masterEnabled: true,
   ranks: [
     { id: 'bronze', label: 'Bronze', abbreviation: 'B', minRating: 0, maxRating: 14999 },
     { id: 'silver', label: 'Silver', abbreviation: 'S', minRating: 15000, maxRating: 19999 },
@@ -961,7 +962,8 @@ function normalizePugRankSettings(settings: Partial<PugRankSettings> | undefined
   return {
     ranks: safeRanks,
     masterIconDataUrl: isImageDataUrl(settings?.masterIconDataUrl) ? settings.masterIconDataUrl : undefined,
-    masterPlayerCount
+    masterPlayerCount,
+    masterEnabled: typeof settings?.masterEnabled === 'boolean' ? settings.masterEnabled : true
   };
 }
 
@@ -1203,7 +1205,9 @@ function finalizeActivePugSeason(data: StoreShape, endedAt: string, nextSeasonLa
   const eloSettings = normalizePugEloSettings(data.settings.pugs?.elo);
   const sortedRatings = [...data.pugEloRatings].sort((a, b) => b.rating - a.rating || (a.username ?? a.userId).localeCompare(b.username ?? b.userId));
   const publicSortedRatings = sortedRatings.filter((rating) => !isDeveloperAccount(rating.userId));
-  const masterUserIds = new Set(publicSortedRatings.slice(0, rankSettings.masterPlayerCount).map((rating) => rating.userId));
+  const masterUserIds = rankSettings.masterEnabled
+    ? new Set(publicSortedRatings.slice(0, rankSettings.masterPlayerCount).map((rating) => rating.userId))
+    : new Set<string>();
   const rewards = completeSeasonBadgeRewards(activeSeason, rankSettings);
 
   data.pugSeasonLeaderboards = data.pugSeasonLeaderboards.filter((entry) => entry.seasonId !== activeSeason.id);
@@ -1252,7 +1256,7 @@ function defaultBadgeReward(season: Pick<PugSeason, 'label'>, rank: Pick<PugRank
 }
 
 function resolveSeasonRank(rating: number, settings: PugRankSettings, isMaster: boolean) {
-  if (isMaster) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating, iconDataUrl: settings.masterIconDataUrl };
+  if (settings.masterEnabled && isMaster) return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating, iconDataUrl: settings.masterIconDataUrl };
   const ranks = settings.ranks.filter((rank) => rank.id !== 'master-infernal');
   return [...ranks].reverse().find((rank) => rating >= rank.minRating && (rank.maxRating === undefined || rating <= rank.maxRating)) ?? ranks[0] ?? { id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 };
 }

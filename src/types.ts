@@ -146,6 +146,7 @@ export type PugRankSettings = {
   ranks: PugRankDefinition[];
   masterIconDataUrl?: string;
   masterPlayerCount: number;
+  masterEnabled: boolean;
 };
 
 export type PugSettings = {
