@@ -1541,9 +1541,8 @@ function parseDateTimeInput(value: unknown, label: string) {
 }
 
 function buildCashoutCupBracket(event: Event, teamIds: string[], now: string): EventBracket {
-  const maps = uniqueMapPool(event.bracketMapPool?.length ? event.bracketMapPool : ['Map TBD']);
-  const roundMaps = randomMapRotation(maps, 4);
-  const rounds = roundMaps.map((map, index) => buildCashoutQualifyingRound(index + 1, map, teamIds));
+  const maps = event.bracketMapPool?.length ? event.bracketMapPool : ['Map TBD'];
+  const rounds = Array.from({ length: 4 }, (_, index) => buildCashoutQualifyingRound(index + 1, pickCashoutMap(maps), teamIds));
   return {
     eventId: event.id,
     type: 'cashout-cup',
@@ -1552,6 +1551,10 @@ function buildCashoutCupBracket(event: Event, teamIds: string[], now: string): E
     createdAt: now,
     updatedAt: now
   };
+}
+
+function pickCashoutMap(pool: string[]) {
+  return pool[crypto.randomInt(pool.length)] ?? 'Map TBD';
 }
 
 function buildCashoutQualifyingRound(index: number, map: string, teamIds: string[]) {
@@ -1565,55 +1568,6 @@ function buildCashoutQualifyingRound(index: number, map: string, teamIds: string
     brackets.push({ id: `round-${index}-bracket-${Math.floor(i / 4) + 1}`, teamIds: playingTeams.slice(i, i + 4) });
   }
   return { index, map, brackets, sitOutTeamIds, status: 'pending' as const };
-}
-
-function uniqueMapPool(mapPool: string[]) {
-  const maps: string[] = [];
-  const seenMaps = new Set<string>();
-  for (const map of mapPool.map((item) => item.trim()).filter(Boolean)) {
-    if (seenMaps.has(map)) continue;
-    seenMaps.add(map);
-    maps.push(map);
-  }
-  return maps.length ? maps : ['Map TBD'];
-}
-
-function randomMapRotation(mapPool: string[], count: number, playedMaps: string[] = []) {
-  const maps = uniqueMapPool(mapPool);
-  const pickedMaps: string[] = [];
-  let currentRotation = currentMapRotation(maps, playedMaps);
-
-  for (let index = 0; index < count; index += 1) {
-    const previousMap = pickedMaps.at(-1) ?? [...playedMaps].reverse().find((map) => maps.includes(map));
-    let eligibleMaps = maps.filter((map) => !currentRotation.has(map));
-    if (!eligibleMaps.length) {
-      currentRotation = new Set<string>();
-      eligibleMaps = maps.filter((map) => map !== previousMap);
-    }
-    const pickableMaps = eligibleMaps.length ? eligibleMaps : maps;
-    const map = pickableMaps[crypto.randomInt(pickableMaps.length)] ?? 'Map TBD';
-    pickedMaps.push(map);
-    currentRotation.add(map);
-  }
-
-  return pickedMaps;
-}
-
-function currentMapRotation(mapPool: string[], mapsPlayedInOrder: string[]) {
-  const mapPoolSet = new Set(mapPool);
-  const playedMaps = new Set<string>();
-  let previousCollectedMap: string | undefined;
-
-  for (const map of [...mapsPlayedInOrder].reverse()) {
-    if (!mapPoolSet.has(map)) continue;
-    if (map === previousCollectedMap) continue;
-    if (playedMaps.has(map)) break;
-    playedMaps.add(map);
-    previousCollectedMap = map;
-    if (playedMaps.size === mapPool.length) break;
-  }
-
-  return playedMaps;
 }
 
 function rotateArray<T>(items: T[], count: number) {
@@ -1650,11 +1604,10 @@ function recordCashoutQualifyingResults(bracket: EventBracket, roundIndex: numbe
 }
 
 function selectCashoutFinalMaps(bracket: EventBracket) {
-  const pool = uniqueMapPool(bracket.mapPool?.length ? bracket.mapPool : ['Map TBD']);
-  const previouslyPlayedMaps = bracket.qualifyingRounds.map((round) => round.map);
-  return randomMapRotation(pool, 9, previouslyPlayedMaps).map((map, index) => ({
+  const pool = bracket.mapPool?.length ? bracket.mapPool : ['Map TBD'];
+  return Array.from({ length: 9 }, (_, index) => ({
     index: index + 1,
-    map,
+    map: pickCashoutMap(pool),
     status: 'pending' as const
   }));
 }
