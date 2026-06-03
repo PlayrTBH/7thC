@@ -1322,12 +1322,18 @@ export class TeamBot {
     await previousPick;
     try {
       const settings = await this.store.getAdministratorSettings();
-      const maps = settings.pugs?.mapPool.map((map) => map.trim()).filter(Boolean) ?? [];
+      const maps = uniqueMapPool(settings.pugs?.mapPool ?? []);
       if (!maps.length) return undefined;
 
-      const previousMap = this.lastPickedPugMap ?? await this.getMostRecentPugMap() ?? currentMap;
-      const eligibleMaps = previousMap && maps.some((map) => map !== previousMap) ? maps.filter((map) => map !== previousMap) : maps;
-      const map = eligibleMaps[randomIndex(eligibleMaps.length)];
+      const recentMaps = await this.getRecentPugMaps(currentMap);
+      const playedThisRotation = latestMapRotation(maps, recentMaps);
+      const unplayedMaps = maps.filter((map) => !playedThisRotation.has(map));
+      const previousMap = recentMaps.find((map) => maps.includes(map));
+      const eligibleMaps = unplayedMaps.length
+        ? unplayedMaps
+        : maps.filter((map) => map !== previousMap);
+      const pickableMaps = eligibleMaps.length ? eligibleMaps : maps;
+      const map = pickableMaps[randomIndex(pickableMaps.length)];
       this.lastPickedPugMap = map;
       return map;
     } finally {
@@ -1335,9 +1341,9 @@ export class TeamBot {
     }
   }
 
-  private async getMostRecentPugMap() {
+  private async getRecentPugMaps(currentMap?: string) {
     const logs = await this.store.getPugMatchLogs();
-    return logs.find((log) => log.map)?.map;
+    return [this.lastPickedPugMap, ...logs.map((log) => log.map), currentMap].filter((map): map is string => Boolean(map));
   }
 
   private async sendPugVotePrompt(text: import('discord.js').TextChannel, match: PugMatch, teamCount: number) {
@@ -2827,6 +2833,34 @@ function createRandomTeams(playerIds: string[], size: PugQueueSize) {
   return teams;
 }
 
+
+function uniqueMapPool(mapPool: string[]) {
+  const maps: string[] = [];
+  const seenMaps = new Set<string>();
+  for (const map of mapPool.map((item) => item.trim()).filter(Boolean)) {
+    if (seenMaps.has(map)) continue;
+    seenMaps.add(map);
+    maps.push(map);
+  }
+  return maps;
+}
+
+function latestMapRotation(mapPool: string[], recentMaps: string[]) {
+  const mapPoolSet = new Set(mapPool);
+  const playedMaps = new Set<string>();
+  let previousCollectedMap: string | undefined;
+
+  for (const map of recentMaps) {
+    if (!mapPoolSet.has(map)) continue;
+    if (map === previousCollectedMap) continue;
+    if (playedMaps.has(map)) break;
+    playedMaps.add(map);
+    previousCollectedMap = map;
+    if (playedMaps.size === mapPool.length) break;
+  }
+
+  return playedMaps;
+}
 
 function randomIndex(length: number) {
   if (!Number.isSafeInteger(length) || length <= 0) throw new Error('Random index length must be a positive integer.');
