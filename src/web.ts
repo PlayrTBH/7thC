@@ -391,7 +391,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getActivePugSeason(),
         store.getPugSeasonLeaderboards()
       ]);
-      const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterPlayerCount);
+      const topMasterUserIds = getTopMasterUserIds(allRatings, rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0);
       const memberProfiles = await bot.getGuildMemberProfiles(leaderboard.map((rating) => rating.userId));
       const profilesByUserId = new Map(memberProfiles.map((profile) => [profile.userId, profile]));
       const decoratedLeaderboard = leaderboard.map((rating) => {
@@ -687,7 +687,7 @@ export function createWebApp(bot: TeamBotApi, store: JsonStore) {
         store.getPugUserBadgeSelection(userId)
       ]);
       const players = buildPugPlayerSearchEntries(history, ratings, eloSettings);
-      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings, rankSettings.masterPlayerCount));
+      const stats = buildPugPlayerStats(userId, players, history, ratings, eloSettings, rankSettings, getTopMasterUserIds(ratings, rankSettings.masterEnabled ? rankSettings.masterPlayerCount : 0));
       const profile = profiles[0];
       const eloGraph = buildPugEloGraphState(userId, history, activeSeason, rankSettings, parsePugEloGraphRange(req.query.eloRange));
       res.send(layout(`${profile?.displayName ?? stats.player.username ?? 'Player'} profile`, leaderboardPlayerProfilePage(stats, profile, badges, selectedBadgeIds, eloGraph), { user: req.session.discordUser, isAdmin: administratorAccess.isAdmin, active: 'leaderboard' }));
@@ -2409,7 +2409,7 @@ function getTopMasterUserIds(ratings: Pick<PugEloRating, 'userId'>[], count: num
 }
 
 function resolvePugRank(rating: Pick<PugEloRating, 'userId' | 'rating'>, settings: PugRankSettings, topMasterUserIds: Set<string>): PugPlayerRank {
-  if (!isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) {
+  if (settings.masterEnabled && !isDeveloperAccount(rating.userId) && topMasterUserIds.has(rating.userId)) {
     return { id: 'master-infernal', label: 'Master Infernal', abbreviation: 'M1', minRating: rating.rating, iconDataUrl: settings.masterIconDataUrl, isMaster: true };
   }
   const ranks = settings.ranks.length ? settings.ranks : [];
@@ -2532,7 +2532,7 @@ function buildPugPlayerStats(userId: string, players: PugPlayerSearchEntry[], hi
     total: modes.reduce((sum, mode) => sum + mode.total, 0),
     winRate: 0
   });
-  const fallbackRanks: PugRankSettings = { ranks: [{ id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 }], masterPlayerCount: 3 };
+  const fallbackRanks: PugRankSettings = { ranks: [{ id: 'unranked', label: 'Unranked', abbreviation: 'UR', minRating: 0 }], masterPlayerCount: 3, masterEnabled: true };
   return { player, modes, totals, rank: resolvePugRank(player, rankSettings ?? fallbackRanks, topMasterUserIds) };
 }
 
@@ -2665,6 +2665,10 @@ function administratorRanksPage(settings: PugRankSettings) {
         <div>
           <h3>Master Infernal <span class="pill">M1</span></h3>
           <p><small>Dynamic rank for the top N players on the leaderboard. Its ELO range is not editable.</small></p>
+          <label class="rank-toggle-button ${settings.masterEnabled ? 'is-enabled' : 'is-disabled'}">
+            <input name="masterEnabled" type="checkbox" value="1"${settings.masterEnabled ? ' checked' : ''} />
+            <span>${settings.masterEnabled ? 'M1 enabled' : 'M1 disabled'}</span>
+          </label>
           <label>Top players <input name="masterPlayerCount" type="number" min="0" step="1" required value="${settings.masterPlayerCount}" /></label>
         </div>
         <div class="rank-icon-editor">
@@ -2719,7 +2723,8 @@ function parsePugRankSettings(body: Record<string, unknown>): PugRankSettings {
   if (!ranks.length) throw new Error('At least one rank is required.');
   const masterIconDataUrl = parseOptionalRankIcon(String(body.masterIconDataUrl ?? ''));
   const masterPlayerCount = parsePositiveInteger(body.masterPlayerCount, 'Master Infernal top players', 0);
-  return { ranks, masterIconDataUrl, masterPlayerCount };
+  const masterEnabled = body.masterEnabled === '1' || body.masterEnabled === 'on' || body.masterEnabled === true;
+  return { ranks, masterIconDataUrl, masterPlayerCount, masterEnabled };
 }
 
 function formArray(value: unknown) {
@@ -3478,6 +3483,10 @@ function layout(title: string, body: string, options: LayoutOptions = {}) {
     .compact-leaderboard .leaderboard-entry { grid-template-columns: minmax(10rem, 1fr) auto auto; }
     .rank-editor-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .75rem; align-items: end; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: #12141a; }
     .master-rank-editor { grid-template-columns: minmax(14rem, 1fr) auto; }
+    .rank-toggle-button { display: inline-flex; align-items: center; gap: .45rem; width: max-content; margin: .35rem 0 .75rem; padding: .5rem .8rem; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; background: #0f1116; color: var(--muted); font-weight: 800; cursor: pointer; }
+    .rank-toggle-button input { accent-color: var(--red-strong); }
+    .rank-toggle-button.is-enabled { border-color: rgba(34,197,94,.42); color: #86efac; background: rgba(34,197,94,.09); }
+    .rank-toggle-button.is-disabled { border-color: rgba(248,113,113,.42); color: #fecaca; background: rgba(248,113,113,.09); }
     .rank-icon-editor { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
     .rank-icon-preview { display: grid; place-items: center; width: 3rem; height: 3rem; border: 1px dashed rgba(255,255,255,.24); border-radius: .75rem; background-color: #0f1116; background-size: cover; background-position: center; color: var(--muted); font-size: .65rem; text-align: center; }
     .rank-icon-preview.is-empty { background-image: none !important; }
