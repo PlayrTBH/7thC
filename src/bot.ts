@@ -334,7 +334,7 @@ export class TeamBot {
     }
 
     if (match.selectedMode === 'random' && !match.teams?.length) {
-      const teams = createRandomTeams(match.playerIds, match.size);
+      const teams = await this.createRandomPugTeams(match.playerIds, match.size);
       await this.finalizePugTeams(guild, text, match, teams, 'Random teams won the majority vote and teams have been created.', { reuseTeamVoiceChannels: Boolean(match.teamVoiceChannelIds.length), preserveMap: Boolean(match.map) });
       return;
     }
@@ -1242,8 +1242,14 @@ export class TeamBot {
       return;
     }
 
-    const teams = createRandomTeams(match.playerIds, match.size);
+    const teams = await this.createRandomPugTeams(match.playerIds, match.size);
     await this.finalizePugTeams(guild, text, match, teams, 'Random teams won the majority vote and teams have been created.');
+  }
+
+  private async createRandomPugTeams(playerIds: string[], size: PugQueueSize) {
+    const [settings, ratings] = await Promise.all([this.store.getPugEloSettings(), this.store.getPugEloRatings()]);
+    const ratingsByUserId = new Map(ratings.map((rating) => [rating.userId, rating.rating]));
+    return createEloSeededRandomTeams(playerIds, size, ratingsByUserId, settings.startingRating);
   }
 
   private async startPugCaptainDraft(text: import('discord.js').TextChannel, match: PugMatch) {
@@ -1796,10 +1802,7 @@ export class TeamBot {
 
     await this.sendPugEloResultDms(guild, match, result, eloResult);
     await this.movePugVoiceChannelMembersToLobby(guild, match, 'PUG match ended').catch((error) => console.warn('Unable to move PUG players back to lobby after match end:', error));
-
-    for (const channelId of [...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
-      await guild.channels.delete(channelId, 'PUG match ended').catch(() => undefined);
-    }
+    await this.deletePugMatchChannels(guild, match, 'PUG match ended');
   }
 
 
@@ -2025,10 +2028,26 @@ export class TeamBot {
   }
 
   private async deletePugMatchChannels(guild: Guild, match: PugMatch, reason: string) {
-    await this.deletePugTeamVoiceChannels(guild, match, reason);
-    for (const channelId of [match.queueVoiceChannelId, match.textChannelId, match.categoryId]) {
-      await guild.channels.delete(channelId, reason).catch(() => undefined);
+    const channelIds = new Set([...match.teamVoiceChannelIds, match.queueVoiceChannelId, match.textChannelId]);
+    for (const channelId of await this.getPugMatchChildChannelIds(guild, match)) {
+      channelIds.add(channelId);
     }
+
+    for (const channelId of channelIds) {
+      if (channelId === match.categoryId) continue;
+      await guild.channels.delete(channelId, reason).catch((error) => console.warn(`Unable to delete PUG match channel ${channelId}:`, error));
+    }
+    await guild.channels.delete(match.categoryId, reason).catch((error) => console.warn(`Unable to delete PUG match category ${match.categoryId}:`, error));
+    match.teamVoiceChannelIds = [];
+  }
+
+  private async getPugMatchChildChannelIds(guild: Guild, match: PugMatch) {
+    const channels = await guild.channels.fetch().catch((error) => {
+      console.warn(`Unable to fetch PUG match category children for ${match.id}:`, error);
+      return null;
+    });
+    if (!channels) return [];
+    return Array.from(channels.values()).flatMap((channel) => channel?.parentId === match.categoryId ? [channel.id] : []);
   }
 
   private async movePugVoiceChannelMembersToLobby(guild: Guild, match: PugMatch, reason: string) {
@@ -2041,8 +2060,8 @@ export class TeamBot {
     await previousReturn;
     try {
       const lobby = await this.selectPugReturnLobby(guild);
-      const voiceChannelIds = [match.queueVoiceChannelId, ...match.teamVoiceChannelIds];
-      await Promise.all(voiceChannelIds.map(async (channelId) => {
+      const voiceChannelIds = new Set([match.queueVoiceChannelId, ...match.teamVoiceChannelIds, ...await this.getPugMatchChildChannelIds(guild, match)]);
+      await Promise.all([...voiceChannelIds].map(async (channelId) => {
         const channel = await guild.channels.fetch(channelId).catch(() => null);
         if (!channel || channel.type !== ChannelType.GuildVoice) return;
         await Promise.all(channel.members.map((member) => member.voice.setChannel(lobby, reason).catch(() => undefined)));
@@ -3087,11 +3106,31 @@ function modeLabel(mode: PugTeamMode) {
   return mode === 'captains' ? 'Captains' : 'Random teams';
 }
 
-function createRandomTeams(playerIds: string[], size: PugQueueSize) {
-  const shuffled = shuffle(playerIds);
+function createEloSeededRandomTeams(playerIds: string[], size: PugQueueSize, ratingsByUserId: Map<string, number>, startingRating: number) {
   const teamCount = getPugTeamCount(size);
+  const teamCapacity = Math.ceil(size / teamCount);
   const teams = Array.from({ length: teamCount }, () => [] as string[]);
-  shuffled.forEach((playerId, index) => teams[index % teamCount].push(playerId));
+  const rankedPlayers = shuffle(playerIds).sort((a, b) => (ratingsByUserId.get(b) ?? startingRating) - (ratingsByUserId.get(a) ?? startingRating));
+  const seededPlayerCount = Math.min(4, rankedPlayers.length);
+  const seededPlayers = rankedPlayers.slice(0, seededPlayerCount);
+
+  // For Final Round, split the top four ELO players 1/4 vs. 2/3, then randomize the remaining slots.
+  if (teamCount === 2 && seededPlayers.length === 4) {
+    teams[0].push(seededPlayers[0], seededPlayers[3]);
+    teams[1].push(seededPlayers[1], seededPlayers[2]);
+  } else {
+    seededPlayers.forEach((playerId, index) => teams[index % teamCount].push(playerId));
+  }
+
+  for (const playerId of shuffle(rankedPlayers.slice(seededPlayerCount))) {
+    const availableTeams = teams
+      .map((team, index) => ({ team, index }))
+      .filter(({ team }) => team.length < teamCapacity);
+    const fewestPlayers = Math.min(...availableTeams.map(({ team }) => team.length));
+    const candidateTeams = availableTeams.filter(({ team }) => team.length === fewestPlayers);
+    teams[candidateTeams[randomIndex(candidateTeams.length)].index].push(playerId);
+  }
+
   return teams;
 }
 
