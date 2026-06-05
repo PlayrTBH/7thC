@@ -262,6 +262,7 @@ export type PugMapBanState = {
   teamOrder: number[];
   currentTurn: number;
   bans: Array<{ teamIndex: number; map: string }>;
+  votes?: Record<string, string>;
   messageId?: string;
   endsAt?: string;
 };
