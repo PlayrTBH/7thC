@@ -312,6 +312,7 @@ export class TeamBot {
       teamOrder: [...log.mapBan.teamOrder],
       currentTurn: log.mapBan.currentTurn,
       bans: log.mapBan.bans.map((ban) => ({ ...ban })),
+      votes: { ...(log.mapBan.votes ?? {}) },
       messageId: log.mapBan.messageId,
       endsAt: log.mapBan.endsAt
     };
@@ -1355,6 +1356,7 @@ export class TeamBot {
       teamOrder,
       currentTurn: 0,
       bans: [],
+      votes: {},
       endsAt: new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString()
     };
     match.map = undefined;
@@ -1415,20 +1417,48 @@ export class TeamBot {
     if (!match?.mapBan || !match.teams?.length) throw new Error('Map bans are no longer active for this PUG match.');
     const teamIndex = this.getCurrentPugMapBanTeam(match);
     if (teamIndex === undefined) throw new Error('Map bans are already complete.');
-    if (!match.teams[teamIndex]?.includes(interaction.user.id)) throw new Error(`It is Team ${teamIndex + 1}'s turn to ban a map.`);
+    const team = match.teams[teamIndex] ?? [];
+    if (!team.includes(interaction.user.id)) throw new Error(`It is Team ${teamIndex + 1}'s turn to vote on a map ban.`);
     const map = match.mapBan.candidateMaps[mapIndex];
     if (!map || !this.getAvailablePugMapBanMaps(match).includes(map)) throw new Error('That map is no longer available to ban.');
 
-    this.stopPugMapBanTimer(match);
-    match.mapBan.bans.push({ teamIndex, map });
-    match.mapBan.currentTurn += 1;
-    match.mapBan.endsAt = new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
-    match.updatedAt = new Date().toISOString();
-    await this.respondToPugInteraction(interaction, `Team ${teamIndex + 1} banned ${map}.`);
+    match.mapBan.votes ??= {};
+    if (match.mapBan.votes[interaction.user.id] === map) delete match.mapBan.votes[interaction.user.id];
+    else match.mapBan.votes[interaction.user.id] = map;
 
+    const threshold = getPugMapBanVoteThreshold(team.length);
+    const voteCount = getPugMapBanVoteCount(match, teamIndex, map);
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
-    if (!text || text.type !== ChannelType.GuildText) return;
+    if (!text || text.type !== ChannelType.GuildText) {
+      match.updatedAt = new Date().toISOString();
+      await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+      await this.respondToPugInteraction(interaction, `Map ban vote recorded (${voteCount}/${threshold}).`);
+      return;
+    }
+
+    if (voteCount >= threshold) {
+      this.stopPugMapBanTimer(match);
+      await this.applyPugMapBan(text, match, teamIndex, map);
+      await this.respondToPugInteraction(interaction, `Team ${teamIndex + 1} reached ${threshold}/${team.length} votes and banned ${map}.`);
+      return;
+    }
+
+    match.updatedAt = new Date().toISOString();
+    await this.respondToPugInteraction(interaction, `Map ban vote recorded (${voteCount}/${threshold} for ${map}).`);
+    await this.refreshPugMapBanMessage(text, match);
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+  }
+
+  private async applyPugMapBan(text: import('discord.js').TextChannel, match: PugMatch, teamIndex: number, map: string, auto = false) {
+    if (!match.mapBan) return;
+    match.mapBan.bans.push({ teamIndex, map });
+    match.mapBan.currentTurn += 1;
+    match.mapBan.votes = {};
+    match.mapBan.endsAt = new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
+    match.updatedAt = new Date().toISOString();
+
+    if (auto) await text.send({ content: `Team ${teamIndex + 1} did not vote to ban within 30 seconds, so ${map} was auto-banned.` });
     if (this.getAvailablePugMapBanMaps(match).length <= 1 || match.mapBan.currentTurn >= match.mapBan.teamOrder.length) {
       await this.completePugMapBan(text, match);
       return;
@@ -1461,22 +1491,11 @@ export class TeamBot {
     const availableMaps = this.getAvailablePugMapBanMaps(match);
     if (teamIndex === undefined || availableMaps.length <= 1) return;
     const map = availableMaps[randomIndex(availableMaps.length)];
-    match.mapBan.bans.push({ teamIndex, map });
-    match.mapBan.currentTurn += 1;
-    match.mapBan.endsAt = new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
-    match.updatedAt = new Date().toISOString();
 
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) return;
-    await text.send({ content: `Team ${teamIndex + 1} did not ban within 30 seconds, so ${map} was auto-banned.` });
-    if (this.getAvailablePugMapBanMaps(match).length <= 1 || match.mapBan.currentTurn >= match.mapBan.teamOrder.length) {
-      await this.completePugMapBan(text, match);
-      return;
-    }
-    await this.refreshPugMapBanMessage(text, match);
-    this.startPugMapBanTimer(match);
-    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+    await this.applyPugMapBan(text, match, teamIndex, map, true);
   }
 
   private async completePugMapBan(text: import('discord.js').TextChannel, match: PugMatch) {
@@ -1515,7 +1534,9 @@ export class TeamBot {
     const teamIndex = this.getCurrentPugMapBanTeam(match);
     if (teamIndex === undefined) return 'Map bans are complete.';
     const endsAt = match.mapBan?.endsAt ? Math.floor(new Date(match.mapBan.endsAt).getTime() / 1000) : undefined;
-    return `${match.teams?.[teamIndex]?.map((id) => `<@${id}>`).join(' ') ?? ''} Team ${teamIndex + 1}, ban one map within 30 seconds${endsAt ? ` (timer ends <t:${endsAt}:R>)` : ''}.`;
+    const teamSize = match.teams?.[teamIndex]?.length ?? 0;
+    const threshold = getPugMapBanVoteThreshold(teamSize);
+    return `${match.teams?.[teamIndex]?.map((id) => `<@${id}>`).join(' ') ?? ''} Team ${teamIndex + 1}, vote to ban one map within 30 seconds. ${threshold}/${teamSize} team members must vote for the same map${endsAt ? ` (timer ends <t:${endsAt}:R>)` : ''}.`;
   }
 
   private getCurrentPugMapBanTeam(match: PugMatch) {
@@ -1987,7 +2008,7 @@ export class TeamBot {
       captainIds,
       mode: match.selectedMode,
       map: match.map,
-      mapBan: match.mapBan ? { candidateMaps: [...match.mapBan.candidateMaps], teamOrder: [...match.mapBan.teamOrder], currentTurn: match.mapBan.currentTurn, bans: match.mapBan.bans.map((ban) => ({ ...ban })), messageId: match.mapBan.messageId, endsAt: match.mapBan.endsAt } : undefined,
+      mapBan: match.mapBan ? { candidateMaps: [...match.mapBan.candidateMaps], teamOrder: [...match.mapBan.teamOrder], currentTurn: match.mapBan.currentTurn, bans: match.mapBan.bans.map((ban) => ({ ...ban })), votes: { ...(match.mapBan.votes ?? {}) }, messageId: match.mapBan.messageId, endsAt: match.mapBan.endsAt } : undefined,
       voteMode: match.voteMode,
       votes: Object.fromEntries(match.votes),
       status: 'ongoing',
@@ -3122,15 +3143,23 @@ function buildPugMapBanEmbed(match: PugMatch) {
   const mapBan = match.mapBan;
   if (!mapBan) return new EmbedBuilder().setTitle('PUG Map Bans').setColor(0xc90820).setDescription('Map bans are not active.');
   const currentTeamIndex = getCurrentPugMapBanTeamIndex(match);
-  return new EmbedBuilder()
+  const currentTeamSize = currentTeamIndex === undefined ? 0 : match.teams?.[currentTeamIndex]?.length ?? 0;
+  const threshold = getPugMapBanVoteThreshold(currentTeamSize);
+  const currentVoteLines = currentTeamIndex === undefined
+    ? ['No active vote.']
+    : getAvailablePugMapBanMapNames(match).map((map) => formatVotePercentageLine(map, getPugMapBanVoteCount(match, currentTeamIndex, map), currentTeamSize));
+  const embed = new EmbedBuilder()
     .setTitle('PUG Map Bans')
     .setColor(0xc90820)
-    .setDescription(currentTeamIndex === undefined ? 'Map bans are complete.' : `Team ${currentTeamIndex + 1} is banning now.`)
+    .setDescription(currentTeamIndex === undefined ? 'Map bans are complete.' : `Team ${currentTeamIndex + 1} is voting to ban now.`)
     .addFields([
       { name: 'Available maps', value: getAvailablePugMapBanMapNames(match).map((map) => `• ${map}`).join('\n') || 'None', inline: false },
+      { name: 'Current team vote', value: currentVoteLines.join('\n') || 'No votes yet', inline: false },
       { name: 'Bans', value: mapBan.bans.map((ban) => `Team ${ban.teamIndex + 1}: ${ban.map}`).join('\n') || 'No maps banned yet', inline: false },
       { name: 'Ban order', value: mapBan.teamOrder.map((teamIndex, index) => `${index === mapBan.currentTurn ? '➡️ ' : ''}Team ${teamIndex + 1}`).join('\n'), inline: true }
     ]);
+  if (currentTeamIndex !== undefined) embed.setFooter({ text: `Ban vote required: ${threshold}/${currentTeamSize}` });
+  return embed;
 }
 
 function buildCompletedPugMapBanEmbed(match: PugMatch, mapBan: PugMapBanState, selectedMap: string) {
@@ -3162,6 +3191,16 @@ function getCurrentPugMapBanTeamIndex(match: PugMatch) {
   if (!match.mapBan) return undefined;
   if (getAvailablePugMapBanMapNames(match).length <= 1) return undefined;
   return match.mapBan.teamOrder[match.mapBan.currentTurn];
+}
+
+function getPugMapBanVoteThreshold(teamSize: number) {
+  return Math.max(1, Math.ceil((teamSize * 2) / 3));
+}
+
+function getPugMapBanVoteCount(match: PugMatch, teamIndex: number, map: string) {
+  const team = match.teams?.[teamIndex] ?? [];
+  const votes = match.mapBan?.votes ?? {};
+  return team.filter((userId) => votes[userId] === map).length;
 }
 
 function getAvailablePugMapBanMapNames(match: PugMatch) {

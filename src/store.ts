@@ -917,6 +917,7 @@ function normalizePugMapBan(value: unknown): PugMapBanState | undefined {
     teamOrder,
     currentTurn: typeof mapBan.currentTurn === 'number' && Number.isFinite(mapBan.currentTurn) ? Math.max(0, Math.round(mapBan.currentTurn)) : 0,
     bans,
+    votes: normalizeStringRecord(mapBan.votes),
     messageId: typeof mapBan.messageId === 'string' ? mapBan.messageId : undefined,
     endsAt: typeof mapBan.endsAt === 'string' ? mapBan.endsAt : undefined
   };
