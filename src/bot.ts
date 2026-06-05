@@ -24,7 +24,7 @@ import {
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { config, DEVELOPER_DISCORD_USER_ID } from './config.js';
 import type { JsonStore } from './store.js';
-import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugQueueSize, PugRankDefinition, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
+import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMapBanState, PugMatchLog, PugQueueSize, PugRankDefinition, PugRankSettings, PugTeamMode, PugVoteMode, Team, TeamInvite, TeamMemberRole } from './types.js';
 
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
@@ -32,6 +32,7 @@ const PUG_QUEUE_COUNTDOWN_MS = 30 * 1000;
 const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_INSUFFICIENT_PLAYERS_CANCEL_MS = 5 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
+const PUG_MAP_BAN_TURN_MS = 30 * 1000;
 const PUG_QUEUE_COUNTDOWN_REFRESH_MS = 1000;
 const PUG_DEAD_MATCH_MS = 60 * 60 * 1000;
 const PUG_LEADERBOARD_REFRESH_MS = 3 * 60 * 60 * 1000;
@@ -44,9 +45,10 @@ const pugLobbyChannelNamePattern = /^PUG Lobby(?: - \d+ in-match)?$/;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
 type PugCaptainDraft = PugCaptainDraftState;
+type PugMapBan = PugMapBanState & { timer?: NodeJS.Timeout };
 type PugRankTransition = { before: PugRankDefinition; after: PugRankDefinition };
 type PugEloResult = { changes: PugEloChange[]; teamTotals: number[]; rankTransitions: Map<string, PugRankTransition> };
-type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; playerRankRoleIds: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; voteStartedAt?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
+type PugMatch = { id: string; size: PugQueueSize; playerIds: string[]; playerUsernames: Map<string, string>; playerRankLabels: Map<string, string>; playerRankRoleIds: Map<string, string>; categoryId: string; queueVoiceChannelId: string; textChannelId: string; teamVoiceChannelIds: string[]; modeVotes: Map<string, PugTeamMode>; selectedMode?: PugTeamMode; modeVoteMessageId?: string; modeVoteRefreshTimer?: NodeJS.Timeout; captainDraft?: PugCaptainDraft; teams?: string[][]; map?: string; mapBan?: PugMapBan; voteMode?: PugVoteMode; voteMessageId?: string; voteRefreshTimer?: NodeJS.Timeout; deadMatchTimer?: NodeJS.Timeout; voteStartedAt?: string; votes: Map<string, string>; teamEloTotals?: number[]; eloChanges?: PugEloChange[]; createdAt: string; updatedAt: string };
 
 const activityTypeMap: Record<BotActivityType, ActivityType.Playing | ActivityType.Watching | ActivityType.Listening | ActivityType.Competing> = {
   Playing: ActivityType.Playing,
@@ -207,7 +209,8 @@ export class TeamBot {
         ? { labels: new Map(Object.entries(log.playerRankLabels ?? {})), roleIds: new Map(Object.entries(log.playerRankRoleIds ?? {})) }
         : await this.buildPugPlayerRanks(guild, log.playerIds);
       const captainDraft = this.restorePugCaptainDraft(log);
-      const teams = log.voteMode ? log.teams.map((team) => [...team]) : undefined;
+      const teams = log.voteMode || log.mapBan || log.map ? log.teams.map((team) => [...team]) : undefined;
+      const mapBan = this.restorePugMapBan(log);
       const match: PugMatch = {
         id: log.id,
         size: log.size,
@@ -225,6 +228,7 @@ export class TeamBot {
         captainDraft,
         teams,
         map: log.map,
+        mapBan,
         voteMode: log.voteMode,
         voteMessageId: log.voteMessageId,
         voteStartedAt: log.voteStartedAt,
@@ -300,6 +304,19 @@ export class TeamBot {
     };
   }
 
+
+  private restorePugMapBan(log: PugMatchLog): PugMapBan | undefined {
+    if (!log.mapBan || log.map || log.voteMode) return undefined;
+    return {
+      candidateMaps: [...log.mapBan.candidateMaps],
+      teamOrder: [...log.mapBan.teamOrder],
+      currentTurn: log.mapBan.currentTurn,
+      bans: log.mapBan.bans.map((ban) => ({ ...ban })),
+      messageId: log.mapBan.messageId,
+      endsAt: log.mapBan.endsAt
+    };
+  }
+
   private async resumePugMatch(guild: Guild, match: PugMatch) {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) return;
@@ -327,11 +344,23 @@ export class TeamBot {
     }
 
     if (match.captainDraft?.availablePlayerIds.length) return;
-    if (match.captainDraft && !match.voteMode) {
+    if (match.mapBan && match.teams?.length && !match.map && !match.voteMode) {
+      await this.resumePugMapBan(text, match);
+      return;
+    }
+    if (match.captainDraft && !match.teams?.length && !match.voteMode) {
       await this.finalizePugTeams(guild, text, match, match.captainDraft.teams, 'Captains drafted their teams.', { reuseTeamVoiceChannels: Boolean(match.teamVoiceChannelIds.length), preserveMap: Boolean(match.map) });
       return;
     }
 
+    if (match.teams?.length && match.map && !match.voteMode) {
+      await this.sendPugVotePrompt(text, match, match.teams.length);
+      return;
+    }
+    if (match.teams?.length && !match.map && !match.voteMode) {
+      await this.startPugMapBan(text, match);
+      return;
+    }
     if (match.teams?.length && match.voteMode) this.startPugResultVoteReposter(match, this.getPugDeadMatchDelay(match));
   }
 
@@ -815,6 +844,11 @@ export class TeamBot {
       return;
     }
 
+    if (action === 'mapban') {
+      await this.recordPugMapBan(interaction, first, Number(second));
+      return;
+    }
+
     if (action === 'vote' || action === 'vote2') {
       await this.recordPugVote(interaction, first, Number(second), action === 'vote2');
       return;
@@ -1279,18 +1313,221 @@ export class TeamBot {
   }
 
   private async finalizePugTeams(guild: Guild, text: import('discord.js').TextChannel, match: PugMatch, teams: string[][], description: string, options: { reuseTeamVoiceChannels?: boolean; preserveMap?: boolean } = {}) {
-    const map = options.preserveMap && match.map ? match.map : await this.pickPugMap(match.map);
+    const preservedMap = options.preserveMap ? match.map : undefined;
     match.teams = teams.map((team) => [...team]);
-    match.map = map;
+    match.map = preservedMap;
+    match.mapBan = undefined;
     match.updatedAt = new Date().toISOString();
     await this.createPugTeamVoiceChannels(guild, match, teams, { reuseExisting: options.reuseTeamVoiceChannels });
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
 
     await text.send({
-      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${description}${map ? `\n\n**Map:** ${map}` : ''}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id, playerIndex) => `${playerIndex === 0 && match.selectedMode === 'captains' ? '⭐ ' : ''}${formatPugPlayerLabel(match, id)}`).join('\n') || 'No players', inline: true })))],
+      embeds: [new EmbedBuilder().setTitle('PUG Teams').setColor(0xc90820).setDescription(`${description}${preservedMap ? `\n\n**Map:** ${preservedMap}` : '\n\nMap bans will start next.'}`).addFields(teams.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id, playerIndex) => `${playerIndex === 0 && match.selectedMode === 'captains' ? '⭐ ' : ''}${formatPugPlayerLabel(match, id)}`).join('\n') || 'No players', inline: true })))],
       allowedMentions: { users: match.playerIds }
     });
-    await this.sendPugVotePrompt(text, match, teams.length);
+
+    if (preservedMap) {
+      await this.sendPugVotePrompt(text, match, teams.length);
+      return;
+    }
+
+    await this.startPugMapBan(text, match);
+  }
+
+
+  private async startPugMapBan(text: import('discord.js').TextChannel, match: PugMatch) {
+    if (!match.teams?.length) return;
+    const candidateMaps = await this.pickPugMapCandidates(match.teams.length + 1);
+    if (candidateMaps.length <= 1) {
+      match.map = candidateMaps[0];
+      match.mapBan = undefined;
+      if (match.map) this.lastPickedPugMap = match.map;
+      match.updatedAt = new Date().toISOString();
+      await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+      await text.send({ content: match.map ? `**Map selected:** ${match.map}` : 'No PUG maps are configured. Starting the result vote without a map.' });
+      await this.sendPugVotePrompt(text, match, match.teams.length);
+      return;
+    }
+
+    const teamOrder = shuffle(Array.from({ length: match.teams.length }, (_, index) => String(index))).map(Number);
+    match.mapBan = {
+      candidateMaps,
+      teamOrder,
+      currentTurn: 0,
+      bans: [],
+      endsAt: new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString()
+    };
+    match.map = undefined;
+    const currentTeamIndex = this.getCurrentPugMapBanTeam(match);
+    const message = await text.send({
+      content: this.buildPugMapBanContent(match),
+      embeds: [buildPugMapBanEmbed(match)],
+      components: buildPugMapBanRows(match),
+      allowedMentions: currentTeamIndex === undefined ? undefined : { users: match.teams[currentTeamIndex] ?? [] }
+    });
+    match.mapBan.messageId = message.id;
+    match.updatedAt = new Date().toISOString();
+    this.startPugMapBanTimer(match);
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+  }
+
+  private async resumePugMapBan(text: import('discord.js').TextChannel, match: PugMatch) {
+    if (!match.mapBan || !match.teams?.length) return;
+    if (this.getAvailablePugMapBanMaps(match).length <= 1 || match.mapBan.currentTurn >= match.mapBan.teamOrder.length) {
+      await this.completePugMapBan(text, match);
+      return;
+    }
+    match.mapBan.endsAt ??= new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
+    if (match.mapBan.messageId) await this.refreshPugMapBanMessage(text, match).catch((error) => console.warn('Unable to refresh PUG map ban message:', error));
+    else {
+      const currentTeamIndex = this.getCurrentPugMapBanTeam(match);
+      const message = await text.send({
+        content: this.buildPugMapBanContent(match),
+        embeds: [buildPugMapBanEmbed(match)],
+        components: buildPugMapBanRows(match),
+        allowedMentions: currentTeamIndex === undefined ? undefined : { users: match.teams[currentTeamIndex] ?? [] }
+      });
+      match.mapBan.messageId = message.id;
+    }
+    this.startPugMapBanTimer(match);
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+  }
+
+  private async pickPugMapCandidates(count: number) {
+    const previousPick = this.pugMapPickOperation;
+    let releasePickLock!: () => void;
+    this.pugMapPickOperation = new Promise((resolve) => {
+      releasePickLock = resolve;
+    });
+
+    await previousPick;
+    try {
+      const settings = await this.store.getAdministratorSettings();
+      const maps = uniqueMapPool(settings.pugs?.mapPool ?? []);
+      return shuffle(maps).slice(0, Math.min(count, maps.length));
+    } finally {
+      releasePickLock();
+    }
+  }
+
+  private async recordPugMapBan(interaction: import('discord.js').ButtonInteraction, matchId: string, mapIndex: number) {
+    const match = this.pugMatches.get(matchId);
+    if (!match?.mapBan || !match.teams?.length) throw new Error('Map bans are no longer active for this PUG match.');
+    const teamIndex = this.getCurrentPugMapBanTeam(match);
+    if (teamIndex === undefined) throw new Error('Map bans are already complete.');
+    if (!match.teams[teamIndex]?.includes(interaction.user.id)) throw new Error(`It is Team ${teamIndex + 1}'s turn to ban a map.`);
+    const map = match.mapBan.candidateMaps[mapIndex];
+    if (!map || !this.getAvailablePugMapBanMaps(match).includes(map)) throw new Error('That map is no longer available to ban.');
+
+    this.stopPugMapBanTimer(match);
+    match.mapBan.bans.push({ teamIndex, map });
+    match.mapBan.currentTurn += 1;
+    match.mapBan.endsAt = new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
+    match.updatedAt = new Date().toISOString();
+    await this.respondToPugInteraction(interaction, `Team ${teamIndex + 1} banned ${map}.`);
+
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) return;
+    if (this.getAvailablePugMapBanMaps(match).length <= 1 || match.mapBan.currentTurn >= match.mapBan.teamOrder.length) {
+      await this.completePugMapBan(text, match);
+      return;
+    }
+
+    await this.refreshPugMapBanMessage(text, match);
+    this.startPugMapBanTimer(match);
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+  }
+
+  private startPugMapBanTimer(match: PugMatch) {
+    this.stopPugMapBanTimer(match);
+    if (!match.mapBan) return;
+    const delay = Math.max(0, new Date(match.mapBan.endsAt ?? Date.now()).getTime() - Date.now());
+    match.mapBan.timer = setTimeout(() => {
+      this.expirePugMapBanTurn(match.id).catch((error) => console.warn('Unable to expire PUG map ban turn:', error));
+    }, delay);
+  }
+
+  private stopPugMapBanTimer(match: PugMatch) {
+    if (!match.mapBan?.timer) return;
+    clearTimeout(match.mapBan.timer);
+    match.mapBan.timer = undefined;
+  }
+
+  private async expirePugMapBanTurn(matchId: string) {
+    const match = this.pugMatches.get(matchId);
+    if (!match?.mapBan || !match.teams?.length || match.map || match.voteMode) return;
+    const teamIndex = this.getCurrentPugMapBanTeam(match);
+    const availableMaps = this.getAvailablePugMapBanMaps(match);
+    if (teamIndex === undefined || availableMaps.length <= 1) return;
+    const map = availableMaps[randomIndex(availableMaps.length)];
+    match.mapBan.bans.push({ teamIndex, map });
+    match.mapBan.currentTurn += 1;
+    match.mapBan.endsAt = new Date(Date.now() + PUG_MAP_BAN_TURN_MS).toISOString();
+    match.updatedAt = new Date().toISOString();
+
+    const guild = await this.getGuild();
+    const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (!text || text.type !== ChannelType.GuildText) return;
+    await text.send({ content: `Team ${teamIndex + 1} did not ban within 30 seconds, so ${map} was auto-banned.` });
+    if (this.getAvailablePugMapBanMaps(match).length <= 1 || match.mapBan.currentTurn >= match.mapBan.teamOrder.length) {
+      await this.completePugMapBan(text, match);
+      return;
+    }
+    await this.refreshPugMapBanMessage(text, match);
+    this.startPugMapBanTimer(match);
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+  }
+
+  private async completePugMapBan(text: import('discord.js').TextChannel, match: PugMatch) {
+    if (!match.mapBan || !match.teams?.length) return;
+    this.stopPugMapBanTimer(match);
+    const availableMaps = this.getAvailablePugMapBanMaps(match);
+    const selectedMap = availableMaps.length ? availableMaps[randomIndex(availableMaps.length)] : match.mapBan.candidateMaps[randomIndex(match.mapBan.candidateMaps.length)];
+    match.map = selectedMap;
+    this.lastPickedPugMap = selectedMap;
+    const mapBan = match.mapBan;
+    match.mapBan = undefined;
+    match.updatedAt = new Date().toISOString();
+    if (mapBan.messageId) {
+      const message = await text.messages.fetch(mapBan.messageId).catch(() => null);
+      await message?.edit({ content: `Map bans complete. **Selected map:** ${selectedMap}`, embeds: [buildCompletedPugMapBanEmbed(match, mapBan, selectedMap)], components: [] }).catch((error) => console.warn('Unable to finalize PUG map ban message:', error));
+    } else {
+      await text.send({ content: `Map bans complete. **Selected map:** ${selectedMap}` });
+    }
+    await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
+    await this.sendPugVotePrompt(text, match, match.teams.length);
+  }
+
+  private async refreshPugMapBanMessage(text: import('discord.js').TextChannel, match: PugMatch) {
+    if (!match.mapBan?.messageId) return;
+    const message = await text.messages.fetch(match.mapBan.messageId).catch(() => null);
+    const currentTeamIndex = this.getCurrentPugMapBanTeam(match);
+    await message?.edit({
+      content: this.buildPugMapBanContent(match),
+      embeds: [buildPugMapBanEmbed(match)],
+      components: buildPugMapBanRows(match),
+      allowedMentions: currentTeamIndex === undefined ? undefined : { users: match.teams?.[currentTeamIndex] ?? [] }
+    }).catch((error) => console.warn('Unable to refresh PUG map ban message:', error));
+  }
+
+  private buildPugMapBanContent(match: PugMatch) {
+    const teamIndex = this.getCurrentPugMapBanTeam(match);
+    if (teamIndex === undefined) return 'Map bans are complete.';
+    const endsAt = match.mapBan?.endsAt ? Math.floor(new Date(match.mapBan.endsAt).getTime() / 1000) : undefined;
+    return `${match.teams?.[teamIndex]?.map((id) => `<@${id}>`).join(' ') ?? ''} Team ${teamIndex + 1}, ban one map within 30 seconds${endsAt ? ` (timer ends <t:${endsAt}:R>)` : ''}.`;
+  }
+
+  private getCurrentPugMapBanTeam(match: PugMatch) {
+    if (!match.mapBan) return undefined;
+    if (this.getAvailablePugMapBanMaps(match).length <= 1) return undefined;
+    return match.mapBan.teamOrder[match.mapBan.currentTurn];
+  }
+
+  private getAvailablePugMapBanMaps(match: PugMatch) {
+    if (!match.mapBan) return [];
+    const bannedMaps = new Set(match.mapBan.bans.map((ban) => ban.map));
+    return match.mapBan.candidateMaps.filter((map) => !bannedMaps.has(map));
   }
 
   private async createPugTeamVoiceChannels(guild: Guild, match: PugMatch, teams: string[][], options: { reuseExisting?: boolean } = {}) {
@@ -1458,6 +1695,7 @@ export class TeamBot {
 
   private stopPugVoteTimers(match: PugMatch) {
     this.stopPugModeVoteReposter(match);
+    this.stopPugMapBanTimer(match);
     this.stopPugResultVoteReposter(match);
   }
 
@@ -1647,6 +1885,7 @@ export class TeamBot {
     match.captainDraft = undefined;
     match.teams = undefined;
     match.map = undefined;
+    match.mapBan = undefined;
     match.voteMode = undefined;
     match.voteMessageId = undefined;
     match.voteStartedAt = undefined;
@@ -1673,7 +1912,7 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
-    this.stopPugResultVoteReposter(match);
+    this.stopPugVoteTimers(match);
     match.selectedMode = 'random';
     match.captainDraft = undefined;
     match.votes.clear();
@@ -1693,11 +1932,12 @@ export class TeamBot {
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!text || text.type !== ChannelType.GuildText) throw new Error('PUG match text channel is not available.');
 
-    this.stopPugResultVoteReposter(match);
+    this.stopPugVoteTimers(match);
     await this.deletePugTeamVoiceChannels(guild, match, 'PUG captains changed by administrator');
     match.selectedMode = 'captains';
     match.teams = undefined;
     match.map = undefined;
+    match.mapBan = undefined;
     match.voteMode = undefined;
     match.voteMessageId = undefined;
     match.voteStartedAt = undefined;
@@ -1747,6 +1987,7 @@ export class TeamBot {
       captainIds,
       mode: match.selectedMode,
       map: match.map,
+      mapBan: match.mapBan ? { candidateMaps: [...match.mapBan.candidateMaps], teamOrder: [...match.mapBan.teamOrder], currentTurn: match.mapBan.currentTurn, bans: match.mapBan.bans.map((ban) => ({ ...ban })), messageId: match.mapBan.messageId, endsAt: match.mapBan.endsAt } : undefined,
       voteMode: match.voteMode,
       votes: Object.fromEntries(match.votes),
       status: 'ongoing',
@@ -2874,6 +3115,59 @@ function shuffle(values: string[]) {
     [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
   }
   return shuffled;
+}
+
+
+function buildPugMapBanEmbed(match: PugMatch) {
+  const mapBan = match.mapBan;
+  if (!mapBan) return new EmbedBuilder().setTitle('PUG Map Bans').setColor(0xc90820).setDescription('Map bans are not active.');
+  const currentTeamIndex = getCurrentPugMapBanTeamIndex(match);
+  return new EmbedBuilder()
+    .setTitle('PUG Map Bans')
+    .setColor(0xc90820)
+    .setDescription(currentTeamIndex === undefined ? 'Map bans are complete.' : `Team ${currentTeamIndex + 1} is banning now.`)
+    .addFields([
+      { name: 'Available maps', value: getAvailablePugMapBanMapNames(match).map((map) => `• ${map}`).join('\n') || 'None', inline: false },
+      { name: 'Bans', value: mapBan.bans.map((ban) => `Team ${ban.teamIndex + 1}: ${ban.map}`).join('\n') || 'No maps banned yet', inline: false },
+      { name: 'Ban order', value: mapBan.teamOrder.map((teamIndex, index) => `${index === mapBan.currentTurn ? '➡️ ' : ''}Team ${teamIndex + 1}`).join('\n'), inline: true }
+    ]);
+}
+
+function buildCompletedPugMapBanEmbed(match: PugMatch, mapBan: PugMapBanState, selectedMap: string) {
+  return new EmbedBuilder()
+    .setTitle('PUG Map Bans')
+    .setColor(0xc90820)
+    .setDescription(`**Selected map:** ${selectedMap}`)
+    .addFields([
+      { name: 'Original map pool', value: mapBan.candidateMaps.map((map) => `• ${map}`).join('\n') || 'None', inline: false },
+      { name: 'Bans', value: mapBan.bans.map((ban) => `Team ${ban.teamIndex + 1}: ${ban.map}`).join('\n') || 'No maps banned', inline: false },
+      ...(match.teams?.map((team, index) => ({ name: `Team ${index + 1}`, value: team.map((id) => formatPugPlayerLabel(match, id)).join('\n') || 'No players', inline: true })) ?? [])
+    ]);
+}
+
+function buildPugMapBanRows(match: PugMatch) {
+  const mapBan = match.mapBan;
+  if (!mapBan) return [];
+  const availableMaps = new Set(getAvailablePugMapBanMapNames(match));
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    mapBan.candidateMaps.map((map, index) => new ButtonBuilder()
+      .setCustomId(`pug:mapban:${match.id}:${index}`)
+      .setLabel(map.slice(0, 80))
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!availableMaps.has(map)))
+  )];
+}
+
+function getCurrentPugMapBanTeamIndex(match: PugMatch) {
+  if (!match.mapBan) return undefined;
+  if (getAvailablePugMapBanMapNames(match).length <= 1) return undefined;
+  return match.mapBan.teamOrder[match.mapBan.currentTurn];
+}
+
+function getAvailablePugMapBanMapNames(match: PugMatch) {
+  if (!match.mapBan) return [];
+  const bannedMaps = new Set(match.mapBan.bans.map((ban) => ban.map));
+  return match.mapBan.candidateMaps.filter((map) => !bannedMaps.has(map));
 }
 
 function buildPugVoteRows(matchId: string, teamCount: number, voteMode: 'winner' | 'placements') {
