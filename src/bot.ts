@@ -972,13 +972,10 @@ export class TeamBot {
   }
 
   private async startPugMatch(guild: Guild, size: PugQueueSize, players: PugQueuedPlayer[]) {
-    await assertBotPermissions(guild);
+    const me = await assertBotPermissions(guild);
     const matchId = randomUUID();
     const playerIds = players.map((player) => player.userId);
-    const overwrites = [
-      { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] },
-      ...playerIds.map((userId) => ({ id: userId, type: OverwriteType.Member, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }))
-    ];
+    const overwrites = buildPugMatchPermissionOverwrites(guild, me.id, playerIds);
 
     await this.ensurePugLobbyChannel(guild);
     const matchDisplayId = formatPugMatchId(matchId);
@@ -3307,6 +3304,27 @@ function unique(values: string[]) {
   return [...new Set(values)];
 }
 
+function buildPugMatchPermissionOverwrites(guild: Guild, botUserId: string, playerIds: string[]) {
+  const playerPermissions = [
+    PermissionsBitField.Flags.ViewChannel,
+    PermissionsBitField.Flags.Connect,
+    PermissionsBitField.Flags.Speak,
+    PermissionsBitField.Flags.SendMessages,
+    PermissionsBitField.Flags.ReadMessageHistory
+  ];
+  const botPermissions = [
+    ...playerPermissions,
+    PermissionsBitField.Flags.MoveMembers,
+    PermissionsBitField.Flags.ManageChannels
+  ];
+
+  return [
+    { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] },
+    { id: botUserId, type: OverwriteType.Member, allow: botPermissions },
+    ...playerIds.map((userId) => ({ id: userId, type: OverwriteType.Member, allow: playerPermissions }))
+  ];
+}
+
 
 async function findInviteChannel(guild: Guild): Promise<GuildInvitableChannelResolvable> {
   const me = await guild.members.fetchMe();
@@ -3338,6 +3356,7 @@ async function assertBotPermissions(guild: Guild) {
   if (!me.permissions.has(needed)) {
     throw new Error('Bot needs Manage Roles, Manage Channels, Move Members, and Create Instant Invite permissions.');
   }
+  return me;
 }
 
 
