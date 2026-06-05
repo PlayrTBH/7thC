@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { AdministratorSettings, DeveloperSettings, Event, EventBracket, EventRegistration, PugAbandonLog, PugAbandonSettings, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
+import type { AdministratorSettings, DeveloperSettings, Event, EventBracket, EventRegistration, PugAbandonLog, PugAbandonSettings, PugCaptainDraftState, PugEloChange, PugEloRating, PugEloSettings, PugMapBanState, PugMatchLog, PugRankDefinition, PugRankSettings, PugSeason, PugSeasonBadgeReward, PugSeasonLeaderboardEntry, PugSettings, PugUserBadge, PugUserBadgeSelection, StoreShape, Team, TeamInvite, TeamMember, TeamMemberRole } from './types.js';
 import { withFileLock } from './file-lock.js';
 import { DEVELOPER_DISCORD_USER_ID } from './config.js';
 
@@ -870,6 +870,7 @@ function normalizePugMatchLog(match: Partial<PugMatchLog>): PugMatchLog {
     captainIds: Array.isArray(match.captainIds) ? match.captainIds.filter((id): id is string => typeof id === 'string') : [],
     mode: match.mode === 'captains' || match.mode === 'random' ? match.mode : undefined,
     map: typeof match.map === 'string' ? match.map : undefined,
+    mapBan: normalizePugMapBan(match.mapBan),
     voteMode: match.voteMode === 'winner' || match.voteMode === 'placements' ? match.voteMode : undefined,
     votes: match.votes && typeof match.votes === 'object' && !Array.isArray(match.votes) ? Object.fromEntries(Object.entries(match.votes).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : {},
     result: typeof match.result === 'string' ? match.result : undefined,
@@ -893,6 +894,32 @@ function normalizePugModeVotes(value: unknown): Record<string, 'random' | 'capta
   return value && typeof value === 'object' && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, 'random' | 'captains'] => entry[1] === 'random' || entry[1] === 'captains'))
     : {};
+}
+
+
+function normalizePugMapBan(value: unknown): PugMapBanState | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const mapBan = value as Partial<PugMapBanState>;
+  const candidateMaps = Array.isArray(mapBan.candidateMaps) ? mapBan.candidateMaps.filter((map): map is string => typeof map === 'string' && Boolean(map.trim())).map((map) => map.trim()) : [];
+  const teamOrder = Array.isArray(mapBan.teamOrder) ? mapBan.teamOrder.filter((index): index is number => typeof index === 'number' && Number.isInteger(index) && index >= 0) : [];
+  const bans = Array.isArray(mapBan.bans)
+    ? mapBan.bans.map((ban) => {
+      if (!ban || typeof ban !== 'object' || Array.isArray(ban)) return undefined;
+      const value = ban as { teamIndex?: unknown; map?: unknown };
+      return typeof value.teamIndex === 'number' && Number.isInteger(value.teamIndex) && value.teamIndex >= 0 && typeof value.map === 'string'
+        ? { teamIndex: value.teamIndex, map: value.map }
+        : undefined;
+    }).filter(Boolean) as Array<{ teamIndex: number; map: string }>
+    : [];
+  if (!candidateMaps.length || !teamOrder.length) return undefined;
+  return {
+    candidateMaps,
+    teamOrder,
+    currentTurn: typeof mapBan.currentTurn === 'number' && Number.isFinite(mapBan.currentTurn) ? Math.max(0, Math.round(mapBan.currentTurn)) : 0,
+    bans,
+    messageId: typeof mapBan.messageId === 'string' ? mapBan.messageId : undefined,
+    endsAt: typeof mapBan.endsAt === 'string' ? mapBan.endsAt : undefined
+  };
 }
 
 function normalizePugCaptainDraft(value: unknown): PugCaptainDraftState | undefined {

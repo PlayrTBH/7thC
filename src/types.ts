@@ -257,6 +257,15 @@ export type PugCaptainDraftState = {
   messageId?: string;
 };
 
+export type PugMapBanState = {
+  candidateMaps: string[];
+  teamOrder: number[];
+  currentTurn: number;
+  bans: Array<{ teamIndex: number; map: string }>;
+  messageId?: string;
+  endsAt?: string;
+};
+
 export type PugMatchLog = {
   id: string;
   size: PugQueueSize;
@@ -277,6 +286,7 @@ export type PugMatchLog = {
   captainIds: string[];
   mode?: PugTeamMode;
   map?: string;
+  mapBan?: PugMapBanState;
   voteMode?: PugVoteMode;
   votes: Record<string, string>;
   result?: string;
