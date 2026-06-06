@@ -29,6 +29,7 @@ import type { BotActivityType, BotStatus, DeveloperSettings, PugAbandonLog, PugC
 const organizationRoleColor = '#6b7280';
 const pugQueueSizes = [6, 12] as const satisfies readonly PugQueueSize[];
 const PUG_QUEUE_COUNTDOWN_MS = 30 * 1000;
+const PUG_QUEUE_EXPIRATION_MS = 10 * 60 * 1000;
 const PUG_ABANDON_GRACE_MS = 2 * 60 * 1000;
 const PUG_UNREPLACED_PLAYER_CANCEL_MS = 10 * 60 * 1000;
 const PUG_VOTE_REPOST_MS = 12 * 1000;
@@ -44,6 +45,7 @@ const pugLobbyChannelBaseName = 'PUG Lobby';
 const pugLobbyChannelNamePattern = /^PUG Lobby(?: - \d+ in-match)?$/;
 type PugQueuedPlayer = { userId: string; username: string; voiceChannelId?: string };
 type PugQueueCountdown = { endsAt: number; timer: NodeJS.Timeout };
+type PugQueueExpiration = { timer: NodeJS.Timeout };
 type PugCaptainDraft = PugCaptainDraftState;
 type PugMapBan = PugMapBanState & { timer?: NodeJS.Timeout };
 type PugRankTransition = { before: PugRankDefinition; after: PugRankDefinition };
@@ -72,6 +74,7 @@ export class TeamBot {
 
   private readonly pugQueues = new Map<PugQueueSize, PugQueuedPlayer[]>();
   private readonly pugQueueCountdowns = new Map<PugQueueSize, PugQueueCountdown>();
+  private readonly pugQueueExpirations = new Map<PugQueueSize, PugQueueExpiration>();
   private readonly pugMatches = new Map<string, PugMatch>();
   private pugQueueOperation: Promise<void> = Promise.resolve();
   private readonly pugMatchEndLocks = new Map<string, Promise<void>>();
@@ -344,7 +347,13 @@ export class TeamBot {
       return;
     }
 
-    if (match.captainDraft?.availablePlayerIds.length) return;
+    if (match.captainDraft?.availablePlayerIds.length) {
+      const automaticallyAssignedPlayerId = this.autoAssignFinalPugDraftPlayer(match);
+      if (!automaticallyAssignedPlayerId) return;
+      await this.refreshPugCaptainDraftMessage(text, match, true);
+      await this.finalizePugTeams(guild, text, match, match.captainDraft.teams, 'Captains drafted their teams.');
+      return;
+    }
     if (match.mapBan && match.teams?.length && !match.map && !match.voteMode) {
       await this.resumePugMapBan(text, match);
       return;
@@ -902,6 +911,7 @@ export class TeamBot {
     const queue = this.pugQueues.get(size) ?? [];
     const countdown = this.pugQueueCountdowns.get(size);
     if (queue.length >= size) {
+      this.clearPugQueueExpiration(size);
       if (countdown) return;
       const endsAt = Date.now() + PUG_QUEUE_COUNTDOWN_MS;
       const timer = setTimeout(() => {
@@ -914,11 +924,50 @@ export class TeamBot {
       return;
     }
 
-    if (!countdown) return;
-    clearTimeout(countdown.timer);
-    this.pugQueueCountdowns.delete(size);
-    this.syncPugQueueCountdownRefresh();
-    this.schedulePugQueueMessageRefresh(0);
+    if (countdown) {
+      clearTimeout(countdown.timer);
+      this.pugQueueCountdowns.delete(size);
+      this.syncPugQueueCountdownRefresh();
+      this.schedulePugQueueMessageRefresh(0);
+    }
+    this.updatePugQueueExpiration(size);
+  }
+
+  private updatePugQueueExpiration(size: PugQueueSize) {
+    const queue = this.pugQueues.get(size) ?? [];
+    if (!queue.length || queue.length >= size) {
+      this.clearPugQueueExpiration(size);
+      return;
+    }
+
+    if (this.pugQueueExpirations.has(size)) return;
+    const timer = setTimeout(() => {
+      this.expirePugQueue(size).catch((error) => console.warn(`Unable to expire ${pugQueueLabel(size)} PUG queue:`, error));
+    }, PUG_QUEUE_EXPIRATION_MS);
+    this.pugQueueExpirations.set(size, { timer });
+  }
+
+  private clearPugQueueExpiration(size: PugQueueSize) {
+    const expiration = this.pugQueueExpirations.get(size);
+    if (!expiration) return;
+    clearTimeout(expiration.timer);
+    this.pugQueueExpirations.delete(size);
+  }
+
+  private async expirePugQueue(size: PugQueueSize) {
+    let expired = false;
+    await this.withPugQueueLock(async () => {
+      this.clearPugQueueExpiration(size);
+      const queue = this.pugQueues.get(size) ?? [];
+      if (queue.length && queue.length < size) {
+        this.pugQueues.delete(size);
+        expired = true;
+      } else {
+        this.updatePugQueueCountdown(size);
+      }
+    });
+
+    if (expired) this.schedulePugQueueMessageRefresh(0);
   }
 
   private async finishPugQueueCountdown(size: PugQueueSize) {
@@ -1276,6 +1325,16 @@ export class TeamBot {
     await this.store.upsertPugMatchLog(this.toPugMatchLog(match));
   }
 
+  private autoAssignFinalPugDraftPlayer(match: PugMatch) {
+    const draft = match.captainDraft;
+    if (!draft || draft.availablePlayerIds.length !== 1) return undefined;
+    const playerId = draft.availablePlayerIds[0];
+    draft.teams[draft.currentCaptainIndex].push(playerId);
+    draft.availablePlayerIds = [];
+    draft.picksThisTurn = 0;
+    return playerId;
+  }
+
   private async recordPugDraftPick(interaction: import('discord.js').ButtonInteraction, matchId: string, playerId: string) {
     const match = this.pugMatches.get(matchId);
     if (!match?.captainDraft) throw new Error('This captain draft is no longer active.');
@@ -1293,7 +1352,8 @@ export class TeamBot {
       draft.picksThisTurn = 0;
     }
 
-    await this.respondToPugInteraction(interaction, `You picked <@${playerId}>.`);
+    const automaticallyAssignedPlayerId = this.autoAssignFinalPugDraftPlayer(match);
+    await this.respondToPugInteraction(interaction, automaticallyAssignedPlayerId ? `You picked <@${playerId}>. <@${automaticallyAssignedPlayerId}> was automatically assigned to the last team to pick.` : `You picked <@${playerId}>.`);
 
     const guild = await this.getGuild();
     const text = await guild.channels.fetch(match.textChannelId).catch(() => null);
